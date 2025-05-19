@@ -10,13 +10,13 @@ from tensorrt_llm.inputs import (INPUT_FORMATTER_MAP, default_image_loader,
 
 example_images = [
     "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png",
-    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
-    "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg",
+    # "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
+    # "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg",
 ]
 example_image_prompts = [
     "Describe the natural environment in the image.",
-    "Describe the object and the weather condition in the image.",
-    "Describe the traffic condition on the road in the image.",
+    # "Describe the object and the weather condition in the image.",
+    # "Describe the traffic condition on the road in the image.",
 ]
 example_videos = [
     "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4",
@@ -68,6 +68,11 @@ def add_multimodal_args(parser):
                         type=int,
                         default=8,
                         help="The number of video frames to be sampled.")
+    parser.add_argument("--image_format",
+                        type=str,
+                        choices=["pt", "pil"],
+                        default="pt",
+                        help="The format of the image.")
     return parser
 
 
@@ -95,7 +100,7 @@ def main():
 
     llm, sampling_params = setup_llm(args)
 
-    image_format = "pt"  # ["pt", "pil"]
+    image_format = args.image_format
     if args.model_type is not None:
         model_type = args.model_type
     else:
@@ -106,7 +111,7 @@ def main():
     inputs = prepare_multimodal_inputs(args.model_dir, model_type,
                                        args.modality, args.prompt, args.media,
                                        image_format, args.num_frames)
-
+    print(inputs)
     outputs = llm.generate(inputs, sampling_params)
 
     for i, output in enumerate(outputs):

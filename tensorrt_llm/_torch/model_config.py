@@ -32,6 +32,8 @@ class ModelConfig(Generic[TConfig]):
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
 
+    pretrained_model_name_or_path: Optional[str] = None
+
     def __post_init__(self):
         if self.pretrained_config and hasattr(self.pretrained_config,
                                               "architectures"):
@@ -166,6 +168,7 @@ class ModelConfig(Generic[TConfig]):
         return cls(pretrained_config=pretrained_config,
                    quant_config=quant_config,
                    quant_config_dict=layer_quant_config,
+                   pretrained_model_name_or_path=checkpoint_dir,
                    **kwargs)
 
     def get_bindings_model_config(self) -> "ModelConfigCpp":

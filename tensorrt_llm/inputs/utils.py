@@ -12,7 +12,7 @@ import requests
 import torch
 from PIL import Image
 from torchvision.transforms import ToTensor
-from transformers import AutoProcessor
+from transformers import AutoProcessor, AutoTokenizer
 
 
 def _load_and_convert_image(image):
@@ -272,6 +272,43 @@ def format_qwen2_vl_input(model_dir, inputs):
     return inputs
 
 
+
+def format_hyperclovax_vlm_input(model_dir, inputs):
+    """
+    This function formats the input for the Hyperclovax VLM model.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+
+    def apply_template(prompt, multimodal_data):
+        conversation = [
+            {
+                "role": "user",
+                "content": {
+                    "type": "text",
+                    "text": prompt
+                },
+            },
+            *[{
+                "role": "user",
+                "content": {
+                    "type": "image",
+                    "filename": "temp.png",
+                    "image": image,
+                }
+            } for image in multimodal_data["image"]],
+        ]
+        return tokenizer.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    for input in inputs:
+        input["prompt"] = apply_template(input["prompt"],
+                                         input["multi_modal_data"])
+    return inputs
+
+
 def default_image_loader(prompts: List[str],
                          images: Union[List[List[str]], List[str]],
                          image_data_format: str = "pt"):
@@ -283,10 +320,10 @@ def default_image_loader(prompts: List[str],
         "prompt": prompt,
         "multi_modal_data": {
             "image": [
-                load_image(i, format=image_data_format, device="cuda")
+                load_image(i, format=image_data_format, device="cpu")
                 for i in image
             ] if isinstance(image, list) else
-            [load_image(image, format=image_data_format, device="cuda")]
+            [load_image(image, format=image_data_format, device="cpu")]
         }
     } for prompt, image in zip(prompts, images)]
     return inputs
@@ -322,4 +359,5 @@ INPUT_FORMATTER_MAP = {
     "qwen2_vl": format_qwen2_vl_input,
     "qwen2_5_vl": format_qwen2_vl_input,
     "llama4": format_generic_input,
+    "hyperclovax_vlm": format_hyperclovax_vlm_input,
 }

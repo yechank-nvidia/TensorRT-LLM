@@ -5,6 +5,8 @@ from .modeling_bert import BertForSequenceClassification
 from .modeling_clip import CLIPVisionModel
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
+# from .modeling_hyeperclovax import HCXVisionForCausalLM
+from .modeling_hyperclovax_refactor import HCXVisionForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
 from .modeling_mistral import MistralForCausalLM
@@ -47,6 +49,7 @@ __all__ = [
     "Qwen2_5_VLModel",
     "Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM",
+    "HCXVisionForCausalLM",
 ]
 
 if transformers.__version__ >= "4.45.1":
