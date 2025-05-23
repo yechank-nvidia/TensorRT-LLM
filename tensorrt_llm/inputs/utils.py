@@ -23,7 +23,7 @@ def _load_and_convert_image(image):
 
 def load_image(image: str,
                format: str = "pt",
-               device: str = "cuda") -> Union[Image.Image, torch.Tensor]:
+               device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(image)
@@ -52,8 +52,8 @@ def load_image(image: str,
 
 async def async_load_image(
         image: str,
-        format: str = "pt",
-        device: str = "cuda") -> Union[Image.Image, torch.Tensor]:
+        format: str = "pil",
+        device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(image)
@@ -85,8 +85,8 @@ async def async_load_image(
 def load_video(
         video: str,
         num_frames: int = 10,
-        format: str = "pt",
-        device: str = "cuda") -> Union[List[Image.Image], List[torch.Tensor]]:
+        format: str = "pil",
+        device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
 
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
@@ -131,8 +131,8 @@ def load_video(
 async def async_load_video(
         video: str,
         num_frames: int = 10,
-        format: str = "pt",
-        device: str = "cuda") -> Union[List[Image.Image], List[torch.Tensor]]:
+        format: str = "pil",
+        device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(video)
@@ -272,7 +272,6 @@ def format_qwen2_vl_input(model_dir, inputs):
     return inputs
 
 
-
 def format_hyperclovax_vlm_input(model_dir, inputs):
     """
     This function formats the input for the Hyperclovax VLM model.
@@ -342,11 +341,11 @@ def default_video_loader(prompts: List[str],
         "multi_modal_data": {
             "video": [
                 load_video(
-                    i, num_frames, format=image_data_format, device="cuda")
+                    i, num_frames, format=image_data_format, device="cpu")
                 for i in video
             ] if isinstance(video, list) else [
                 load_video(
-                    video, num_frames, format=image_data_format, device="cuda")
+                    video, num_frames, format=image_data_format, device="cpu")
             ]
         }
     } for prompt, video in zip(prompts, videos)]

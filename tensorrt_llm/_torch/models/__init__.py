@@ -16,7 +16,8 @@ from .modeling_nemotron_h import NemotronHForCausalLM
 from .modeling_nemotron_nas import NemotronNASForCausalLM
 from .modeling_qwen import (Qwen2ForCausalLM, Qwen2ForProcessRewardModel,
                             Qwen2ForRewardModel)
-from .modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
+# from .modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
+from .modeling_qwen2vl_refactor import Qwen2_5_VLModel, Qwen2VLModel
 from .modeling_qwen3 import Qwen3ForCausalLM
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .modeling_qwen_moe import Qwen2MoeForCausalLM
@@ -60,3 +61,4 @@ else:
     print(
         f"Failed to import MllamaForConditionalGeneration as transformers.__version__ {transformers.__version__} < 4.45.1"
     )
+#
