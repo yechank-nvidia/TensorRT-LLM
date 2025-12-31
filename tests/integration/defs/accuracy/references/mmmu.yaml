@@ -23,3 +23,5 @@ Qwen/Qwen3-VL-30B-A3B-Instruct:
   - accuracy: 55.33
 mistral/Mistral-Large-3-675B:
   - accuracy: 60.00
+Qwen/Qwen3-VL-8B-Instruct:
+  - accuracy: 54.00
