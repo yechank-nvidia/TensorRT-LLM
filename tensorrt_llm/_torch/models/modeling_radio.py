@@ -6,8 +6,8 @@ import copy
 import dataclasses
 import math
 from collections import namedtuple
-from typing import (ClassVar, Dict, Iterable, List, Literal, NamedTuple,
-                    Optional, Tuple, Type, Union)
+from typing import (Dict, Iterable, List, Literal, NamedTuple, Optional, Tuple,
+                    Type, Union)
 
 import torch
 import torch.nn as nn
@@ -1006,10 +1006,6 @@ class RADIOVisionModelBase(nn.Module):
 
 class RADIOVisionModel(PreTrainedModel):
     """Modify from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/hf_model.py."""
-
-    # Default for ViT-style attention without KV cache (ragged FlashInfer / cuDNN).
-    # Subclasses may override this class attribute; callers may pass ``vision_attn_backend``.
-    DEFAULT_VISION_ATTN_BACKEND: ClassVar[str] = "FLASHINFER"
 
     def __init__(self,
                  model_config: model_config_lib.ModelConfig,
