@@ -670,10 +670,14 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 attention_mask_data=attention_mask_data,
             )
             wrapper = metadata.get_ragged_prefill_wrapper(plan_params)
+            # cuDNN's ragged prefill kernel assumes contiguous NHD tensors.
+            # In a fused QKV projection, q/k/v are strided slices of a single
+            # [tokens, 3*hidden] buffer, and passing them as-is causes the
+            # kernel to read wrong memory and produce corrupted outputs.
             wrapper.run(
-                q,
-                k,
-                v,
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
                 out=output.view(-1, self.num_heads, self.head_dim),
             )
             return
