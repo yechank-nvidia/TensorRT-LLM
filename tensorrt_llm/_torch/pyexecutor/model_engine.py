@@ -1841,7 +1841,7 @@ class PyTorchModelEngine(ModelEngine):
     def is_multimodal(self) -> bool:
         """True iff this engine drives a multimodal model.
 
-        Primary signal: :class:`MultimodalModelMixin` (PR #13866) is the
+        Primary signal: :class:`MultimodalModelMixin` is the
         canonical marker — multimodal LM classes inherit from it. Until
         every model has migrated (Mistral done; Qwen-VL, Nemotron, Gemma,
         Phi-4-MM, etc. pending), fall back to whether the input processor
@@ -4584,10 +4584,7 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.num_contexts = batch_size
             attn_metadata.max_seq_len = self.max_seq_len
             attn_metadata.request_ids = list(range(batch_size))
-            if hasattr(attn_metadata, 'prepare_encoder_only'):
-                attn_metadata.prepare_encoder_only()
-            else:
-                attn_metadata.prepare()
+            attn_metadata.prepare_encoder_only()
 
             self.input_ids_cuda[:actual_num_tokens].copy_(input_ids_t,
                                                           non_blocking=True)
