@@ -234,6 +234,26 @@ class CUDAGraphRunner:
                    is_all_greedy_sample)
         return key
 
+    @staticmethod
+    def _needs_mrope_delta_cache_seed(request: Any) -> bool:
+        if request.py_seq_slot is None or request.is_dummy:
+            return False
+
+        if getattr(request, "py_mrope_delta_cache_slot",
+                   None) == request.py_seq_slot:
+            return False
+
+        if getattr(request, "py_mrope_position_delta", None) is not None:
+            return True
+
+        multimodal_data = getattr(request, "py_multimodal_data", None)
+        if not multimodal_data:
+            return False
+
+        mrope_config = multimodal_data.get("mrope_config")
+        return (mrope_config is not None
+                and mrope_config.get("mrope_position_deltas") is not None)
+
     def __del__(self):
         self.clear()
 
@@ -276,9 +296,7 @@ class CUDAGraphRunner:
         if not self.enabled or not can_run_cuda_graph:
             return None, None, None
         if self.config.use_mrope and any(
-                request.py_seq_slot is not None and not request.is_dummy
-                and getattr(request, "py_mrope_delta_cache_slot",
-                            None) != request.py_seq_slot
+                self._needs_mrope_delta_cache_seed(request)
                 for request in batch.generation_requests):
             # Requests whose current seq slot has not been seeded in the
             # model-side MRoPE delta cache must run eagerly. Later decode steps

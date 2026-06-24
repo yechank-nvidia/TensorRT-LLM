@@ -3,6 +3,7 @@
 
 import unittest
 from dataclasses import dataclass
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import torch
@@ -11,6 +12,7 @@ import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
     KvCacheConnectorWorker
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -146,6 +148,82 @@ def create_model_engine_and_kvcache(llm_args: TorchLlmArgs = None,
 
 
 class PyTorchModelEngineTestCase(unittest.TestCase):
+
+    def _make_mrope_cuda_graph_runner_for_gate_test(self) -> CUDAGraphRunner:
+        graph_runner = CUDAGraphRunner.__new__(CUDAGraphRunner)
+        graph_runner.config = SimpleNamespace(use_mrope=True,
+                                              enable_attention_dp=False)
+        graph_runner.enabled = True
+        graph_runner.graphs = {}
+        graph_runner.graph_outputs = {}
+        graph_runner.graph_metadata = {}
+        graph_runner.memory_pool = None
+        graph_runner._capture_allowed = False
+        graph_runner.get_graph_key = Mock(return_value=(1, 0, False, False,
+                                                        True))
+        return graph_runner
+
+    @staticmethod
+    def _make_mrope_request(**kwargs: object) -> SimpleNamespace:
+        defaults = {
+            "py_seq_slot": 3,
+            "is_dummy": False,
+            "py_multimodal_data": None,
+        }
+        defaults.update(kwargs)
+        return SimpleNamespace(**defaults)
+
+    def test_mrope_cuda_graph_gate_allows_text_only_generation(self) -> None:
+        graph_runner = self._make_mrope_cuda_graph_runner_for_gate_test()
+        batch = SimpleNamespace(
+            can_run_cuda_graph=True,
+            batch_size=1,
+            generation_requests=[self._make_mrope_request()])
+
+        self.assertEqual(
+            graph_runner.maybe_get_cuda_graph(batch,
+                                              enable_spec_decode=False,
+                                              attn_metadata=Mock()),
+            (None, None, None))
+        graph_runner.get_graph_key.assert_called_once()
+
+    def test_mrope_cuda_graph_gate_blocks_unseeded_delta(self) -> None:
+        graph_runner = self._make_mrope_cuda_graph_runner_for_gate_test()
+        request = self._make_mrope_request(py_multimodal_data={
+            "mrope_config": {
+                "mrope_position_deltas": torch.tensor([7])
+            }
+        })
+        batch = SimpleNamespace(can_run_cuda_graph=True,
+                                batch_size=1,
+                                generation_requests=[request])
+
+        self.assertEqual(
+            graph_runner.maybe_get_cuda_graph(batch,
+                                              enable_spec_decode=False,
+                                              attn_metadata=Mock()),
+            (None, None, None))
+        graph_runner.get_graph_key.assert_not_called()
+
+    def test_mrope_cuda_graph_gate_allows_seeded_delta(self) -> None:
+        graph_runner = self._make_mrope_cuda_graph_runner_for_gate_test()
+        request = self._make_mrope_request(py_mrope_delta_cache_slot=3,
+                                           py_multimodal_data={
+                                               "mrope_config": {
+                                                   "mrope_position_deltas":
+                                                   torch.tensor([7])
+                                               }
+                                           })
+        batch = SimpleNamespace(can_run_cuda_graph=True,
+                                batch_size=1,
+                                generation_requests=[request])
+
+        self.assertEqual(
+            graph_runner.maybe_get_cuda_graph(batch,
+                                              enable_spec_decode=False,
+                                              attn_metadata=Mock()),
+            (None, None, None))
+        graph_runner.get_graph_key.assert_called_once()
 
     def test_pad_generation_requests(self) -> None:
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()
