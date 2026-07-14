@@ -2768,7 +2768,9 @@ class PyExecutor:
                             local_disagg_candidates,
                             fitting_disagg_gen_init_requests)
 
-                self._execute_scheduled_mm_encoder_items(scheduled_batch)
+                if (self.is_multimodal_model
+                        and scheduled_batch.scheduled_mm_encoder_items):
+                    self._forward_multimodal_encoder_step(scheduled_batch)
 
                 # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
                 if self.kv_cache_transceiver:
@@ -3912,8 +3914,6 @@ class PyExecutor:
         # not exist until the capacity scheduler has returned its verdict.
         self._pad_empty_attention_dp_batch(scheduled_batch)
 
-        self._execute_scheduled_mm_encoder_items(scheduled_batch)
-
         if self.drafter is not None and not self.use_spec_decode:
             for request in scheduled_batch.all_requests():
                 request.py_disable_speculative_decoding = True
@@ -4260,6 +4260,10 @@ class PyExecutor:
                                 req)
                     self._finalize_adp_dummy_allocation(False)
                     continue
+
+                if (self.is_multimodal_model
+                        and scheduled_batch.scheduled_mm_encoder_items):
+                    self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
@@ -4796,6 +4800,10 @@ class PyExecutor:
                                 req)
                     self._finalize_adp_dummy_allocation(False)
                     continue
+
+                if (self.is_multimodal_model
+                        and scheduled_batch.scheduled_mm_encoder_items):
+                    self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
@@ -5941,16 +5949,14 @@ class PyExecutor:
 
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, num_fitting
 
-    def _execute_scheduled_mm_encoder_items(
+    def _forward_multimodal_encoder_step(
             self, scheduled_requests: ScheduledRequests) -> None:
+        """Run scheduler-selected MM encoder work before LLM resources."""
         scheduled_items = scheduled_requests.scheduled_mm_encoder_items
         if not scheduled_items:
             return
-        self.execution_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.execution_stream):
-            self.model_engine.execute_multimodal_encoder_items(
-                self.active_requests, scheduled_items)
-        torch.cuda.current_stream().wait_stream(self.execution_stream)
+        self.model_engine.forward_multimodal_encoder_items(
+            self.active_requests, scheduled_items)
 
     # ---------------------------------------------------------------
     # Encoder-decoder support: encoder iteration in the executor loop.
