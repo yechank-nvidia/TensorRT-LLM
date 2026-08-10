@@ -584,6 +584,20 @@ def test_flush_pending_responses_includes_multimodal_encoder_errors():
     assert executor._pending_mm_encoder_error_responses == []
 
 
+def test_flush_pending_responses_joins_empty_attention_dp_rank():
+    enqueued = []
+
+    executor = object.__new__(PyExecutor)
+    executor._pending_transfer_responses = []
+    executor._pending_mm_encoder_error_responses = []
+    executor.enable_attention_dp = True
+    executor._enqueue_responses = lambda responses: enqueued.append(list(responses))
+
+    executor._flush_pending_transfer_responses()
+
+    assert enqueued == [[]]
+
+
 def _executor_for_mm_admission(active_requests, *, max_num_tokens=8):
     executor = object.__new__(PyExecutor)
     executor.enable_attention_dp = False
