@@ -14,8 +14,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from enum import IntEnum
 from queue import Queue
-from typing import (TYPE_CHECKING, Dict, Iterable, Iterator, List, Optional,
-                    Tuple, Union)
+from typing import (TYPE_CHECKING, Dict, Hashable, Iterable, Iterator, List,
+                    Optional, Tuple, Union)
 
 import torch
 from strenum import StrEnum
@@ -41,7 +41,8 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
-from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
+from tensorrt_llm.inputs.multimodal import (strip_mm_data_for_generation,
+                                            strip_mm_encoder_inputs)
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
@@ -97,9 +98,9 @@ from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
-from .scheduler import (RequestScheduler, ScheduledRequests,
-                        SerializableSchedulerOutput, WaitingQueue,
-                        create_waiting_queue)
+from .scheduler import (MultimodalScheduler, RequestScheduler,
+                        ScheduledRequests, SerializableSchedulerOutput,
+                        WaitingQueue, create_waiting_queue)
 from .scheduler.adp_router import ADPRouter
 
 if TYPE_CHECKING:
@@ -292,26 +293,6 @@ def _load_iteration_indexes(env_var: str):
     return frozenset(starts), frozenset(stops)
 
 
-def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
-    """Drop encoder outputs and raw inputs after prefill or early termination.
-
-    Wraps `strip_mm_data_for_generation` and mutates the shared `request.py_multimodal_data`
-    in-place so the `LlmRequest`'s multimodal tensors actually get freed (unlike
-    `MultimodalParams.strip_for_generation`, which rebinds a per-forward-call wrapper's attribute
-    and leaves the request's dict untouched).
-    """
-    mm_data = getattr(request, "py_multimodal_data", None)
-    if mm_data:
-        strip_mm_data_for_generation(mm_data)
-    # Drop the per-item encoder state alongside the dict clear above. The
-    # state and the published `multimodal_embedding` are two references to
-    # one embedding buffer, so both have to go for the GPU memory to be
-    # freed -- and a request stripped mid-encode only has the state's.
-    # Clearing it is also the byte-budget release: the scheduler derives
-    # occupancy from live states, so this request stops counting next tick.
-    request.py_mm_encoder_state = None
-
-
 @contextmanager
 def _distributed_warmup_guard(dist: Distributed,
                               mapping: Mapping) -> Iterator[None]:
@@ -463,10 +444,11 @@ class PyExecutor:
         self._enable_non_overlap_adp_forward_intent = getattr(
             model_engine, "_enable_non_overlap_adp_forward_intent", False)
         # Compatibility checks and MultimodalScheduler wrapping live in
-        # `create_py_executor_instance`; the executor only keeps the flag
-        # its loop paths branch on.
+        # `create_py_executor_instance`. Protocol handling runs on every PP
+        # stage; local encoder/cache operations also check the PP rank.
         self._mm_encoder_item_scheduling_enabled = getattr(
             model_engine, "mm_encoder_item_scheduling_enabled", False)
+        self._pending_mm_encoder_cache_removals: List[Hashable] = []
         self.scheduler = scheduler
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
@@ -718,6 +700,7 @@ class PyExecutor:
         self.send_handles = [None] * self.num_micro_batches
         # schedule handle for PP to propagate the first PP rank's schedule result
         self.send_schedule_handles = [None] * self.num_micro_batches
+        self.send_mm_encoder_result_handles = [None] * self.num_micro_batches
         self.send_expected_batch_num_handles = [None] * self.num_micro_batches
         self.unhandled_batch_counter = 0
         self.pp_scheduler_max_retry_count = int(
@@ -2475,6 +2458,8 @@ class PyExecutor:
                 self.wait_on_pp_send_handles(self.send_handles, i)
                 self.wait_on_pp_send_handles(self.send_schedule_handles, i)
                 self.wait_on_pp_send_handles(
+                    self.send_mm_encoder_result_handles, i)
+                self.wait_on_pp_send_handles(
                     self.send_expected_batch_num_handles, i)
             except Exception:
                 # PP send handles may be in a broken state after an
@@ -2539,6 +2524,23 @@ class PyExecutor:
                 serializable_schedule.wait_for_disagg_gen_transfer_progress)
         return (scheduled_batch, fitting_disagg_gen_init_requests,
                 num_fitting_reqs, wait_for_disagg_gen_transfer_progress)
+
+    def _pp_propagate_mm_encoder_result(
+        self,
+        result: Optional[Tuple[str, List[int]]],
+        microbatch_id: int,
+    ) -> Optional[Tuple[str, List[int]]]:
+        """Relay PP0's request-scoped MM encoder outcome before LLM forward."""
+        if not self.dist.is_first_pp_rank:
+            result = self.dist.recv_object(self.dist.prev_pp_rank,
+                                           PPCommTag.MM_ENCODER_RESULT)
+        if not self.dist.is_last_pp_rank:
+            self.wait_on_pp_send_handles(self.send_mm_encoder_result_handles,
+                                         microbatch_id)
+            self.send_mm_encoder_result_handles[
+                microbatch_id] = self.dist.isend_object(
+                    result, self.dist.next_pp_rank, PPCommTag.MM_ENCODER_RESULT)
+        return result
 
     def _pp_retry_until_can_schedule(self, scheduled_batch):
         """
@@ -2639,8 +2641,20 @@ class PyExecutor:
                                "prepare_expect_snapshot_points"):
                         self.kv_cache_manager.prepare_expect_snapshot_points(
                             self.active_requests)
-                    local_scheduler_output = self.scheduler.schedule_request(
-                        self.active_requests, self.inflight_req_ids)
+                    if isinstance(self.scheduler, MultimodalScheduler):
+                        local_scheduler_output = self.scheduler.replay_request(
+                            self.active_requests,
+                            self.inflight_req_ids,
+                            blocked_request_ids=(
+                                scheduled_batch.mm_encoder_blocked_request_ids),
+                            scheduled_items=(
+                                scheduled_batch.scheduled_mm_encoder_items),
+                            cache_removals=(
+                                scheduled_batch.mm_encoder_cache_removals),
+                        )
+                    else:
+                        local_scheduler_output = self.scheduler.schedule_request(
+                            self.active_requests, self.inflight_req_ids)
                     if self.kv_cache_transceiver:
                         local_disagg_candidates = getattr(
                             local_scheduler_output,
@@ -2649,9 +2663,24 @@ class PyExecutor:
                             local_disagg_candidates,
                             fitting_disagg_gen_init_requests)
 
+                mm_encoder_result = None
                 if (self._mm_encoder_item_scheduling_enabled
-                        and scheduled_batch.scheduled_mm_encoder_items):
-                    self._forward_multimodal_encoder_step(scheduled_batch)
+                        and self.dist.is_first_pp_rank):
+                    mm_encoder_result = self._forward_multimodal_encoder_step(
+                        scheduled_batch)
+                elif (self.dist.pp_size > 1
+                      and self._mm_encoder_item_scheduling_enabled):
+                    for request in scheduled_batch.context_requests:
+                        if request.py_multimodal_data is not None:
+                            strip_mm_encoder_inputs(request.py_multimodal_data)
+                if self._mm_encoder_item_scheduling_enabled:
+                    mm_encoder_result = self._pp_propagate_mm_encoder_result(
+                        mm_encoder_result, microbatch_id)
+                    if (not self.dist.is_first_pp_rank
+                            and mm_encoder_result is not None):
+                        error_msg, failed_request_ids = mm_encoder_result
+                        self._handle_multimodal_encoder_request_error(
+                            scheduled_batch, error_msg, set(failed_request_ids))
 
                 if self._is_kv_manager_v2:
                     self._terminate_recompute_paused_requests(scheduled_batch)
@@ -4226,7 +4255,7 @@ class PyExecutor:
                     continue
 
                 if (self._mm_encoder_item_scheduling_enabled
-                        and scheduled_batch.scheduled_mm_encoder_items):
+                        and self.dist.is_first_pp_rank):
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if self._is_kv_manager_v2:
@@ -5053,7 +5082,7 @@ class PyExecutor:
                     continue
 
                 if (self._mm_encoder_item_scheduling_enabled
-                        and scheduled_batch.scheduled_mm_encoder_items):
+                        and self.dist.is_first_pp_rank):
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if self._is_kv_manager_v2:
@@ -5919,6 +5948,10 @@ class PyExecutor:
                             "bytes_per_mm_encoder_embedding",
                             0,
                         ))
+                    if not self.dist.is_first_pp_rank:
+                        # Every PP stage validates the same request contract,
+                        # but only PP0 retains item references and cache state.
+                        request.py_mm_encoder_state = None
                 return False
             except Exception as e:
                 self._handle_errors(str(e),
@@ -6293,6 +6326,17 @@ class PyExecutor:
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
 
+        if self._pending_mm_encoder_cache_removals:
+            if not self._is_mm_encoder_cache_authority():
+                raise RuntimeError(
+                    "MM physical replica queued an authority-only cache removal"
+                )
+            scheduler_output = scheduler_output._replace(
+                mm_encoder_cache_removals=(
+                    self._pending_mm_encoder_cache_removals +
+                    list(scheduler_output.mm_encoder_cache_removals or ())))
+            self._pending_mm_encoder_cache_removals = []
+
         scheduled_encoder_requests = scheduler_output.encoder_requests
         should_batch_encoder_requests = (self.is_encoder_decoder
                                          and not self.enable_attention_dp
@@ -6346,42 +6390,57 @@ class PyExecutor:
         scheduled_requests.scheduled_mm_encoder_items = (
             scheduler_output.scheduled_mm_encoder_items)
         scheduled_requests.recompute_paused_requests = scheduler_output.recompute_paused_requests
+        scheduled_requests.mm_encoder_blocked_request_ids = (
+            scheduler_output.mm_encoder_blocked_request_ids)
+        scheduled_requests.mm_encoder_cache_removals = (
+            scheduler_output.mm_encoder_cache_removals)
 
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, num_fitting
 
     def _forward_multimodal_encoder_step(
-            self, scheduled_requests: ScheduledRequests) -> None:
-        """Run scheduler-selected MM encoder work before LLM resources."""
-        scheduled_items = scheduled_requests.scheduled_mm_encoder_items
-        if not scheduled_items:
-            return
+        self, scheduled_requests: ScheduledRequests
+    ) -> Optional[Tuple[str, List[int]]]:
+        """Apply the MM cache delta and run selected producers before prefill."""
+        scheduled_items = scheduled_requests.scheduled_mm_encoder_items or {}
         try:
-            self.model_engine.forward_multimodal_encoder_items(
-                self.active_requests, scheduled_items)
+            self.model_engine.replay_multimodal_cache_plan(
+                self.active_requests,
+                scheduled_requests,
+                is_cache_authority=self._is_mm_encoder_cache_authority(),
+            )
         except MultimodalEncoderRequestError as e:
             error_msg = str(e)
             logger.error(f"Encountered an error in multimodal encoder forward: "
                          f"{error_msg}\n{traceback.format_exc()}")
 
-            failed_request_ids = set(scheduled_items)
-            failed_requests = [
-                request for request in self.active_requests
-                if request.request_id in failed_request_ids
-            ]
+            failed_request_ids = set(e.request_ids or scheduled_items)
+            self._handle_multimodal_encoder_request_error(
+                scheduled_requests, error_msg, failed_request_ids)
+            return error_msg, sorted(failed_request_ids)
+        return None
 
-            # Capacity scheduling may already have placed requests whose last
-            # pending item was selected into this iteration's context batch.
-            # Remove the failed owners before the LLM forward; unrelated
-            # context and generation work remains intact.
-            scheduled_requests.reset_context_requests([
-                request for request in scheduled_requests.context_requests
-                if request.request_id not in failed_request_ids
-            ])
-            scheduled_requests.scheduled_mm_encoder_items = None
+    def _handle_multimodal_encoder_request_error(
+            self, scheduled_requests: ScheduledRequests, error_msg: str,
+            failed_request_ids: set[int]) -> None:
+        """Remove the same failed MM dependents on every participating rank."""
+        failed_requests = [
+            request for request in self.active_requests
+            if request.request_id in failed_request_ids
+        ]
 
-            self._handle_errors(error_msg,
-                                requests=failed_requests,
-                                charge_budget=False)
+        # Capacity scheduling may already have placed requests whose last
+        # pending item was selected into this iteration's context batch.
+        # Remove the failed owners before the LLM forward; unrelated context
+        # and generation work remains intact.
+        scheduled_requests.reset_context_requests([
+            request for request in scheduled_requests.context_requests
+            if request.request_id not in failed_request_ids
+        ])
+        scheduled_requests.scheduled_mm_encoder_items = None
+
+        self._handle_errors(error_msg,
+                            requests=failed_requests,
+                            charge_budget=False)
 
     # ---------------------------------------------------------------
     # Encoder-decoder support: encoder iteration in the executor loop.
@@ -7792,6 +7851,33 @@ class PyExecutor:
                 request.set_exclude_last_generation_logits(False)
                 request.state = LlmRequestState.GENERATION_TO_COMPLETE
 
+    def _is_mm_encoder_cache_authority(self) -> bool:
+        return (self._mm_encoder_item_scheduling_enabled
+                and self.dist.is_first_pp_rank
+                and (self.dist.pp_size == 1 or self.enable_attention_dp
+                     or self.global_rank == 0))
+
+    def _release_py_multimodal_resources(self, request: LlmRequest) -> None:
+        """Release MM references and strip request-owned data exactly once."""
+        state = getattr(request, "py_mm_encoder_state", None)
+        if state is not None:
+            entry_ids = state.drain_entry_ids()
+            request.py_mm_encoder_state = None
+            if self._is_mm_encoder_cache_authority():
+                encoder_cache = self.model_engine.mm_encoder_cache
+                if encoder_cache is None:
+                    raise RuntimeError(
+                        "MM cache authority has no model-owned encoder cache")
+                for entry_id in entry_ids:
+                    removed_entry_id = encoder_cache.release(entry_id)
+                    if (removed_entry_id is not None and self.dist.pp_size > 1):
+                        self._pending_mm_encoder_cache_removals.append(
+                            removed_entry_id)
+
+        mm_data = getattr(request, "py_multimodal_data", None)
+        if mm_data:
+            strip_mm_data_for_generation(mm_data)
+
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
         # handle potential attention dp dummy request
         if self.active_requests and self.active_requests[
@@ -7815,7 +7901,7 @@ class PyExecutor:
                 # on `py_multimodal_data`. Without this, encoder inputs and outputs for multi-modal
                 # requests stay pinned on GPU through the full decode lifetime and can lead to OOMs
                 # at high concurrency.
-                _strip_py_multimodal_data_post_prefill(request)
+                self._release_py_multimodal_resources(request)
                 if not self.disable_overlap_scheduler and request.will_complete_next_iteration(
                 ):
                     request.set_exclude_last_generation_logits(False)
@@ -8146,7 +8232,7 @@ class PyExecutor:
         self._free_request_resources(request)
         # Cancellation and request-scoped failures can terminate before the
         # normal post-prefill release point, including with a partial buffer.
-        _strip_py_multimodal_data_post_prefill(request)
+        self._release_py_multimodal_resources(request)
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
 
@@ -8680,6 +8766,24 @@ class PyExecutor:
 
     def reset_prefix_cache(self):
         self.kv_cache_manager.reset_reuse_state()
+
+    def invalidate_multimodal_encoder_cache(self) -> None:
+        """Clear weight-derived MM outputs after request lifetimes quiesce."""
+        live_request_ids = [
+            request.py_request_id for request in self.active_requests
+            if request.py_mm_encoder_state is not None and any(
+                entry_id is not None
+                for entry_id in request.py_mm_encoder_state.entry_ids)
+        ]
+        if live_request_ids:
+            raise RuntimeError(
+                "cannot update weights with live multimodal cache references: "
+                f"request_ids={live_request_ids}")
+        self.model_engine.invalidate_multimodal_encoder_cache()
+        # Hard invalidation also clears every follower's physical store. Do
+        # not later replay transient deletions selected for the old weight
+        # generation against that now-empty store.
+        self._pending_mm_encoder_cache_removals.clear()
 
     def _handle_guided_decoder_errors(
             self, scheduled_batch: ScheduledRequests,
