@@ -42,7 +42,6 @@ from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.multimodal import (strip_mm_data_for_generation,
                                             strip_mm_encoder_inputs)
-from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
@@ -79,8 +78,7 @@ from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
                           MultimodalEncoderRequestError, get_draft_token_length,
-                          initialize_multimodal_encoder_request,
-                          is_multimodal_encoder_ready)
+                          initialize_multimodal_encoder_request)
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
@@ -2770,6 +2768,8 @@ class PyExecutor:
                                 scheduled_batch.scheduled_mm_encoder_items),
                             cache_removals=(
                                 scheduled_batch.mm_encoder_cache_removals),
+                            context_chunk_sizes=(
+                                scheduled_batch.mm_encoder_context_chunk_sizes),
                         )
                     else:
                         local_scheduler_output = self.scheduler.schedule_request(
@@ -5692,79 +5692,6 @@ class PyExecutor:
                 f"{self.benchmark_req_queues_size} to prevent an unreachable "
                 f"benchmark disagg fill gate.")
 
-    def _apply_mm_encoder_admission(
-            self, waiting_queue: WaitingQueue,
-            new_requests: List[RequestQueueItem]) -> List[RequestQueueItem]:
-        """Apply MM encoder item/token budgets to capacity-admitted requests.
-
-        Active requests consume this iteration's encoder budget first. New
-        requests then preserve waiting-queue FCFS order: once the head request
-        cannot make encoder progress, all later requests are deferred and
-        prepended to the waiting queue.
-        """
-        remaining_batch_slots = self.model_engine.encoder_batch_size
-        remaining_tokens = self.model_engine.encoder_max_num_tokens
-
-        def consume_pending(costs, pending_indices=None):
-            nonlocal remaining_batch_slots, remaining_tokens
-            if pending_indices is None:
-                pending_indices = range(len(costs))
-            progressed = False
-            for item_idx in pending_indices:
-                cost = costs[item_idx]
-                if remaining_batch_slots == 0 or cost > remaining_tokens:
-                    break
-                remaining_batch_slots -= 1
-                remaining_tokens -= cost
-                progressed = True
-            return progressed
-
-        for request in self.active_requests:
-            state = request.py_mm_encoder_state
-            if state is None or is_multimodal_encoder_ready(request):
-                continue
-            consume_pending(state.encoder_token_lengths,
-                            state.pending_item_indices())
-
-        admitted = []
-        deferred = []
-        blocked = False
-        for queue_item in new_requests:
-            if blocked:
-                deferred.append(queue_item)
-                continue
-            mm_data = getattr(queue_item.request, "py_multimodal_data", None)
-            try:
-                item_metadata = (get_multimodal_encoder_item_metadata(mm_data)
-                                 if isinstance(mm_data, dict) else None)
-            except (TypeError, ValueError):
-                # Admission only estimates capacity. Pass malformed requests
-                # through so the normal request-scoped validation path can
-                # report the error without terminating the executor loop or
-                # blocking later FCFS entries behind an invalid request.
-                admitted.append(queue_item)
-                continue
-            costs = (item_metadata.encoder_token_lengths
-                     if item_metadata is not None else None)
-            has_full_embedding = (isinstance(mm_data, dict)
-                                  and mm_data.get("multimodal_embedding")
-                                  is not None)
-            if costs and any(cost > self.model_engine.encoder_max_num_tokens
-                             for cost in costs):
-                # Admit the invalid request so normal request validation can
-                # return an error instead of leaving the FCFS queue blocked.
-                admitted.append(queue_item)
-                continue
-            if costs and not has_full_embedding and not consume_pending(costs):
-                blocked = True
-                deferred.append(queue_item)
-                continue
-            admitted.append(queue_item)
-
-        if deferred:
-            waiting_queue.prepend_requests(deferred)
-        return admitted
-
     def _pop_from_waiting_queue(
         self,
         waiting_queue: WaitingQueue,
@@ -5792,11 +5719,7 @@ class PyExecutor:
             enable_attention_dp=self.enable_attention_dp,
             max_num_active_requests=self.max_num_active_requests,
             all_ranks_num_active_requests=all_ranks_num_active_requests)
-        if (not new_requests or
-                not getattr(self, "_mm_encoder_item_scheduling_enabled", False)
-                or self.enable_attention_dp):
-            return new_requests
-        return self._apply_mm_encoder_admission(waiting_queue, new_requests)
+        return new_requests
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
@@ -6352,6 +6275,8 @@ class PyExecutor:
             scheduler_output.mm_encoder_blocked_request_ids)
         scheduled_requests.mm_encoder_cache_removals = (
             scheduler_output.mm_encoder_cache_removals)
+        scheduled_requests.mm_encoder_context_chunk_sizes = (
+            scheduler_output.mm_encoder_context_chunk_sizes)
 
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, num_fitting
 
@@ -6360,6 +6285,11 @@ class PyExecutor:
     ) -> Optional[Tuple[str, List[int]]]:
         """Update the MM cache and encode selected items before LLM prefill."""
         scheduled_items = scheduled_requests.scheduled_mm_encoder_items or {}
+        if (not scheduled_items
+                and not scheduled_requests.mm_encoder_cache_removals and
+                not any(request.py_mm_encoder_state is not None
+                        for request in scheduled_requests.context_requests)):
+            return None
         try:
             self.model_engine.run_multimodal_encoder_schedule(
                 self.active_requests,
@@ -7792,23 +7722,64 @@ class PyExecutor:
                 and (self.dist.pp_size == 1 or self.enable_attention_dp
                      or self.global_rank == 0))
 
+    def _release_mm_item_cache_entries(self, request: LlmRequest,
+                                       item_indices: Iterable[int]) -> None:
+        """Release this request's cache references for the given MM items."""
+        state = request.py_mm_encoder_state
+        if state is None:
+            return
+        encoder_cache = None
+        if self._owns_mm_encoder_cache_references():
+            encoder_cache = self.model_engine.mm_encoder_cache
+            if encoder_cache is None:
+                raise RuntimeError(
+                    "The MM cache-reference rank has no encoder cache")
+        for item_idx in item_indices:
+            if state.item_cache_keys[item_idx] is None:
+                continue
+            cache_key = state.clear_item_cache_key(item_idx)
+            if encoder_cache is None:
+                continue
+            removed_cache_key = encoder_cache.release(cache_key)
+            if removed_cache_key is not None and self.dist.pp_size > 1:
+                self._pending_mm_encoder_cache_removals.append(
+                    removed_cache_key)
+
+    def _release_consumed_mm_item_entries(self, request: LlmRequest) -> None:
+        """Release item outputs wholly behind confirmed prefill progress."""
+        state = request.py_mm_encoder_state
+        if state is None:
+            return
+        position = request.context_current_position
+        mm_data = request.py_multimodal_data
+        cumsum = (mm_data.get("multimodal_embed_mask_cumsum") if isinstance(
+            mm_data, dict) else None)
+        releasable = []
+        if cumsum is not None:
+            consumed_rows = int(cumsum[position - 1]) if position > 0 else 0
+            item_end = 0
+            for item_idx, length in enumerate(state.embedding_lengths):
+                item_end += length
+                if item_end <= consumed_rows:
+                    releasable.append(item_idx)
+        elif (request.multimodal_positions is not None
+              and request.multimodal_lengths is not None):
+            releasable = [
+                item_idx
+                for item_idx, (item_position, item_length) in enumerate(
+                    zip(request.multimodal_positions,
+                        request.multimodal_lengths,
+                        strict=True))
+                if int(item_position) + int(item_length) <= position
+            ]
+        self._release_mm_item_cache_entries(request, releasable)
+
     def _release_multimodal_resources(self, request: LlmRequest) -> None:
         """Release this request's cache entries and discard unused MM data."""
         state = request.py_mm_encoder_state
         if state is not None:
-            cache_keys = state.pop_all_cache_keys()
+            self._release_mm_item_cache_entries(request, range(state.num_items))
             request.py_mm_encoder_state = None
-            if self._owns_mm_encoder_cache_references():
-                encoder_cache = self.model_engine.mm_encoder_cache
-                if encoder_cache is None:
-                    raise RuntimeError(
-                        "The MM cache-reference rank has no encoder cache")
-                for cache_key in cache_keys:
-                    removed_cache_key = encoder_cache.release(cache_key)
-                    if (removed_cache_key is not None
-                            and self.dist.pp_size > 1):
-                        self._pending_mm_encoder_cache_removals.append(
-                            removed_cache_key)
 
         mm_data = getattr(request, "py_multimodal_data", None)
         if mm_data:
@@ -7831,6 +7802,7 @@ class PyExecutor:
                     request.context_current_position +
                     request.context_chunk_size)
                 request.move_to_next_context_chunk()
+                self._release_consumed_mm_item_entries(request)
             if request.context_remaining_length == 0:
                 # Prefill is done for this request; drop pinned encoder outputs
                 # (multimodal_embedding) and raw pre-encoder tensors that multimodal models stashed
@@ -8579,6 +8551,9 @@ class PyExecutor:
 
     def _pause_requests(self, requests_to_pause):
         for req in requests_to_pause:
+            state = req.py_mm_encoder_state
+            if state is not None:
+                self._release_mm_item_cache_entries(req, range(state.num_items))
             req.pause(self.max_input_len)
 
     def _add_inflight_ids(self, scheduled_requests: ScheduledRequests):

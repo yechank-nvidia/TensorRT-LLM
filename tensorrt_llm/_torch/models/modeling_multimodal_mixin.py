@@ -1062,26 +1062,29 @@ class MultimodalModelMixin:
         # Item-scheduled execution attaches cache-owned entries as an immutable
         # tuple to distinguish them from legacy chunk-accumulation lists. Keep
         # those per-item segments intact through chunk selection and fusion.
-        scheduled_segments: list[torch.Tensor] = []
-        has_scheduled_segments = False
+        embedding_segments: list[torch.Tensor] = []
+        has_segmented_embeddings = False
         for param in multimodal_params:
             embedding = param.multimodal_data.get("multimodal_embedding")
             if isinstance(embedding, tuple):
-                has_scheduled_segments = True
+                has_segmented_embeddings = True
                 segments = embedding
             elif isinstance(embedding, torch.Tensor):
                 segments = (embedding,)
             elif isinstance(embedding, list):
                 segments = tuple(embedding)
             else:
-                scheduled_segments = []
+                embedding_segments = []
                 break
             if not all(isinstance(segment, torch.Tensor) for segment in segments):
                 raise TypeError("multimodal_embedding segments must be tensors")
-            scheduled_segments.extend(segments)
-        if has_scheduled_segments and scheduled_segments:
-            self._validate_embeddings(scheduled_segments, multimodal_params)
-            return tuple(scheduled_segments)
+            embedding_segments.extend(segments)
+        if has_segmented_embeddings:
+            if embedding_segments:
+                self._validate_embeddings(
+                    embedding_segments, multimodal_params, current_chunk_only=True
+                )
+            return tuple(embedding_segments)
 
         encoder_cache = self._get_multimodal_encoder_cache()
         cache_misses: list[MultimodalParams] = []
@@ -1588,11 +1591,15 @@ class MultimodalModelMixin:
     def _validate_embeddings(
         embeddings: list[torch.Tensor],
         multimodal_params: Sequence[MultimodalParams],
+        *,
+        current_chunk_only: bool = False,
     ) -> None:
         """Validate gathered embedding segments and their aggregate row count.
 
         Skipped if any param lacks `multimodal_runtime.total_embeds_in_request`, since the contract
-        cannot be evaluated without complete metadata.
+        cannot be evaluated without complete metadata. Item-scheduled views
+        validate against only the current chunk's rows because the cache
+        segments are already sliced to the active prompt window.
         """
         if not embeddings:
             raise ValueError("Multimodal embeddings must contain at least one tensor.")
@@ -1615,7 +1622,11 @@ class MultimodalModelMixin:
             has_runtime = runtime is not None and runtime.total_embeds_in_request is not None
             has_runtime_metadata.append(has_runtime)
             if has_runtime:
-                expected_rows += runtime.total_embeds_in_request
+                expected_rows += (
+                    runtime.num_mm_tokens_in_chunk
+                    if current_chunk_only
+                    else runtime.total_embeds_in_request
+                )
 
         if any(has_runtime_metadata) and not all(has_runtime_metadata):
             raise ValueError(

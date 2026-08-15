@@ -542,23 +542,20 @@ def _parse_binary_byte_string(value: Any) -> Any:
 
 
 class MultimodalEncoderSchedulingPolicy(StrEnum):
-    """Selects how a model that supports item-level MM encoder scheduling runs its encoder.
+    """Choose when a supported model encodes each multimodal item.
 
-    Ignored for models that do not support it (they always use legacy inline
-    encode).
+    Models without item scheduling ignore this setting and encode all items in
+    the model forward pass.
     """
 
     DISABLED = "DISABLED"
-    """Legacy inline encode: the encoder runs inside the model forward, not as
-    a separately scheduled step. Item scheduling and its byte budget are off."""
+    """Encode all items in the model forward pass."""
 
     DEFAULT = "DEFAULT"
-    """Item scheduling (``MultimodalScheduler``): the executor encodes atomic
-    MM items as a separate, budgeted step before prefill."""
+    """Encode the items needed by the current LLM prefill chunk."""
 
     EAGER = "EAGER"
-    """Item scheduling that advances encoder work for active requests before
-    LLM capacity filtering (``MultimodalEagerEncoderScheduler``)."""
+    """Also use leftover encoder budget to prepare later items."""
 
 
 class MultimodalConfig(StrictBaseModel):
@@ -600,12 +597,11 @@ class MultimodalConfig(StrictBaseModel):
     encoder_scheduling_policy: MultimodalEncoderSchedulingPolicy = Field(
         default=MultimodalEncoderSchedulingPolicy.DEFAULT,
         description=(
-            "MM encoder scheduling policy for models that support item-level "
-            "encoder scheduling. DISABLED: legacy inline encode (item "
-            "scheduling and its byte budget off). DEFAULT: item scheduling. "
-            "EAGER: item scheduling that advances encoder work for active "
-            "requests before LLM capacity filtering. Ignored for models that "
-            "do not support item scheduling."),
+            "When to encode multimodal items. DISABLED: encode all items in "
+            "the model forward pass. DEFAULT: encode items needed by the "
+            "current LLM prefill chunk. EAGER: also use leftover encoder "
+            "budget to prepare later items. Models without item scheduling "
+            "ignore this setting."),
         status="prototype",
     )
 

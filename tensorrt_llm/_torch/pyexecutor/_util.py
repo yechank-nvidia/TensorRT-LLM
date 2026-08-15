@@ -72,9 +72,8 @@ from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        KVCacheV2Scheduler, MultimodalEagerEncoderScheduler,
-                        MultimodalScheduler, SimpleScheduler,
-                        SimpleUnifiedScheduler)
+                        KVCacheV2Scheduler, MultimodalScheduler,
+                        SimpleScheduler, SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
 
 if TYPE_CHECKING:
@@ -3109,20 +3108,15 @@ def create_py_executor_instance(
         # Wrap the LLM scheduler with atomic MM item budgeting. ModelEngine
         # already validated model-capability-dependent feature combinations.
         multimodal_config = llm_args.multimodal_config
-        # `mm_encoder_item_scheduling_enabled` already excludes the DISABLED
-        # policy (a disabled model never reaches here and keeps the base LLM
-        # scheduler), so only the EAGER vs DEFAULT variant is selected here.
-        scheduler_cls = MultimodalScheduler
         if (multimodal_config.encoder_scheduling_policy ==
                 MultimodalEncoderSchedulingPolicy.EAGER):
             logger.info("Eager multimodal encoder scheduling is enabled for "
-                        "capacity-rejected active requests.")
-            scheduler_cls = MultimodalEagerEncoderScheduler
+                        "future items of active requests.")
         encoder_cache = model_engine.mm_encoder_cache
         if encoder_cache is None:
             raise RuntimeError(
                 "MM encoder item scheduling requires its unified output cache")
-        scheduler = scheduler_cls(
+        scheduler = MultimodalScheduler(
             scheduler,
             max_batch_size=model_engine.encoder_batch_size,
             max_num_tokens=model_engine.encoder_max_num_tokens,
@@ -3131,6 +3125,7 @@ def create_py_executor_instance(
             bytes_per_encoder_embedding=(
                 model_engine.bytes_per_mm_encoder_embedding),
             retain_cache_entries=model_engine.model.encoder_cache_active,
+            scheduling_policy=(multimodal_config.encoder_scheduling_policy),
         )
 
     config = model_engine.model.model_config.pretrained_config
