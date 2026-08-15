@@ -1058,14 +1058,43 @@ class MultimodalModelMixin:
     ) -> torch.Tensor:
         """Return cached multimodal embeddings or run the encoder for misses.
 
-        Delegates cache lookup and gather behavior to `get_multimodal_embeddings`, then validates
-        the single tensor contract for both encoded and cached-only paths.
+        Item scheduling marks its current-window cache segments with a tuple.
+        This layer joins those segments so the model-facing path keeps the
+        existing single-tensor contract. Other callers retain the normal cache
+        lookup and encoder behavior.
 
         During side-stream prefetch, this runs with the auxiliary stream current, so the H2D copies,
         the encoder, and every persistent-cache `put()` are issued on that stream. `TensorLRUCache`
         records each entry's producer event on the issuing (aux) stream; the next iteration's
         main-stream consumer waits on the request-level `encoder_event` for ordering.
         """
+        # The immutable tuple distinguishes current-window cache segments from
+        # legacy lists used while accumulating encoder outputs.
+        embedding_segments: list[torch.Tensor] = []
+        has_scheduled_segments = False
+        for param in multimodal_params:
+            embedding = param.multimodal_data.get("multimodal_embedding")
+            if isinstance(embedding, tuple):
+                has_scheduled_segments = True
+                segments = embedding
+            elif isinstance(embedding, torch.Tensor):
+                segments = (embedding,)
+            elif isinstance(embedding, list):
+                segments = tuple(embedding)
+            else:
+                embedding_segments = []
+                break
+            if not all(isinstance(segment, torch.Tensor) for segment in segments):
+                raise TypeError("multimodal_embedding segments must be tensors")
+            embedding_segments.extend(segments)
+        if has_scheduled_segments:
+            if embedding_segments:
+                embedding = torch.cat(embedding_segments, dim=0)
+            else:
+                embedding = self.text_embedding_layer.weight.new_empty((0, self.embedding_dim))
+            self._validate_embeddings([embedding], multimodal_params, current_chunk_only=True)
+            return embedding
+
         encoder_cache = self._multimodal_encoder_cache
         cache_misses: list[MultimodalParams] = []
         partial_hits: list[tuple[MultimodalParams, EncoderCachePartition]] = []
@@ -1544,11 +1573,15 @@ class MultimodalModelMixin:
     def _validate_embeddings(
         embeddings: list[torch.Tensor],
         multimodal_params: Sequence[MultimodalParams],
+        *,
+        current_chunk_only: bool = False,
     ) -> None:
         """Validate gathered embeddings' row count against runtime metadata.
 
         Skipped if any param lacks `multimodal_runtime.total_embeds_in_request`, since the contract
-        cannot be evaluated without complete metadata.
+        cannot be evaluated without complete metadata. Item-scheduled views
+        validate against only the current chunk's rows because the cache
+        segments are already sliced to the active prompt window.
         """
         if len(embeddings) != 1:
             raise ValueError(
@@ -1564,7 +1597,11 @@ class MultimodalModelMixin:
             has_runtime = runtime is not None and runtime.total_embeds_in_request is not None
             has_runtime_metadata.append(has_runtime)
             if has_runtime:
-                expected_rows += runtime.total_embeds_in_request
+                expected_rows += (
+                    runtime.num_mm_tokens_in_chunk
+                    if current_chunk_only
+                    else runtime.total_embeds_in_request
+                )
 
         if any(has_runtime_metadata) and not all(has_runtime_metadata):
             raise ValueError(

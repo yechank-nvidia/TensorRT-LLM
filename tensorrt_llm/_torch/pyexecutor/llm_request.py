@@ -4,7 +4,6 @@
 
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
-from enum import Enum, auto
 from typing import (TYPE_CHECKING, Any, Dict, Hashable, Iterable, List,
                     Optional, Union, cast)
 
@@ -15,6 +14,7 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
+from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.sampling_params import LogprobMode
 
@@ -66,26 +66,6 @@ class MultimodalEncoderRequestError(ValueError):
         self.request_ids = frozenset(request_ids or ())
 
 
-class MultimodalEncoderProgress(Enum):
-    """Python-only progress derived from request-local MM item outputs.
-
-    Only `READY` gates control flow today (`is_multimodal_encoder_ready`);
-    `PENDING`/`PARTIAL` are the intermediate states the item-level chunked
-    MM prefill follow-up will consume (per-chunk readiness) and document the
-    FCFS priority in the meantime."""
-
-    PENDING = auto()
-    """No MM item of the request has an encoder output yet."""
-
-    PARTIAL = auto()
-    """Some but not all items are encoded; the request must continue on the
-    item-scheduling path until every item has an output."""
-
-    READY = auto()
-    """No further encoder work is needed: every item is encoded, a
-    precomputed embedding was supplied, or the request has no MM payload."""
-
-
 class _Unset:
     """Sentinel for a memo that has not been computed yet.
 
@@ -111,36 +91,32 @@ class MultimodalEncoderRequestState:
     Other requests leave `py_mm_encoder_state` as `None`.
 
     Encoder outputs live only in the model-owned `TensorLRUCache`. This object
-    stores one cache key and one ready flag per item, in prompt order. On the
-    rank that tracks cache references, each non-empty slot holds one. Two
-    identical items may point to the same cache entry, but each item still
-    holds and releases its own reference. The request does not store another
-    output tensor or combined output buffer.
+    stores one cache key per item, in prompt order. The rank that tracks cache
+    references holds one reference for every non-empty slot. Identical items
+    may share one key, but each item still holds and releases its own reference.
+    The cache itself tells whether an output is ready; the request
+    does not keep another ready flag, output tensor, or combined output buffer.
 
-    Cleanup clears the slots before releasing their references, so repeated
-    request cleanup is safe. Other first-stage ranks keep the same cache keys
-    but do not change reference counts. The schedule sent between ranks only
-    contains selected items, blocked request IDs, and cache removals.
+    Cleanup clears keys before releasing references, so repeated request
+    cleanup is safe. Other first-stage ranks keep the same keys but do not
+    change reference counts. The schedule sent between ranks contains selected
+    items, adjusted context chunks, blocked request IDs, and cache removals.
     """
 
     embedding_lengths: List[int]
     """Expected encoder-output rows for each item, in prompt order."""
 
     encoder_token_lengths: List[int]
-    """Validated encoder attention-token cost of each atomic item.
+    """Validated encoder token cost for each item.
 
     Admission copies these values from the request metadata so scheduling
     never has to re-validate user input inside the scheduler loop.
     """
 
-    item_ready: List[bool]
-    """Whether each item's bound cache entry is ready, in prompt order."""
-
     item_cache_keys: List[Optional[Hashable]] = field(default_factory=list)
     """Cache keys held by this request, in prompt order.
 
     A non-empty slot holds one reference on the rank that tracks them.
-    `item_ready` tells whether the entry already contains its encoder output.
     """
 
     stable_item_cache_keys: Union[List[Hashable], None, "_Unset"] = _UNSET
@@ -161,43 +137,25 @@ class MultimodalEncoderRequestState:
             encoder_token_lengths = embedding_lengths
         return cls(embedding_lengths=list(embedding_lengths),
                    encoder_token_lengths=list(encoder_token_lengths),
-                   item_ready=[False] * len(embedding_lengths),
                    item_cache_keys=[None] * len(embedding_lengths))
 
     def __post_init__(self) -> None:
         if not self.item_cache_keys:
-            self.item_cache_keys = [None] * len(self.item_ready)
+            self.item_cache_keys = [None] * len(self.embedding_lengths)
         if not (len(self.embedding_lengths) == len(self.encoder_token_lengths)
-                == len(self.item_ready) == len(self.item_cache_keys)):
+                == len(self.item_cache_keys)):
             raise ValueError("MM encoder token and embedding lengths must have "
                              "exactly one cache key per item slot")
 
     @property
     def num_items(self) -> int:
-        return len(self.item_ready)
+        return len(self.embedding_lengths)
 
-    @property
-    def progress(self) -> MultimodalEncoderProgress:
-        if all(self.item_ready):
-            return MultimodalEncoderProgress.READY
-        if any(self.item_ready):
-            return MultimodalEncoderProgress.PARTIAL
-        return MultimodalEncoderProgress.PENDING
-
-    def pending_item_indices(self) -> List[int]:
-        """Indices of items that still need an encoder output, prompt order."""
-        return [
-            item_idx for item_idx, ready in enumerate(self.item_ready)
-            if not ready
-        ]
-
-    def set_item_cache_key(self, item_idx: int, cache_key: Hashable, *,
-                           ready: bool) -> None:
+    def set_item_cache_key(self, item_idx: int, cache_key: Hashable) -> None:
         """Assign a cache key to one item."""
         if self.item_cache_keys[item_idx] is not None:
             raise RuntimeError(f"MM item {item_idx} already has a cache key")
         self.item_cache_keys[item_idx] = cache_key
-        self.item_ready[item_idx] = ready
 
     def clear_item_cache_key(self, item_idx: int) -> Hashable:
         """Clear and return one item's cache key."""
@@ -205,28 +163,7 @@ class MultimodalEncoderRequestState:
         if cache_key is None:
             raise RuntimeError(f"MM item {item_idx} has no cache key")
         self.item_cache_keys[item_idx] = None
-        self.item_ready[item_idx] = False
         return cache_key
-
-    def mark_cache_key_ready(self, cache_key: Hashable) -> None:
-        """Mark every item using `cache_key` as ready."""
-        for item_idx, bound_cache_key in enumerate(self.item_cache_keys):
-            if bound_cache_key == cache_key and not self.item_ready[item_idx]:
-                self.item_ready[item_idx] = True
-
-    def mark_all_items_ready(self) -> None:
-        """Mark every bound item ready after a scheduled context replay."""
-        self.item_ready = [True] * self.num_items
-
-    def pop_all_cache_keys(self) -> List[Hashable]:
-        """Return and clear all cache keys, keeping prompt order and duplicates."""
-        cache_keys = [
-            cache_key for cache_key in self.item_cache_keys
-            if cache_key is not None
-        ]
-        self.item_cache_keys = [None] * len(self.item_cache_keys)
-        self.item_ready = [False] * len(self.item_ready)
-        return cache_keys
 
 
 if TYPE_CHECKING:
@@ -1345,6 +1282,47 @@ def get_multimodal_embedding_lengths(
     return multimodal_embedding_lengths
 
 
+def get_mm_items_for_chunk(request: LlmRequest, chunk_start: int,
+                           chunk_end: int) -> List[int]:
+    """Return the MM items whose encoder rows are used by a prompt chunk."""
+    state = request.py_mm_encoder_state
+    if state is None or chunk_start >= chunk_end:
+        return []
+
+    mm_data = request.py_multimodal_data
+    cumsum = (mm_data.get("multimodal_embed_mask_cumsum") if isinstance(
+        mm_data, dict) else None)
+    if cumsum is not None:
+        runtime = MultimodalRuntimeData(chunk_start, chunk_end, cumsum)
+        row_begin = runtime.num_cached_mm_tokens
+        row_count = runtime.num_mm_tokens_in_chunk
+        assert row_begin is not None and row_count is not None
+        row_end = row_begin + row_count
+        item_indices = []
+        item_begin = 0
+        for item_idx, length in enumerate(state.embedding_lengths):
+            item_end = item_begin + length
+            if item_begin < row_end and item_end > row_begin:
+                item_indices.append(item_idx)
+            item_begin = item_end
+        return item_indices
+
+    positions = request.multimodal_positions
+    lengths = request.multimodal_lengths
+    if positions is not None and lengths is not None:
+        return [
+            item_idx for item_idx, (
+                position,
+                length) in enumerate(zip(positions, lengths, strict=True))
+            if int(position) < chunk_end and int(position) +
+            int(length) > chunk_start
+        ]
+
+    # Legacy metadata cannot locate individual items in the prompt. Requiring
+    # all items may encode a wrapper-token item early but remains correct.
+    return list(range(state.num_items))
+
+
 def get_multimodal_encoder_token_lengths(
         request: LlmRequest) -> Optional[List[int]]:
     """Return per-item physical encoder attention-token costs.
@@ -1395,11 +1373,9 @@ def initialize_multimodal_encoder_request(
     """Initialize immutable request kind and mutable per-item encoder state.
 
     Raises `ValueError` (failing only this request) when raw encoder inputs
-    have missing or empty item metadata, an atomic item is larger than the
+    have missing or empty item metadata, one item is larger than the
     effective encoder token budget, or — when the encoder-output budget is
-    supplied — the request's complete embedding footprint could never fit.
-    Prefill currently waits for every item, so the complete footprint must
-    remain resident until the request becomes LLM-eligible.
+    supplied — one item output is larger than the encoder-output budget.
     """
     mm_data = request.py_multimodal_data
     has_raw_payload = isinstance(mm_data, dict) and any(
@@ -1432,11 +1408,12 @@ def initialize_multimodal_encoder_request(
             raise ValueError("Multimodal item scheduling requires "
                              "multimodal_embedding_lengths")
         if (max_output_bytes is not None and bytes_per_encoder_embedding > 0):
-            total_bytes = (sum(embedding_lengths) * bytes_per_encoder_embedding)
-            if total_bytes > max_output_bytes:
+            largest_output_bytes = (max(embedding_lengths) *
+                                    bytes_per_encoder_embedding)
+            if largest_output_bytes > max_output_bytes:
                 raise ValueError(
                     format_multimodal_encoder_output_budget_error(
-                        total_bytes,
+                        largest_output_bytes,
                         max_output_bytes,
                         max_num_tokens,
                         request_id=request.py_request_id,
@@ -1444,19 +1421,6 @@ def initialize_multimodal_encoder_request(
         request.py_mm_encoder_state = (
             MultimodalEncoderRequestState.from_embedding_lengths(
                 embedding_lengths, encoder_token_lengths=token_lengths))
-
-
-def is_multimodal_encoder_ready(request: LlmRequest) -> bool:
-    """Return whether this request needs no further MM encoder work.
-
-    Readiness is purely a function of the request's encoder item state: a
-    request without one (text-only, precomputed embedding, or a model
-    outside item scheduling) needs no encoder work; otherwise the request
-    is ready once every item slot is filled (finer-grained progress lives
-    on `MultimodalEncoderRequestState.progress`).
-    """
-    state = request.py_mm_encoder_state
-    return state is None or state.progress is MultimodalEncoderProgress.READY
 
 
 def executor_request_to_llm_request(
