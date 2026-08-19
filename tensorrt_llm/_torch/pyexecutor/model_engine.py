@@ -866,6 +866,11 @@ class PyTorchModelEngine(ModelEngine):
                 torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
+
+            enable_mm_encoder_cuda_graph = getattr(
+                self.model, "enable_multimodal_encoder_cuda_graph", None)
+            if callable(enable_mm_encoder_cuda_graph):
+                enable_mm_encoder_cuda_graph()
         except Exception as e:
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)

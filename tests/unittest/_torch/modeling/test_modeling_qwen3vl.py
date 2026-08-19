@@ -507,6 +507,106 @@ def test_qwen3_vision_prepare_metadata_passes_fixed_max_seq_len(
     assert calls == [(seq_lens, metadata, fixed_max_seq_len)]
 
 
+def test_qwen3_vision_run_blocks_uses_encoder_graph() -> None:
+    class FakeGraphRunner:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def maybe_run(self, **kwargs):
+            self.calls.append(kwargs)
+            return {
+                "hidden_states": torch.full((4, 8), 2.0),
+                "deepstack_0": torch.full((4, 8), 3.0),
+            }
+
+    vision = Qwen3VisionModel.__new__(Qwen3VisionModel)
+    torch.nn.Module.__init__(vision)
+    vision._blocks_graph_runner = FakeGraphRunner()
+    vision.deepstack_visual_indexes = [0]
+    vision.deepstack_merger_list = torch.nn.ModuleList([torch.nn.Identity()])
+    vision.merger = torch.nn.Identity()
+    metadata = SimpleNamespace(seq_lens=torch.tensor([4]))
+    hidden_states = torch.ones(4, 8)
+    cos = torch.ones(4, 2)
+    sin = torch.zeros(4, 2)
+    position_ids = torch.arange(4, dtype=torch.int32)
+
+    output, deepstack = vision._run_blocks(hidden_states, cos, sin, position_ids, metadata)
+
+    assert torch.equal(output, torch.full((4, 8), 2.0))
+    assert len(deepstack) == 1
+    assert torch.equal(deepstack[0], torch.full((4, 8), 3.0))
+    assert vision._blocks_graph_runner.calls == [
+        {
+            "seq_lengths": [4],
+            "inputs": {
+                "hidden_states": hidden_states,
+                "cos": cos,
+                "sin": sin,
+                "rope_position_ids": position_ids,
+            },
+        }
+    ]
+
+
+def test_qwen3_vision_run_blocks_preserves_eager_merger_order() -> None:
+    events = []
+
+    class RecordingBlock(torch.nn.Module):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+
+        def forward(self, hidden_states, **kwargs):
+            events.append(self.name)
+            return hidden_states
+
+    class RecordingMerger(torch.nn.Module):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+
+        def forward(self, hidden_states):
+            events.append(self.name)
+            return hidden_states
+
+    vision = Qwen3VisionModel.__new__(Qwen3VisionModel)
+    torch.nn.Module.__init__(vision)
+    vision._blocks_graph_runner = None
+    vision.blocks = torch.nn.ModuleList([RecordingBlock("block_0"), RecordingBlock("block_1")])
+    vision._deepstack_layer_to_merger_idx = {0: 0}
+    vision.deepstack_merger_list = torch.nn.ModuleList([RecordingMerger("deepstack_merger")])
+    vision.merger = RecordingMerger("final_merger")
+    hidden_states = torch.ones(4, 8)
+
+    vision._run_blocks(
+        hidden_states,
+        torch.ones(4, 2),
+        torch.zeros(4, 2),
+        torch.arange(4, dtype=torch.int32),
+        SimpleNamespace(seq_lens=torch.tensor([4])),
+    )
+
+    assert events == ["block_0", "deepstack_merger", "block_1", "final_merger"]
+
+
+def test_qwen3vl_enables_local_encoder_cuda_graph() -> None:
+    class FakeEncoder:
+        def __init__(self) -> None:
+            self.enabled = False
+
+        def enable_cuda_graph(self) -> None:
+            self.enabled = True
+
+    model = object.__new__(modeling_qwen3vl.Qwen3VLModelBase)
+    torch.nn.Module.__init__(model)
+    model.mm_encoder = FakeEncoder()
+
+    model.enable_multimodal_encoder_cuda_graph()
+
+    assert model.mm_encoder.enabled is True
+
+
 def test_qwen3_processor_max_pixels_maps_to_fixed_attention_capacity() -> None:
     max_pixels = 16_777_216
     expected_max_tokens_per_item = {"image": 65_536}
