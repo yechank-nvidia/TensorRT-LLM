@@ -76,6 +76,7 @@ class SchedulerOutput(
             "paused_requests",
             "fitting_disagg_gen_init_requests",
             "num_fitting_requests",
+            # Multimodal encoder scheduling outputs.
             "scheduled_mm_encoder_items",
             "recompute_paused_requests",
             "mm_encoder_blocked_request_ids",
