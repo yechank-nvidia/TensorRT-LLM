@@ -1551,9 +1551,10 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
 
         deepstack_embeds = []
         for index, mm_embed in enumerate(active_embeddings):
-            primary_width = mm_embed.shape[1] // (self.deepstack_num_level + 1)
-            active_embeddings[index] = mm_embed[:, :primary_width]
-            deepstack_embeds.append(mm_embed[:, primary_width:])
+            active_embeddings[index], deepstack_embed = self.split_mm_embeds(
+                mm_embed, self.deepstack_num_level
+            )
+            deepstack_embeds.extend(deepstack_embed)
         return active_embeddings, deepstack_embeds
 
     def _fuse_multimodal_embeddings(
@@ -1593,27 +1594,16 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         if not extra_embeds:
             return fused_input_ids, inputs_embeds, ()
 
-        # Expand each segment's packed deepstack tail as a view and scatter it
-        # into the same cumulative MM-index range as the primary segment.
+        # Expand the per-level deepstack mm embeddings into the pre-allocated
+        # `(L, max_num_tokens, H)` buffer with a single packed scatter, avoiding `L` fresh
+        # `torch.zeros` + `L` scatters inside `fuse_input_embeds`.
         deepstack_buffer = self.deepstack_input_embeds[:, : input_ids.shape[0], :]
         deepstack_buffer.zero_()
-        row_start = 0
-        for primary, packed_deepstack in zip(multimodal_embeddings, extra_embeds, strict=True):
-            row_end = row_start + primary.shape[0]
-            if packed_deepstack.shape != (
-                primary.shape[0],
-                self.deepstack_num_level * primary.shape[1],
-            ):
-                raise ValueError(
-                    "Qwen3-VL deepstack segment shape does not match its primary segment"
-                )
-            per_level = packed_deepstack.view(
-                primary.shape[0], self.deepstack_num_level, primary.shape[1]
-            ).permute(1, 0, 2)
-            deepstack_buffer[:, mm_token_indices[row_start:row_end], :] = per_level.to(
-                dtype=deepstack_buffer.dtype, device=deepstack_buffer.device
-            )
-            row_start = row_end
+        packed_deepstack = torch.stack(tuple(extra_embeds), dim=0)
+        deepstack_buffer[:, mm_token_indices, :] = packed_deepstack.to(
+            dtype=deepstack_buffer.dtype,
+            device=deepstack_buffer.device,
+        )
         return fused_input_ids, inputs_embeds, tuple(deepstack_buffer.unbind(0))
 
     def get_language_model_extra_forward_kwargs(

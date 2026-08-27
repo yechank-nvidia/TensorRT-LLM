@@ -99,7 +99,8 @@ from .llm_request import (LlmRequest, LlmRequestState,
                           MultimodalEncoderProgress,
                           MultimodalEncoderRequestError, _Unset,
                           get_draft_token_length,
-                          get_multimodal_embedding_lengths)
+                          get_multimodal_embedding_lengths,
+                          make_mm_encoder_transient_cache_key)
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
@@ -639,13 +640,22 @@ class PyTorchModelEngine(ModelEngine):
                         f"{self.mm_encoder_attention_metadata_capacity}.")
             self.mm_encoder_output_budget_bytes = (
                 self._compute_mm_encoder_output_budget_bytes())
-            if mapping.is_first_pp_rank():
-                encoder_cache = self.model._get_multimodal_encoder_cache(
-                    required_capacity_bytes=self.mm_encoder_output_budget_bytes)
-                if encoder_cache is None:
-                    raise RuntimeError(
-                        "MM encoder item scheduling failed to initialize its "
-                        "required output store")
+        if (isinstance(self.model, MultimodalModelMixin)
+                and mapping.is_first_pp_rank()):
+            multimodal_config = self.model.model_config.multimodal_config
+            reuse_capacity_bytes = (multimodal_config.encoder_cache_max_bytes
+                                    if self.model.encoder_cache_active
+                                    and multimodal_config is not None else 0)
+            cache_capacity_bytes = max(
+                self.mm_encoder_output_budget_bytes or 0,
+                reuse_capacity_bytes,
+            )
+            encoder_cache = self.model._initialize_multimodal_encoder_cache(
+                cache_capacity_bytes)
+            if self.mm_encoder_item_scheduling_enabled and encoder_cache is None:
+                raise RuntimeError(
+                    "MM encoder item scheduling failed to initialize its "
+                    "required output store")
         self._set_up_multimodal_encoder_attn_metadata()
         if self.llm_args.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()
@@ -3676,7 +3686,8 @@ class PyTorchModelEngine(ModelEngine):
                     continue
                 stable_keys = self.get_mm_encoder_item_cache_keys(request)
                 item_cache_keys = ([
-                    ("mm_transient", request.request_id, item_idx)
+                    make_mm_encoder_transient_cache_key(request.request_id,
+                                                        item_idx)
                     for item_idx in range(state.num_items)
                 ] if stable_keys is None else stable_keys)
                 if len(item_cache_keys) != state.num_items:
@@ -3765,7 +3776,7 @@ class PyTorchModelEngine(ModelEngine):
             return None
         if not item_scheduling_enabled and not model.encoder_cache_active:
             return None
-        return model._get_multimodal_encoder_cache()
+        return model._multimodal_encoder_cache
 
     def invalidate_multimodal_encoder_cache(self) -> None:
         """Clear cached MM encoder outputs when no request is using them."""
@@ -3775,7 +3786,7 @@ class PyTorchModelEngine(ModelEngine):
 
     def _build_multimodal_data_for_llm(
             self, request: LlmRequest) -> Optional[Dict[str, Any]]:
-        """Return the request data with cached item outputs in prompt order."""
+        """Return request data with cached item outputs concatenated in prompt order."""
         state = request.py_mm_encoder_state
         if state is None:
             return request.py_multimodal_data
@@ -3807,7 +3818,7 @@ class PyTorchModelEngine(ModelEngine):
             segments.append(segment)
 
         multimodal_data = dict(request.py_multimodal_data or {})
-        multimodal_data["multimodal_embedding"] = tuple(segments)
+        multimodal_data["multimodal_embedding"] = torch.cat(segments, dim=0)
         return multimodal_data
 
     def get_mm_encoder_item_cache_keys(

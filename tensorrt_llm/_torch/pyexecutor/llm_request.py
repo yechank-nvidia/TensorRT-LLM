@@ -96,6 +96,12 @@ class _Unset:
 _UNSET = _Unset()
 
 
+def make_mm_encoder_transient_cache_key(request_id: int,
+                                        item_idx: int) -> Hashable:
+    """Return the request-local key shared by scheduling and PP cache replay."""
+    return ("mm_transient", request_id, item_idx)
+
+
 @dataclass
 class MultimodalEncoderRequestState:
     """Tracks the encoder-cache key for each MM item in a request.

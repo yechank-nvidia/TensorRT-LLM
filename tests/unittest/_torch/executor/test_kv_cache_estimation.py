@@ -396,14 +396,6 @@ def test_reserve_adds_only_unprofiled_output_capacity():
     assert creator._get_multimodal_encoder_memory_reserve(profiled_output_bytes=400) == 112
 
 
-def test_reserve_uses_one_effective_multimodal_encoder_store():
-    creator = object.__new__(KvCacheCreator)
-    creator._model_engine = SimpleNamespace(
-        mm_encoder_cache=TensorLRUCache(1024),
-    )
-    assert creator._get_multimodal_encoder_memory_reserve(profiled_output_bytes=400) == 624
-
-
 def test_downstream_pp_rank_without_encoder_store_reserves_no_memory():
     creator = object.__new__(KvCacheCreator)
     creator._model_engine = SimpleNamespace(mm_encoder_cache=None)

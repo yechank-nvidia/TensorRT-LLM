@@ -18,7 +18,7 @@ from tensorrt_llm.bindings import internal as tb_internal
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 
-from ...tensor_lru_cache import CacheAllocationResult, TensorLRUCache
+from ...tensor_lru_cache import CacheAcquireResult, TensorLRUCache
 
 # Assuming these imports exist in your environment
 from ..llm_request import (
@@ -26,6 +26,7 @@ from ..llm_request import (
     LlmRequestState,
     format_multimodal_encoder_output_budget_error,
     is_multimodal_encoder_ready,
+    make_mm_encoder_transient_cache_key,
 )
 
 RequestList = list[LlmRequest]
@@ -635,19 +636,15 @@ class MultimodalScheduler(RequestScheduler):
     def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
         return self.scheduler.scheduling_state_range
 
-    @staticmethod
-    def _transient_cache_key(request: LlmRequest, item_idx: int) -> Hashable:
-        return ("mm_transient", request.request_id, item_idx)
-
     def _get_request_item_cache_keys(self, request: LlmRequest) -> tuple[list[Hashable], bool]:
         state = request.py_mm_encoder_state
         if state is None:
-            raise RuntimeError("MM cache allocation requires encoder request state")
+            raise RuntimeError("MM cache acquisition requires encoder request state")
         stable_keys = self.get_item_cache_keys(request)
         if stable_keys is None:
             return (
                 [
-                    self._transient_cache_key(request, item_idx)
+                    make_mm_encoder_transient_cache_key(request.request_id, item_idx)
                     for item_idx in range(state.num_items)
                 ],
                 False,
@@ -690,12 +687,12 @@ class MultimodalScheduler(RequestScheduler):
                 # binding for a ready item.
                 continue
             expected_bytes = state.embedding_lengths[item_idx] * self.bytes_per_encoder_embedding
-            allocation_result = self.encoder_cache.allocate(
+            acquire_result = self.encoder_cache.acquire(
                 cache_key,
                 expected_bytes,
                 retain_after_release=retain_after_release,
             )
-            if allocation_result is None:
+            if acquire_result is None:
                 for acquired_item_idx in reversed(acquired_item_indices):
                     acquired_cache_key = state.clear_item_cache_key(acquired_item_idx)
                     self.encoder_cache.release(acquired_cache_key)
@@ -703,7 +700,7 @@ class MultimodalScheduler(RequestScheduler):
             state.set_item_cache_key(
                 item_idx,
                 cache_key,
-                ready=allocation_result is CacheAllocationResult.READY_HIT,
+                ready=acquire_result is CacheAcquireResult.READY_HIT,
             )
             acquired_item_indices.append(item_idx)
         return True, acquired_item_indices
@@ -733,7 +730,10 @@ class MultimodalScheduler(RequestScheduler):
 
         Cache hits and items already selected through the same cache entry use
         no encoder compute budget. Newly acquired entries are kept only when
-        at least one of them will be encoded this iteration.
+        at least one of them will be encoded this iteration. After producer
+        selection, their output bytes are summed and passed once to
+        `ensure_capacity`; the returned exact removals are replayed by peer
+        caches before strict producer puts.
         """
         remaining_batch_slots = self.max_batch_size
         remaining_tokens = self.max_num_tokens
@@ -752,7 +752,7 @@ class MultimodalScheduler(RequestScheduler):
             for item_idx in state.pending_item_indices():
                 cache_key = state.item_cache_keys[item_idx]
                 if cache_key is None:
-                    raise RuntimeError("allocated MM item has no cache key")
+                    raise RuntimeError("acquired MM item has no cache key")
                 if cache_key in selected_cache_keys:
                     continue
                 cost = state.encoder_token_lengths[item_idx]
@@ -792,24 +792,17 @@ class MultimodalScheduler(RequestScheduler):
             else:
                 blocked_request_ids.append(request.request_id)
 
-        removals: list[Hashable] = []
-        pending_output_bytes = 0
+        selected_output_bytes = 0
         for request_id, item_indices in selected.items():
             request = request_by_id[request_id]
             state = request.py_mm_encoder_state
             assert state is not None
             for item_idx in item_indices:
-                cache_key = state.item_cache_keys[item_idx]
-                assert cache_key is not None
-                removals.extend(
-                    self.encoder_cache.make_space_for(
-                        cache_key,
-                        pending_output_bytes=pending_output_bytes,
-                    )
-                )
-                pending_output_bytes += (
+                selected_output_bytes += (
                     state.embedding_lengths[item_idx] * self.bytes_per_encoder_embedding
                 )
+
+        removals = self.encoder_cache.ensure_capacity(selected_output_bytes)
 
         return selected, llm_eligible, blocked_request_ids, removals
 

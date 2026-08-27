@@ -63,15 +63,15 @@ metadata:
                 raw MM fields so they don't ride along in decode.
 
 [5] Model.forward(attn_metadata, input_ids, position_ids, multimodal_params=…)
-    MultimodalModelMixin.prepare_multimodal_inputs: consumes prompt-ordered
-       cache-owned item segments on the item-scheduled path; the legacy path still
-       uses get_multimodal_embeddings and its full-request/partial-hit behavior.
-    find_input_mm_embeds: slices active chunk rows while preserving item segments.
+    MultimodalModelMixin.prepare_multimodal_inputs: concatenates prompt-ordered
+       cache-owned item outputs once into the existing embedding-tensor contract;
+       the legacy path still uses get_multimodal_embeddings and its
+       full-request/partial-hit behavior.
+    find_input_mm_embeds: slices active chunk rows from that tensor.
     prepare_mrope_config (mRoPE models): one-shot mrope_rotary_cos_sin per
        request from the staged mrope_position_ids buffer.
-    fuse_input_embeds: scatters every segment directly into precomputed MM token
-       indices; there is no final torch.cat allocation (optional extra_embeds remain
-       available for multi-feature encoders).
+    fuse_input_embeds: merges text and MM rows through the existing precomputed
+       index path (optional extra_embeds remain available for multi-feature encoders).
     self.llm.forward(inputs_embeds=..., mrope_config=...) → logits.
 ```
 
@@ -85,7 +85,9 @@ metadata:
   does not keep a second output tensor or combined output buffer. The cache is
   large enough for one legal encoder iteration; `encoder_cache_max_bytes` may
   make it larger when reuse is enabled. Stable item keys let requests share
-  one encoded output. Items without a stable key use a request-local key.
+  one encoded output. Items without a stable key use a request-local key. The
+  single tensor assembled for an LLM forward is temporary and is not retained
+  as a second request-owned cache.
 
 ### EPD-disaggregated path
 
@@ -329,8 +331,8 @@ class {Name}Model(MultimodalModelMixin, PreTrainedModel):
   build and forward the mRoPE config from `get_language_model_extra_forward_kwargs`. Reference:
   `Qwen3VLModelBase.prepare_mrope_config`.
 - **Deepstack features (Qwen3-VL):** keep each item's primary and deepstack rows in the same cache
-  entry, unpack them in `after_active_multimodal_embeddings`, and scatter the segments in
-  `_fuse_multimodal_embeddings`. Do not concatenate all cache entries into a transient slab.
+  entry, then use the existing `after_active_multimodal_embeddings` and
+  `_fuse_multimodal_embeddings` hooks after the prompt-order tensor is assembled.
 - **HF wrapper without a clean `text_config`:** Qwen2-VL's `Qwen2VLModelBase` rewrites `architectures` to surface the inner LLM. Fall back to that pattern only when the multimodal HF config does not expose a `text_config` sub-config.
 - **Inner LLM that doesn't match HF's `text_config` schema (Qwen3.5-MoE-VL → Qwen3Next).** When the VLM's HF `text_config` schema differs from the TRT-LLM runtime model you want to reuse, write a config normalizer (e.g. `_normalize_qwen35_moe_vl_config`) that maps HF aliases to the runtime's expected names (mRoPE keys, `intermediate_size` aliases, quantization-exclude module paths). Wire it via **lazy import** from `pyexecutor.config_utils.load_pretrained_config` — the `Mistral` and `Qwen3_5` branches are templates. Two gotchas: transformers 5.x's `rope_scaling` is a **property aliasing `rope_parameters`** — setting either silently overwrites the other, so the normalizer should mutate `rope_parameters` directly if the HF code still reads from it. And for VLMs, the normalizer must run on the **composite** config (with `text_config` / `vision_config`), not flattened away.
 - **Thin wrapper for runtime reuse.** Even when the LM class body is identical to the runtime's existing class, still create a `@register_auto_model("YourArch")`-decorated thin subclass — that's how weight-mapper dispatch picks the family-specific mapper. You can't stack two `@register_auto_model` decorators on a single shared class.
@@ -495,7 +497,7 @@ Follow `CONTRIBUTING.md`. Title `[JIRA/NVBUG/None][type] description`, `git comm
 - [ ] Async loaders used for URL/bytes inputs.
 - [ ] Broadcast payload < 1 MB per rank per request (NVTX `broadcast_requests` / `tp_broadcast_requests`); media crosses ranks only via `to_handle` / `to_tensor`.
 - [ ] Post-prefill/termination cleanup drains item-cache refs exactly once and leaves only fields retained by `strip_mm_data_for_generation`.
-- [ ] Encoder output is one tensor whose first dim equals the processor-declared MM output rows; item splits preserve prompt order, and fusion scatters segments without a final concatenation.
+- [ ] Encoder output is one tensor whose first dim equals the processor-declared MM output rows; cache item splits preserve prompt order and are reassembled into the existing single-tensor fusion contract.
 - [ ] Encoder is batched across requests: a multi-request batch produces a single wide encoder block in nsys, not N narrow blocks (Contract 4).
 
 **Tests & docs**

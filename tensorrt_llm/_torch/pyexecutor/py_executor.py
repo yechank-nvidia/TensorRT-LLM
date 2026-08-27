@@ -7872,6 +7872,9 @@ class PyExecutor:
                     removed_cache_key = encoder_cache.release(cache_key)
                     if (removed_cache_key is not None
                             and self.dist.pp_size > 1):
+                        # Non-owning first-stage peers replay this removal. A PP
+                        # topology without such peers carries an unused key in
+                        # the next schedule to keep one simple PP protocol.
                         self._pending_mm_encoder_cache_removals.append(
                             removed_cache_key)
 

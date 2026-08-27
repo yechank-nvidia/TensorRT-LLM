@@ -31,16 +31,25 @@ K = TypeVar("K", bound=Hashable)
 
 
 class CacheEntryState(Enum):
+    """Lifecycle state of a cache key."""
+
+    # ABSENT is used by strict operations to require a missing key. Stored
+    # entries are either RESERVED or READY.
     ABSENT = auto()
+    # Expected bytes and references exist, but no tensor has been committed.
     RESERVED = auto()
+    # The cache owns a tensor that callers may read.
     READY = auto()
 
 
-class CacheAllocationResult(Enum):
-    """How `allocate` satisfied a successful request."""
+class CacheAcquireResult(Enum):
+    """How `acquire` satisfied a successful request."""
 
+    # A READY entry was found and referenced.
     READY_HIT = auto()
+    # A missing key became a new RESERVED entry.
     NEW_RESERVATION = auto()
+    # An existing RESERVED entry gained another reference.
     RESERVATION_HIT = auto()
 
 
@@ -71,7 +80,6 @@ class TensorLRUCacheStats(NamedTuple):
     rejected_insertions: int
     producer_misses: int
     inflight_deduplications: int
-    blocked_allocations: int
     hit_rate: float
 
 
@@ -85,7 +93,6 @@ class _CacheCounters:
     rejected_insertions: int = 0
     producer_misses: int = 0
     inflight_deduplications: int = 0
-    blocked_allocations: int = 0
 
     @property
     def hit_rate(self) -> float:
@@ -96,22 +103,41 @@ class _CacheCounters:
 class TensorLRUCache(Generic[K]):
     """Thread-safe LRU cache from hashable keys to tensor values.
 
-    Each tensor uses `tensor.numel() * tensor.element_size()` bytes. Returned
-    tensors are the cache-owned tensors and must not be changed by callers.
+    Size accounting uses logical tensor bytes: `tensor.numel() * tensor.element_size()`.
+    Returned tensors alias the cache-owned tensor objects. Callers must treat them as immutable
+    while they remain cache-owned.
 
-    The cache stores a detached copy, not the caller's tensor or view. This
-    keeps later caller changes out of the cache and prevents a small view from
-    retaining a larger source allocation. Copying happens before replacement
-    or eviction, so a failed copy leaves existing entries unchanged. During an
-    insertion, both the source tensor and cache copy exist briefly; therefore
-    `max_bytes` limits stored cache data, not temporary peak memory.
+    The cache owns a detached copy rather than the caller's tensor or view. This prevents later
+    caller mutations from changing a cached value and prevents a small cached view from retaining
+    the caller's larger backing allocation. The copy is made before acquiring the lock and before
+    replacement or eviction, preserving existing cache entries if copying fails. Consequently,
+    `max_bytes` bounds steady-state logical cache contents, not peak allocation: insertion
+    temporarily needs both the source tensor and its copy and may exceed the cache limit until
+    eviction completes.
+
+    Managed entries add a RESERVED state and reference-counted READY state to the original cache:
+
+    1. `acquire` adds a reference and creates a `RESERVED` entry on a miss.
+    2. `ensure_capacity` evicts only unreferenced `READY` entries before selected
+       producers materialize their outputs.
+    3. Strict `put` commits a `RESERVED` entry as `READY` without choosing more
+       eviction victims.
+    4. `get` reads a `READY` tensor without changing its reference count.
+    5. `release` drops the reference and applies the entry's retention policy.
+
+    Reservations and referenced READY entries cannot be evicted. `pinned_bytes` is the logical
+    size of referenced READY tensors, not CUDA pinned host memory.
+
+    `pop` is intentionally separate from `release`: it physically removes an
+    unreferenced entry without applying reference or retention policy. This is
+    used when a caller must replay an exact removal or roll back a reservation.
 
     In CUDA-stream-aware mode, each entry owns the event recorded after its clone. Replacement,
     eviction, and clear drop that event with the entry; events are not reused because an evicted
     tensor may still have outstanding consumers on another stream.
 
     Args:
-        max_bytes: Maximum tensor bytes stored by this cache.
+        max_bytes: Maximum logical tensor bytes held by this cache.
         name: Short label used in debug log messages.
         cuda_stream_aware: When enabled, synchronize CUDA tensor producers and consumers across
             streams and extend allocation lifetime through every consuming stream. CPU tensors are
@@ -133,6 +159,7 @@ class TensorLRUCache(Generic[K]):
         self._cuda_stream_aware = cuda_stream_aware
         self._current_bytes = 0
         self._reserved_bytes = 0
+        # Ready tensor bytes protected from eviction by live references, not CUDA pinned memory.
         self._pinned_bytes = 0
         self._items: OrderedDict[K, _Entry] = OrderedDict()
         self._lock = RLock()
@@ -151,20 +178,32 @@ class TensorLRUCache(Generic[K]):
         with self._lock:
             return len(self._items)
 
-    def allocate(
+    def acquire(
         self,
         key: K,
         expected_bytes: int,
         *,
         retain_after_release: bool = True,
-    ) -> CacheAllocationResult | None:
-        """Add one reference, reserving a missing entry when needed.
+    ) -> CacheAcquireResult | None:
+        """Acquire a reference, reserving a missing entry when needed.
 
-        Returns whether the value was ready, a reservation was created, or a
-        reservation was found. Returns `None` when active requests temporarily
-        use all cache space. An entry larger than the full cache, or a
-        conflicting size or retention setting for an existing key, raises an
-        error.
+        A READY hit and an existing reservation both gain one reference. A
+        missing key becomes RESERVED and accounts `expected_bytes` until the
+        producer commits its tensor with strict `put`.
+
+        Args:
+            key: Identity shared by producers and consumers of one tensor.
+            expected_bytes: Exact tensor bytes that a missing key will produce.
+            retain_after_release: Whether a READY entry remains reusable after
+                its final reference is released.
+
+        Returns:
+            How the reference was acquired, or `None` when live references and
+            reservations temporarily consume all capacity.
+
+        Raises:
+            ValueError: If the requested size is invalid or existing metadata
+                conflicts with the request.
         """
         if expected_bytes <= 0:
             raise ValueError("expected_bytes must be positive")
@@ -187,22 +226,20 @@ class TensorLRUCache(Generic[K]):
                 if entry.state is CacheEntryState.RESERVED:
                     entry.reference_count += 1
                     self._counters.inflight_deduplications += 1
-                    return CacheAllocationResult.RESERVATION_HIT
+                    return CacheAcquireResult.RESERVATION_HIT
                 if entry.state is not CacheEntryState.READY:
                     raise RuntimeError(f"unexpected cache entry state: {entry.state}")
 
                 if entry.reference_count == 0:
                     if self._in_use_bytes + entry.size_bytes > self._max_bytes:
-                        self._counters.blocked_allocations += 1
                         return None
                     self._pinned_bytes += entry.size_bytes
                 entry.reference_count += 1
                 self._items.move_to_end(key)
                 self._counters.hits += 1
-                return CacheAllocationResult.READY_HIT
+                return CacheAcquireResult.READY_HIT
 
             if self._in_use_bytes + expected_bytes > self._max_bytes:
-                self._counters.blocked_allocations += 1
                 return None
 
             self._items[key] = _Entry(
@@ -214,12 +251,14 @@ class TensorLRUCache(Generic[K]):
             self._reserved_bytes += expected_bytes
             self._counters.misses += 1
             self._counters.producer_misses += 1
-            return CacheAllocationResult.NEW_RESERVATION
+            return CacheAcquireResult.NEW_RESERVATION
 
     def get(self, key: K, *, record_stats: bool = True) -> torch.Tensor | None:
         """Return a cache-owned, immutable tensor and promote it to most-recently-used.
 
         The returned tensor aliases the cached value. Callers must not mutate it.
+        Only READY entries are returned. `get` does not acquire a managed
+        reference; `record_stats=False` suppresses its hit/miss accounting.
         """
         with self._lock:
             entry = self._items.get(key)
@@ -245,9 +284,13 @@ class TensorLRUCache(Generic[K]):
     ) -> bool:
         """Insert or replace a tensor.
 
-        Returns `False` and leaves the cache unchanged when `value` is larger
-        than the cache. When `expected_state` is set, the method verifies the
-        current state and size and does not replace or evict entries by itself.
+        Returns `False` and leaves the cache unchanged when `value` is larger than the full
+        cache capacity.
+
+        Managed callers set `expected_state=RESERVED` to commit an acquired
+        producer output, or `ABSENT` to replay an exact remote insertion. The
+        expected size must match and `ensure_capacity` must already have made
+        room; these strict puts never choose eviction victims.
         """
         size_bytes = self._tensor_size_bytes(value)
 
@@ -320,18 +363,21 @@ class TensorLRUCache(Generic[K]):
                 )
             return True
 
-    def make_space_for(self, key: K, *, pending_output_bytes: int = 0) -> list[K]:
-        """Remove enough unused LRU entries to store the selected outputs."""
-        if pending_output_bytes < 0:
-            raise ValueError("pending_output_bytes must be non-negative")
-        with self._lock:
-            entry = self._items.get(key)
-            if entry is None or entry.state is not CacheEntryState.RESERVED:
-                raise RuntimeError("make_space_for requires an existing reserved entry")
+    def ensure_capacity(self, incoming_bytes: int) -> list[K]:
+        """Ensure physical space for selected outputs before they are produced.
 
+        `incoming_bytes` is the total size of outputs selected for the next
+        strict puts. Only unreferenced READY entries are eligible LRU victims;
+        reservations and referenced tensors are never removed. The returned
+        keys let an authority replay the exact removals on peer caches. A
+        failure leaves the cache unchanged.
+        """
+        if incoming_bytes < 0:
+            raise ValueError("incoming_bytes must be non-negative")
+        with self._lock:
             required_bytes = max(
                 0,
-                self._current_bytes + pending_output_bytes + entry.size_bytes - self._max_bytes,
+                self._current_bytes + incoming_bytes - self._max_bytes,
             )
             if required_bytes == 0:
                 return []
@@ -347,7 +393,7 @@ class TensorLRUCache(Generic[K]):
                     break
 
             if freed_bytes < required_bytes:
-                raise RuntimeError("reserved entry does not have enough removable cache space")
+                raise RuntimeError("cache does not have enough removable space")
 
             for victim_key, victim in victims:
                 del self._items[victim_key]
@@ -356,9 +402,14 @@ class TensorLRUCache(Generic[K]):
             return [victim_key for victim_key, _ in victims]
 
     def release(self, key: K) -> K | None:
-        """Release one reference and remove a non-reusable entry when unused.
+        """Release one acquired reference and apply retention policy.
 
-        Returns the key only when a stored tensor was removed.
+        A RESERVED entry disappears when its final producer or follower
+        reference is released. A READY entry becomes evictable at zero
+        references and remains cached when `retain_after_release` is true;
+        otherwise it is removed immediately. Returns the key only when a READY
+        tensor was physically removed, allowing an authority to replay that
+        removal on peer caches.
         """
         with self._lock:
             entry = self._items.get(key)
@@ -386,7 +437,12 @@ class TensorLRUCache(Generic[K]):
             return key
 
     def pop(self, key: K, *, expected_state: CacheEntryState | None = None) -> torch.Tensor | None:
-        """Remove one key and return its tensor, or `None` on miss."""
+        """Remove one unreferenced key without applying release policy.
+
+        `expected_state` makes a missing key or state mismatch an error for
+        exact rollback and peer replay. Returns the READY tensor, or `None` for
+        a removed reservation or an optional miss.
+        """
         with self._lock:
             entry = self._items.get(key)
             if entry is None:
@@ -409,12 +465,7 @@ class TensorLRUCache(Generic[K]):
             return entry.value
 
     def clear(self) -> None:
-        """Remove every unreferenced ready entry.
-
-        Active references and reservations belong to running requests. They
-        cannot be cleared because those requests would still point to missing
-        entries.
-        """
+        """Remove all entries unless a managed reference or reservation is active."""
         with self._lock:
             if self._in_use_bytes:
                 raise RuntimeError("cannot clear cache with live references or reservations")
@@ -437,7 +488,6 @@ class TensorLRUCache(Generic[K]):
                 rejected_insertions=self._counters.rejected_insertions,
                 producer_misses=self._counters.producer_misses,
                 inflight_deduplications=self._counters.inflight_deduplications,
-                blocked_allocations=self._counters.blocked_allocations,
                 hit_rate=self._counters.hit_rate,
             )
 
@@ -450,8 +500,7 @@ class TensorLRUCache(Generic[K]):
             f"insertions={stats.insertions}, replacements={stats.replacements}, "
             f"evictions={stats.evictions}, rejected_insertions={stats.rejected_insertions}, "
             f"producer_misses={stats.producer_misses}, "
-            f"inflight_deduplications={stats.inflight_deduplications}, "
-            f"blocked_allocations={stats.blocked_allocations}"
+            f"inflight_deduplications={stats.inflight_deduplications}"
         )
 
     @property
@@ -465,6 +514,7 @@ class TensorLRUCache(Generic[K]):
     def _clone_for_storage(
         self, value: torch.Tensor
     ) -> tuple[torch.Tensor, torch.cuda.Event | None]:
+        """Clone a value and record its producer event when stream-aware."""
         stored_value = value.detach().clone()
         producer_event = None
         if self._cuda_stream_aware and stored_value.is_cuda:
@@ -479,6 +529,7 @@ class TensorLRUCache(Generic[K]):
         size_bytes: int,
         expected_state: CacheEntryState,
     ) -> bool:
+        """Apply a strict managed insertion after validating the expected state."""
         entry = self._items.get(key)
         actual_state = CacheEntryState.ABSENT if entry is None else entry.state
         if actual_state is not expected_state:

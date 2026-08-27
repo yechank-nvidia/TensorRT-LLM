@@ -19,6 +19,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     get_multimodal_encoder_token_lengths,
     initialize_multimodal_encoder_request,
     is_multimodal_encoder_ready,
+    make_mm_encoder_transient_cache_key,
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine,
@@ -202,7 +203,7 @@ def test_multimodal_scheduler_encodes_shared_cache_key_once():
 def test_scheduler_defers_items_beyond_output_byte_budget():
     # Budget hosts exactly one 1-row item (4 bytes): the second request's
     # item must wait even though the token budget would admit it
-    # (allocate-before-compute).
+    # (acquire-before-compute).
     scheduler = _scheduler(max_batch_size=8, max_num_tokens=1 << 20, cache_capacity=4)
     first = _request(1, [3])
     second = _request(2, [3])
@@ -242,7 +243,7 @@ def test_pinned_outputs_block_new_admissions_until_explicit_release():
 
 def test_started_request_holds_its_whole_footprint_across_iterations():
     # The token budget splits the head request across iterations, but its
-    # first item already allocates storage for all of them, so the bytes it
+    # first item already reserves capacity for all of them, so the bytes it
     # still needs are charged from the start. A request behind it cannot
     # squat that space and leave the head unable to finish.
     scheduler = _scheduler(max_batch_size=8, max_num_tokens=5, cache_capacity=8)
@@ -821,7 +822,7 @@ def test_terminate_request_releases_multimodal_cache_references_idempotently(
     state = request.py_mm_encoder_state
     cache = TensorLRUCache(16)
     cache_key = ("mm_transient", request.request_id, 0)
-    cache.allocate(cache_key, 4, retain_after_release=False)
+    cache.acquire(cache_key, 4, retain_after_release=False)
     cache.put(cache_key, torch.ones(1), expected_state=CacheEntryState.RESERVED, expected_bytes=4)
     state.set_item_cache_key(0, cache_key, ready=True)
     freed = []
@@ -878,9 +879,6 @@ def test_item_outputs_commit_to_prompt_ordered_cache_keys(monkeypatch):
     cache = TensorLRUCache(1 << 20, name="test")
 
     class _Model(MultimodalModelMixin):
-        def _get_multimodal_encoder_cache(self):
-            return cache
-
         def forward_multimodal_encoder_items(self, encoder_inputs):
             return [
                 torch.full((embedding_length, 2), float(embedding_length))
@@ -891,6 +889,7 @@ def test_item_outputs_commit_to_prompt_ordered_cache_keys(monkeypatch):
     monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
     engine = object.__new__(PyTorchModelEngine)
     engine.model = _Model()
+    engine.model._multimodal_encoder_cache = cache
     engine.mm_encoder_item_scheduling_enabled = True
     engine.mapping = SimpleNamespace(is_first_pp_rank=lambda: True)
     engine.bytes_per_mm_encoder_embedding = 8
@@ -917,7 +916,7 @@ def test_item_outputs_commit_to_prompt_ordered_cache_keys(monkeypatch):
     for item_idx, (cache_key, rows) in enumerate(
         zip(item_cache_keys, state.embedding_lengths, strict=True)
     ):
-        cache.allocate(cache_key, rows * 8, retain_after_release=False)
+        cache.acquire(cache_key, rows * 8, retain_after_release=False)
         state.set_item_cache_key(item_idx, cache_key, ready=False)
 
     engine.forward_multimodal_encoder_items([request], {1: [0]})
@@ -932,6 +931,93 @@ def test_item_outputs_commit_to_prompt_ordered_cache_keys(monkeypatch):
     assert "multimodal_embedding" not in request.py_multimodal_data
     assert "image" not in request.py_multimodal_data
     assert is_multimodal_encoder_ready(request)
+    multimodal_data = engine._build_multimodal_data_for_llm(request)
+    torch.testing.assert_close(
+        multimodal_data["multimodal_embedding"],
+        torch.cat([torch.full((2, 2), 2.0), torch.full((3, 2), 3.0)]),
+    )
+
+
+def test_pp_follower_replays_multimodal_cache_schedule_on_cpu(monkeypatch):
+    class _Model(MultimodalModelMixin):
+        def forward_multimodal_encoder_items(self, encoder_inputs):
+            return [
+                torch.full((embedding_length, 2), float(embedding_length))
+                for _, embedding_lengths, _ in encoder_inputs
+                for embedding_length in embedding_lengths
+            ]
+
+    def make_engine(cache):
+        engine = object.__new__(PyTorchModelEngine)
+        engine.model = _Model()
+        engine.model._multimodal_encoder_cache = cache
+        engine.mm_encoder_item_scheduling_enabled = True
+        engine.mapping = SimpleNamespace(is_first_pp_rank=lambda: True)
+        engine.bytes_per_mm_encoder_embedding = 8
+        engine.get_mm_encoder_item_cache_keys = lambda request: None
+        return engine
+
+    def make_request():
+        request = _llm_request(
+            1,
+            multimodal_data={
+                "image": {
+                    "pixel_values": torch.arange(2).unsqueeze(1),
+                    "image_grid_thw": torch.tensor([[1, 1, 2]]),
+                },
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+                    item_refs=[("image", 0)],
+                    encoder_token_lengths=[2],
+                    output_embedding_lengths=[2],
+                ),
+                "multimodal_embedding_lengths": [2],
+            },
+        )
+        initialize_multimodal_encoder_request(request, max_num_tokens=8)
+        return request
+
+    monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
+    authority_cache = TensorLRUCache(16)
+    follower_cache = TensorLRUCache(16)
+    stale_key = ("stale", 0)
+    stale_value = torch.zeros((2, 2))
+    authority_cache.put(stale_key, stale_value)
+    follower_cache.put(stale_key, stale_value)
+
+    authority_request = make_request()
+    follower_request = make_request()
+    cache_key = make_mm_encoder_transient_cache_key(authority_request.request_id, 0)
+    authority_cache.acquire(cache_key, 16, retain_after_release=False)
+    authority_request.py_mm_encoder_state.set_item_cache_key(0, cache_key, ready=False)
+    removals = authority_cache.ensure_capacity(16)
+    assert removals == [stale_key]
+
+    authority_schedule = ScheduledRequests()
+    authority_schedule.reset_context_requests([authority_request])
+    authority_schedule.scheduled_mm_encoder_items = {authority_request.request_id: [0]}
+    authority_schedule.mm_encoder_cache_removals = removals
+    follower_schedule = ScheduledRequests()
+    follower_schedule.reset_context_requests([follower_request])
+    follower_schedule.scheduled_mm_encoder_items = authority_schedule.scheduled_mm_encoder_items
+    follower_schedule.mm_encoder_cache_removals = removals
+
+    make_engine(authority_cache).run_multimodal_encoder_schedule(
+        [authority_request], authority_schedule, owns_cache_references=True
+    )
+    make_engine(follower_cache).run_multimodal_encoder_schedule(
+        [follower_request], follower_schedule, owns_cache_references=False
+    )
+
+    assert authority_request.py_mm_encoder_state.item_ready == [True]
+    assert follower_request.py_mm_encoder_state.item_cache_keys == [cache_key]
+    assert follower_request.py_mm_encoder_state.item_ready == [True]
+    assert authority_cache.get(stale_key, record_stats=False) is None
+    assert follower_cache.get(stale_key, record_stats=False) is None
+    assert authority_cache.current_bytes == follower_cache.current_bytes == 16
+    torch.testing.assert_close(
+        authority_cache.get(cache_key, record_stats=False),
+        follower_cache.get(cache_key, record_stats=False),
+    )
 
 
 # ---------------------------------------------------------------------------
