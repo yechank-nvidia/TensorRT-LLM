@@ -62,6 +62,7 @@ class MultimodalEncoderRequestError(ValueError):
                  *,
                  request_ids: Optional[Iterable[int]] = None) -> None:
         super().__init__(message)
+        # Keep PP ranks in sync when one cache failure affects multiple requests.
         self.request_ids = frozenset(request_ids or ())
 
 
@@ -97,8 +98,8 @@ _UNSET = _Unset()
 
 
 def make_mm_encoder_transient_cache_key(request_id: int,
-                                        item_idx: int) -> Hashable:
-    """Return the request-local key shared by scheduling and PP cache replay."""
+                                        item_idx: int) -> tuple[str, int, int]:
+    """Return a request-local cache key for an item without a stable key."""
     return ("mm_transient", request_id, item_idx)
 
 

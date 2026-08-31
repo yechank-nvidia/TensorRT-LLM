@@ -206,20 +206,20 @@ def test_shared_reservation_stores_one_output_and_keeps_reusable_entry() -> None
     assert cache.acquire("key", 8) is CacheAcquireResult.RESERVATION_HIT
     assert cache.current_bytes == 0
     assert cache.stats().reserved_bytes == 8
-    assert cache.stats().pinned_bytes == 0
+    assert cache.stats().in_use_bytes == 0
 
     assert cache.ensure_capacity(8) == []
     cache.commit("key", value)
     assert cache.current_bytes == 8
     assert cache.stats().reserved_bytes == 0
-    assert cache.stats().pinned_bytes == 8
+    assert cache.stats().in_use_bytes == 8
     cached = cache.get("key", record_stats=False)
     assert cached is not None
     torch.testing.assert_close(cached, value)
 
     assert cache.release("key") is None
     assert cache.release("key") is None
-    assert cache.stats().pinned_bytes == 0
+    assert cache.stats().in_use_bytes == 0
     assert cache.current_bytes == 8
     assert cache.acquire("key", 8) is CacheAcquireResult.READY_HIT
     assert cache.release("key") is None
@@ -249,7 +249,7 @@ def test_non_retained_entries_are_removed_on_their_final_release() -> None:
     assert cache.release("ready") == "ready"
     assert len(cache) == 0
     assert cache.current_bytes == 0
-    assert cache.stats().pinned_bytes == 0
+    assert cache.stats().in_use_bytes == 0
 
 
 def test_reservation_limit_and_output_space_are_checked_separately() -> None:

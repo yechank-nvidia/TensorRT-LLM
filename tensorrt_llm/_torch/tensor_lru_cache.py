@@ -67,7 +67,7 @@ class TensorLRUCacheStats(NamedTuple):
     max_bytes: int
     current_bytes: int
     reserved_bytes: int
-    pinned_bytes: int
+    in_use_bytes: int
     item_count: int
     hits: int
     misses: int
@@ -122,8 +122,8 @@ class TensorLRUCache(Generic[K]):
     4. `get` reads a `READY` tensor without changing its reference count.
     5. `release` drops the reference and applies the entry's retention policy.
 
-    Reservations and referenced READY entries cannot be evicted. `pinned_bytes` is the logical
-    size of referenced READY tensors, not CUDA pinned host memory.
+    Reservations and in-use READY entries cannot be evicted. `in_use_bytes`
+    is the logical size of READY tensors held by at least one reference.
 
     `pop` is intentionally separate from `release`: it physically removes an
     unreferenced entry without applying reference or retention policy. This is
@@ -156,8 +156,8 @@ class TensorLRUCache(Generic[K]):
         self._cuda_stream_aware = cuda_stream_aware
         self._current_bytes = 0
         self._reserved_bytes = 0
-        # Ready tensor bytes protected from eviction by live references, not CUDA pinned memory.
-        self._pinned_bytes = 0
+        # READY tensor bytes held by live references and therefore not evictable.
+        self._in_use_bytes = 0
         self._items: OrderedDict[K, _Entry] = OrderedDict()
         self._lock = RLock()
         self._counters = _CacheCounters()
@@ -228,15 +228,15 @@ class TensorLRUCache(Generic[K]):
                     raise RuntimeError(f"unexpected cache entry state: {entry.state}")
 
                 if entry.reference_count == 0:
-                    if self._in_use_bytes + entry.size_bytes > self._max_bytes:
+                    if self._claimed_bytes + entry.size_bytes > self._max_bytes:
                         return None
-                    self._pinned_bytes += entry.size_bytes
+                    self._in_use_bytes += entry.size_bytes
                 entry.reference_count += 1
                 self._items.move_to_end(key)
                 self._counters.hits += 1
                 return CacheAcquireResult.READY_HIT
 
-            if self._in_use_bytes + expected_bytes > self._max_bytes:
+            if self._claimed_bytes + expected_bytes > self._max_bytes:
                 return None
 
             self._items[key] = _Entry(
@@ -351,7 +351,7 @@ class TensorLRUCache(Generic[K]):
             entry.value = stored_value
             entry.producer_event = producer_event
             self._reserved_bytes -= size_bytes
-            self._pinned_bytes += size_bytes
+            self._in_use_bytes += size_bytes
             self._current_bytes += size_bytes
             self._items.move_to_end(key)
             self._counters.insertions += 1
@@ -375,24 +375,24 @@ class TensorLRUCache(Generic[K]):
             if required_bytes == 0:
                 return []
 
-            victims: list[tuple[K, _Entry]] = []
+            entries_to_evict: list[tuple[K, _Entry]] = []
             freed_bytes = 0
-            for victim_key, victim in list(self._items.items()):
-                if victim.state is not _CacheEntryState.READY or victim.reference_count != 0:
+            for cache_key, entry in list(self._items.items()):
+                if entry.state is not _CacheEntryState.READY or entry.reference_count != 0:
                     continue
-                victims.append((victim_key, victim))
-                freed_bytes += victim.size_bytes
+                entries_to_evict.append((cache_key, entry))
+                freed_bytes += entry.size_bytes
                 if freed_bytes >= required_bytes:
                     break
 
             if freed_bytes < required_bytes:
                 raise RuntimeError("cache does not have enough removable space")
 
-            for victim_key, victim in victims:
-                del self._items[victim_key]
-                self._current_bytes -= victim.size_bytes
-            self._counters.evictions += len(victims)
-            return [victim_key for victim_key, _ in victims]
+            for cache_key, entry in entries_to_evict:
+                del self._items[cache_key]
+                self._current_bytes -= entry.size_bytes
+            self._counters.evictions += len(entries_to_evict)
+            return [cache_key for cache_key, _ in entries_to_evict]
 
     def release(self, key: K) -> K | None:
         """Release one acquired reference and apply retention policy.
@@ -421,7 +421,7 @@ class TensorLRUCache(Generic[K]):
             if entry.state is not _CacheEntryState.READY:
                 raise RuntimeError(f"unexpected cache entry state: {entry.state}")
 
-            self._pinned_bytes -= entry.size_bytes
+            self._in_use_bytes -= entry.size_bytes
             if entry.retain_after_release:
                 return None
 
@@ -454,7 +454,7 @@ class TensorLRUCache(Generic[K]):
     def clear(self) -> None:
         """Remove all entries unless a managed reference or reservation is active."""
         with self._lock:
-            if self._in_use_bytes:
+            if self._claimed_bytes:
                 raise RuntimeError("cannot clear cache with live references or reservations")
             self._items.clear()
             self._current_bytes = 0
@@ -465,7 +465,7 @@ class TensorLRUCache(Generic[K]):
                 max_bytes=self._max_bytes,
                 current_bytes=self._current_bytes,
                 reserved_bytes=self._reserved_bytes,
-                pinned_bytes=self._pinned_bytes,
+                in_use_bytes=self._in_use_bytes,
                 item_count=len(self._items),
                 hits=self._counters.hits,
                 misses=self._counters.misses,
@@ -491,8 +491,8 @@ class TensorLRUCache(Generic[K]):
         )
 
     @property
-    def _in_use_bytes(self) -> int:
-        return self._reserved_bytes + self._pinned_bytes
+    def _claimed_bytes(self) -> int:
+        return self._reserved_bytes + self._in_use_bytes
 
     @staticmethod
     def _tensor_size_bytes(tensor: torch.Tensor) -> int:
