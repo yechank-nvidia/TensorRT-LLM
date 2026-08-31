@@ -1143,10 +1143,7 @@ class MultimodalModelMixin:
         self._multimodal_encoder_cache = TensorLRUCache(
             max_bytes,
             name=_MM_ENCODER_CACHE_LOG_NAME,
-            cuda_stream_aware=(
-                multimodal_config is not None
-                and multimodal_config.encoder_side_stream_max_ahead > 0
-            ),
+            cuda_stream_aware=multimodal_config.encoder_side_stream_max_ahead > 0,
         )
         try:
             embedding_dim = self.embedding_dim

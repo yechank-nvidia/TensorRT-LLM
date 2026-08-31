@@ -644,8 +644,7 @@ class PyTorchModelEngine(ModelEngine):
                 and mapping.is_first_pp_rank()):
             multimodal_config = self.model.model_config.multimodal_config
             reuse_capacity_bytes = (multimodal_config.encoder_cache_max_bytes
-                                    if self.model.encoder_cache_active
-                                    and multimodal_config is not None else 0)
+                                    if self.model.encoder_cache_active else 0)
             cache_capacity_bytes = max(
                 self.mm_encoder_output_budget_bytes or 0,
                 reuse_capacity_bytes,
