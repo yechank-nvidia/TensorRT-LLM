@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from enum import IntEnum
 from queue import Queue
 from typing import (TYPE_CHECKING, Dict, Hashable, Iterable, Iterator, List,
-                    Optional, Tuple, Union)
+                    Optional, Tuple, Union, cast)
 
 import torch
 from strenum import StrEnum
@@ -66,6 +66,7 @@ from ..moe.expert_statistic import ExpertStatistic
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
+from ..tensor_lru_cache import TensorLRUCache
 from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
@@ -7859,15 +7860,13 @@ class PyExecutor:
 
     def _release_multimodal_resources(self, request: LlmRequest) -> None:
         """Release this request's cache entries and discard unused MM data."""
-        state = getattr(request, "py_mm_encoder_state", None)
+        state = request.py_mm_encoder_state
         if state is not None:
             cache_keys = state.pop_all_cache_keys()
             request.py_mm_encoder_state = None
             if self._owns_mm_encoder_cache_references():
-                encoder_cache = self.model_engine.mm_encoder_cache
-                if encoder_cache is None:
-                    raise RuntimeError(
-                        "The MM cache-reference rank has no encoder cache")
+                encoder_cache = cast(TensorLRUCache,
+                                     self.model_engine.mm_encoder_cache)
                 for cache_key in cache_keys:
                     removed_cache_key = encoder_cache.release(cache_key)
                     if (removed_cache_key is not None
@@ -7878,7 +7877,7 @@ class PyExecutor:
                         self._pending_mm_encoder_cache_removals.append(
                             removed_cache_key)
 
-        mm_data = getattr(request, "py_multimodal_data", None)
+        mm_data = request.py_multimodal_data
         if mm_data:
             strip_mm_data_for_generation(mm_data)
 

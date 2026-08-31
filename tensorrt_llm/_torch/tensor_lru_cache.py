@@ -30,12 +30,9 @@ from tensorrt_llm.logger import logger
 K = TypeVar("K", bound=Hashable)
 
 
-class CacheEntryState(Enum):
+class _CacheEntryState(Enum):
     """Lifecycle state of a cache key."""
 
-    # ABSENT is used by strict operations to require a missing key. Stored
-    # entries are either RESERVED or READY.
-    ABSENT = auto()
     # Expected bytes and references exist, but no tensor has been committed.
     RESERVED = auto()
     # The cache owns a tensor that callers may read.
@@ -55,7 +52,7 @@ class CacheAcquireResult(Enum):
 
 @dataclass
 class _Entry:
-    state: CacheEntryState
+    state: _CacheEntryState
     size_bytes: int
     reference_count: int
     retain_after_release: bool
@@ -120,8 +117,8 @@ class TensorLRUCache(Generic[K]):
     1. `acquire` adds a reference and creates a `RESERVED` entry on a miss.
     2. `ensure_capacity` evicts only unreferenced `READY` entries before selected
        producers materialize their outputs.
-    3. Strict `put` commits a `RESERVED` entry as `READY` without choosing more
-       eviction victims.
+    3. `commit` stores a producer output in its `RESERVED` entry without
+       choosing more eviction victims.
     4. `get` reads a `READY` tensor without changing its reference count.
     5. `release` drops the reference and applies the entry's retention policy.
 
@@ -130,7 +127,7 @@ class TensorLRUCache(Generic[K]):
 
     `pop` is intentionally separate from `release`: it physically removes an
     unreferenced entry without applying reference or retention policy. This is
-    used when a caller must replay an exact removal or roll back a reservation.
+    used when a caller replays a removal chosen by another cache.
 
     In CUDA-stream-aware mode, each entry owns the event recorded after its clone. Replacement,
     eviction, and clear drop that event with the entry; events are not reused because an evicted
@@ -189,7 +186,7 @@ class TensorLRUCache(Generic[K]):
 
         A READY hit and an existing reservation both gain one reference. A
         missing key becomes RESERVED and accounts `expected_bytes` until the
-        producer commits its tensor with strict `put`.
+        producer stores its tensor with `commit`.
 
         Args:
             key: Identity shared by producers and consumers of one tensor.
@@ -223,11 +220,11 @@ class TensorLRUCache(Generic[K]):
                 if entry.retain_after_release != retain_after_release:
                     raise ValueError("existing cache entry retention policy does not match")
 
-                if entry.state is CacheEntryState.RESERVED:
+                if entry.state is _CacheEntryState.RESERVED:
                     entry.reference_count += 1
                     self._counters.inflight_deduplications += 1
                     return CacheAcquireResult.RESERVATION_HIT
-                if entry.state is not CacheEntryState.READY:
+                if entry.state is not _CacheEntryState.READY:
                     raise RuntimeError(f"unexpected cache entry state: {entry.state}")
 
                 if entry.reference_count == 0:
@@ -243,7 +240,7 @@ class TensorLRUCache(Generic[K]):
                 return None
 
             self._items[key] = _Entry(
-                state=CacheEntryState.RESERVED,
+                state=_CacheEntryState.RESERVED,
                 size_bytes=expected_bytes,
                 reference_count=1,
                 retain_after_release=retain_after_release,
@@ -262,7 +259,7 @@ class TensorLRUCache(Generic[K]):
         """
         with self._lock:
             entry = self._items.get(key)
-            if entry is None or entry.state is not CacheEntryState.READY:
+            if entry is None or entry.state is not _CacheEntryState.READY:
                 if record_stats:
                     self._counters.misses += 1
                 return None
@@ -278,41 +275,15 @@ class TensorLRUCache(Generic[K]):
         self,
         key: K,
         value: torch.Tensor,
-        *,
-        expected_state: CacheEntryState | None = None,
-        expected_bytes: int | None = None,
     ) -> bool:
         """Insert or replace a tensor.
 
         Returns `False` and leaves the cache unchanged when `value` is larger than the full
         cache capacity.
-
-        Managed callers set `expected_state=RESERVED` to commit an acquired
-        producer output, or `ABSENT` to replay an exact remote insertion. The
-        expected size must match and `ensure_capacity` must already have made
-        room; these strict puts never choose eviction victims.
         """
         size_bytes = self._tensor_size_bytes(value)
 
-        if expected_state not in (
-            None,
-            CacheEntryState.ABSENT,
-            CacheEntryState.RESERVED,
-        ):
-            raise ValueError("strict put only supports ABSENT or RESERVED expected state")
-        if expected_state is None and expected_bytes is not None:
-            raise ValueError("expected_bytes requires expected_state")
-        if expected_state is CacheEntryState.ABSENT and expected_bytes is None:
-            raise ValueError("strict ABSENT insertion requires expected_bytes")
-        if expected_bytes is not None and size_bytes != expected_bytes:
-            raise ValueError(
-                f"tensor size ({size_bytes}) does not match expected_bytes ({expected_bytes})"
-            )
         if size_bytes > self._max_bytes:
-            if expected_state is not None:
-                raise ValueError(
-                    f"tensor size ({size_bytes}) exceeds cache capacity ({self._max_bytes})"
-                )
             with self._lock:
                 self._counters.rejected_insertions += 1
             logger.debug(
@@ -321,18 +292,12 @@ class TensorLRUCache(Generic[K]):
             )
             return False
 
-        stored_value = None
-        producer_event = None
-        if expected_state is None:
-            stored_value, producer_event = self._clone_for_storage(value)
+        stored_value, producer_event = self._clone_for_storage(value)
 
         with self._lock:
-            if expected_state is not None:
-                return self._put_with_expected_state(key, value, size_bytes, expected_state)
-
             old_entry = self._items.get(key)
             if old_entry is not None:
-                if old_entry.state is not CacheEntryState.READY:
+                if old_entry.state is not _CacheEntryState.READY:
                     raise RuntimeError("cannot replace a reserved cache entry")
                 if old_entry.reference_count:
                     raise RuntimeError("cannot replace a referenced cache entry")
@@ -342,9 +307,8 @@ class TensorLRUCache(Generic[K]):
             else:
                 self._counters.insertions += 1
 
-            assert stored_value is not None
             self._items[key] = _Entry(
-                state=CacheEntryState.READY,
+                state=_CacheEntryState.READY,
                 size_bytes=size_bytes,
                 reference_count=0,
                 retain_after_release=True,
@@ -363,11 +327,40 @@ class TensorLRUCache(Generic[K]):
                 )
             return True
 
+    def commit(self, key: K, value: torch.Tensor) -> None:
+        """Store a producer output in an acquired reservation.
+
+        The cache owns the reservation size and verifies the producer output
+        before changing the entry to READY. Capacity must already have been
+        prepared with `ensure_capacity`.
+        """
+        size_bytes = self._tensor_size_bytes(value)
+        with self._lock:
+            entry = self._items.get(key)
+            if entry is None or entry.state is not _CacheEntryState.RESERVED:
+                raise RuntimeError("cache commit requires a reserved entry")
+            if size_bytes != entry.size_bytes:
+                raise ValueError(
+                    f"tensor size ({size_bytes}) does not match reserved bytes ({entry.size_bytes})"
+                )
+            if self._current_bytes + size_bytes > self._max_bytes:
+                raise RuntimeError("reserved entry does not have enough cache space")
+
+            stored_value, producer_event = self._clone_for_storage(value)
+            entry.state = _CacheEntryState.READY
+            entry.value = stored_value
+            entry.producer_event = producer_event
+            self._reserved_bytes -= size_bytes
+            self._pinned_bytes += size_bytes
+            self._current_bytes += size_bytes
+            self._items.move_to_end(key)
+            self._counters.insertions += 1
+
     def ensure_capacity(self, incoming_bytes: int) -> list[K]:
         """Ensure physical space for selected outputs before they are produced.
 
         `incoming_bytes` is the total size of outputs selected for the next
-        strict puts. Only unreferenced READY entries are eligible LRU victims;
+        producer commits. Only unreferenced READY entries are eligible LRU victims;
         reservations and referenced tensors are never removed. The returned
         keys let an authority replay the exact removals on peer caches. A
         failure leaves the cache unchanged.
@@ -385,7 +378,7 @@ class TensorLRUCache(Generic[K]):
             victims: list[tuple[K, _Entry]] = []
             freed_bytes = 0
             for victim_key, victim in list(self._items.items()):
-                if victim.state is not CacheEntryState.READY or victim.reference_count != 0:
+                if victim.state is not _CacheEntryState.READY or victim.reference_count != 0:
                     continue
                 victims.append((victim_key, victim))
                 freed_bytes += victim.size_bytes
@@ -420,12 +413,12 @@ class TensorLRUCache(Generic[K]):
             if entry.reference_count:
                 return None
 
-            if entry.state is CacheEntryState.RESERVED:
+            if entry.state is _CacheEntryState.RESERVED:
                 self._reserved_bytes -= entry.size_bytes
                 del self._items[key]
                 return None
 
-            if entry.state is not CacheEntryState.READY:
+            if entry.state is not _CacheEntryState.READY:
                 raise RuntimeError(f"unexpected cache entry state: {entry.state}")
 
             self._pinned_bytes -= entry.size_bytes
@@ -436,26 +429,20 @@ class TensorLRUCache(Generic[K]):
             del self._items[key]
             return key
 
-    def pop(self, key: K, *, expected_state: CacheEntryState | None = None) -> torch.Tensor | None:
+    def pop(self, key: K) -> torch.Tensor | None:
         """Remove one unreferenced key without applying release policy.
 
-        `expected_state` makes a missing key or state mismatch an error for
-        exact rollback and peer replay. Returns the READY tensor, or `None` for
-        a removed reservation or an optional miss.
+        Returns the READY tensor, or `None` for a removed reservation or miss.
         """
         with self._lock:
             entry = self._items.get(key)
             if entry is None:
-                if expected_state is not None:
-                    raise RuntimeError("expected cache removal target is absent")
                 return None
-            if expected_state is not None and entry.state is not expected_state:
-                raise RuntimeError(f"cache removal expected {expected_state}, found {entry.state}")
             if entry.reference_count:
                 raise RuntimeError("cannot remove a referenced cache entry")
 
             del self._items[key]
-            if entry.state is CacheEntryState.RESERVED:
+            if entry.state is _CacheEntryState.RESERVED:
                 self._reserved_bytes -= entry.size_bytes
                 return None
 
@@ -522,56 +509,6 @@ class TensorLRUCache(Generic[K]):
             producer_event.record(torch.cuda.current_stream(stored_value.device))
         return stored_value, producer_event
 
-    def _put_with_expected_state(
-        self,
-        key: K,
-        value: torch.Tensor,
-        size_bytes: int,
-        expected_state: CacheEntryState,
-    ) -> bool:
-        """Apply a strict managed insertion after validating the expected state."""
-        entry = self._items.get(key)
-        actual_state = CacheEntryState.ABSENT if entry is None else entry.state
-        if actual_state is not expected_state:
-            raise RuntimeError(f"cache insertion expected {expected_state}, found {actual_state}")
-
-        if expected_state is CacheEntryState.RESERVED:
-            assert entry is not None
-            if size_bytes != entry.size_bytes:
-                raise ValueError(
-                    f"tensor size ({size_bytes}) does not match reserved bytes ({entry.size_bytes})"
-                )
-            if self._current_bytes + size_bytes > self._max_bytes:
-                raise RuntimeError("reserved entry does not have enough cache space")
-
-            stored_value, producer_event = self._clone_for_storage(value)
-            entry.state = CacheEntryState.READY
-            entry.value = stored_value
-            entry.producer_event = producer_event
-            self._reserved_bytes -= size_bytes
-            self._pinned_bytes += size_bytes
-            self._current_bytes += size_bytes
-            self._items.move_to_end(key)
-            self._counters.insertions += 1
-            return True
-
-        assert expected_state is CacheEntryState.ABSENT
-        if self._current_bytes + size_bytes > self._max_bytes:
-            raise RuntimeError("remote cache insertion exceeds cache capacity")
-
-        stored_value, producer_event = self._clone_for_storage(value)
-        self._items[key] = _Entry(
-            state=CacheEntryState.READY,
-            size_bytes=size_bytes,
-            reference_count=0,
-            retain_after_release=True,
-            value=stored_value,
-            producer_event=producer_event,
-        )
-        self._current_bytes += size_bytes
-        self._counters.insertions += 1
-        return True
-
     def _prepare_for_current_stream(self, entry: _Entry) -> None:
         """Order and anchor a cached tensor for consumption on the current stream.
 
@@ -599,7 +536,7 @@ class TensorLRUCache(Generic[K]):
         for key, entry in list(self._items.items()):
             if self._current_bytes <= self._max_bytes:
                 break
-            if entry.state is not CacheEntryState.READY or entry.reference_count:
+            if entry.state is not _CacheEntryState.READY or entry.reference_count:
                 continue
             del self._items[key]
             self._current_bytes -= entry.size_bytes

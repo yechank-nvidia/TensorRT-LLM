@@ -207,14 +207,15 @@ class MultimodalEncoderRequestState:
         self.item_ready[item_idx] = False
         return cache_key
 
-    def mark_cache_key_ready(self, cache_key: Hashable) -> int:
+    def mark_cache_key_ready(self, cache_key: Hashable) -> None:
         """Mark every item using `cache_key` as ready."""
-        marked = 0
         for item_idx, bound_cache_key in enumerate(self.item_cache_keys):
             if bound_cache_key == cache_key and not self.item_ready[item_idx]:
                 self.item_ready[item_idx] = True
-                marked += 1
-        return marked
+
+    def mark_all_items_ready(self) -> None:
+        """Mark every bound item ready after a scheduled context replay."""
+        self.item_ready = [True] * self.num_items
 
     def pop_all_cache_keys(self) -> List[Hashable]:
         """Return and clear all cache keys, keeping prompt order and duplicates."""

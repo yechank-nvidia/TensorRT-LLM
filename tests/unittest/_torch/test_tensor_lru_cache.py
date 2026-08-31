@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 import torch
 
-from tensorrt_llm._torch.tensor_lru_cache import CacheAcquireResult, CacheEntryState, TensorLRUCache
+from tensorrt_llm._torch.tensor_lru_cache import CacheAcquireResult, TensorLRUCache
 
 
 def test_rejects_non_positive_capacity() -> None:
@@ -61,11 +61,7 @@ def test_clear_rejects_live_references_and_reservations() -> None:
     with pytest.raises(RuntimeError, match="live references or reservations"):
         cache.clear()
 
-    assert cache.put(
-        "key",
-        torch.ones(2, dtype=torch.float32),
-        expected_state=CacheEntryState.RESERVED,
-    )
+    cache.commit("key", torch.ones(2, dtype=torch.float32))
     with pytest.raises(RuntimeError, match="live references or reservations"):
         cache.clear()
 
@@ -213,7 +209,7 @@ def test_shared_reservation_stores_one_output_and_keeps_reusable_entry() -> None
     assert cache.stats().pinned_bytes == 0
 
     assert cache.ensure_capacity(8) == []
-    assert cache.put("key", value, expected_state=CacheEntryState.RESERVED)
+    cache.commit("key", value)
     assert cache.current_bytes == 8
     assert cache.stats().reserved_bytes == 0
     assert cache.stats().pinned_bytes == 8
@@ -249,11 +245,7 @@ def test_non_retained_entries_are_removed_on_their_final_release() -> None:
     assert (
         cache.acquire("ready", 8, retain_after_release=False) is CacheAcquireResult.NEW_RESERVATION
     )
-    assert cache.put(
-        "ready",
-        torch.ones(2, dtype=torch.float32),
-        expected_state=CacheEntryState.RESERVED,
-    )
+    cache.commit("ready", torch.ones(2, dtype=torch.float32))
     assert cache.release("ready") == "ready"
     assert len(cache) == 0
     assert cache.current_bytes == 0
@@ -271,44 +263,9 @@ def test_reservation_limit_and_output_space_are_checked_separately() -> None:
 
     assert cache.ensure_capacity(16) == ["old-1", "old-2"]
     assert cache.current_bytes == 0
-    assert cache.put(
-        "new-1",
-        torch.ones(2, dtype=torch.float32),
-        expected_state=CacheEntryState.RESERVED,
-    )
-    assert cache.put(
-        "new-2",
-        torch.ones(2, dtype=torch.float32),
-        expected_state=CacheEntryState.RESERVED,
-    )
+    cache.commit("new-1", torch.ones(2, dtype=torch.float32))
+    cache.commit("new-2", torch.ones(2, dtype=torch.float32))
     assert cache.current_bytes == 16
-
-
-def test_remote_cache_put_and_removal_require_the_expected_state() -> None:
-    cache = TensorLRUCache[str](max_bytes=16)
-    value = torch.ones(2, dtype=torch.float32)
-
-    with pytest.raises(ValueError, match="requires expected_bytes"):
-        cache.put("key", value, expected_state=CacheEntryState.ABSENT)
-    assert cache.put(
-        "key",
-        value,
-        expected_state=CacheEntryState.ABSENT,
-        expected_bytes=8,
-    )
-    with pytest.raises(RuntimeError, match="expected CacheEntryState.ABSENT"):
-        cache.put(
-            "key",
-            value,
-            expected_state=CacheEntryState.ABSENT,
-            expected_bytes=8,
-        )
-
-    popped = cache.pop("key", expected_state=CacheEntryState.READY)
-    assert popped is not None
-    torch.testing.assert_close(popped, value)
-    with pytest.raises(RuntimeError, match="target is absent"):
-        cache.pop("key", expected_state=CacheEntryState.READY)
 
 
 def test_stream_aware_mode_leaves_cpu_cache_behavior_unchanged() -> None:

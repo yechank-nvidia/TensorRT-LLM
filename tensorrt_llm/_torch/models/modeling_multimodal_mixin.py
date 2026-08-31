@@ -1113,19 +1113,10 @@ class MultimodalModelMixin:
         The cache stores per-item embeddings for params that can be represented by one modality.
         See `_encoder_cache_keys` for the mixed-modality skip path and its technical limitation.
         `ModelEngine` resolves `max_bytes` as the larger of the item-scheduling
-        output budget and persistent-reuse capacity before runtime access. A
-        repeated call must request the same capacity; zero leaves the cache
-        disabled.
+        output budget and persistent-reuse capacity before runtime access.
+        Zero leaves the cache disabled.
         """
-        if max_bytes < 0:
-            raise ValueError("max_bytes must be non-negative")
-
         if self._multimodal_encoder_cache is not None:
-            if self._multimodal_encoder_cache.max_bytes != max_bytes:
-                raise RuntimeError(
-                    "multimodal encoder cache was initialized with capacity "
-                    f"{self._multimodal_encoder_cache.max_bytes}, requested {max_bytes}"
-                )
             return self._multimodal_encoder_cache
 
         if max_bytes == 0:

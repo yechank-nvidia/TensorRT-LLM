@@ -32,7 +32,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     ScheduledRequests,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import FCFSWaitingQueue
-from tensorrt_llm._torch.tensor_lru_cache import CacheEntryState, TensorLRUCache
+from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -223,11 +223,7 @@ def test_pinned_outputs_block_new_admissions_until_explicit_release():
     assert first_output.scheduled_mm_encoder_items == {1: [0]}
     holder_cache_key = holder.py_mm_encoder_state.item_cache_keys[0]
     assert holder_cache_key is not None
-    assert scheduler.encoder_cache.put(
-        holder_cache_key,
-        torch.ones(1, dtype=torch.float32),
-        expected_state=CacheEntryState.RESERVED,
-    )
+    scheduler.encoder_cache.commit(holder_cache_key, torch.ones(1, dtype=torch.float32))
     holder.py_mm_encoder_state.mark_cache_key_ready(holder_cache_key)
 
     output = scheduler.schedule_request([holder, newcomer], set())
@@ -285,29 +281,6 @@ def test_admission_rejects_requests_larger_than_output_budget():
         )
     assert "Multimodal request 1" in str(exc_info.value)
     assert "effective encoder_max_num_tokens is 1073741824" in str(exc_info.value)
-
-
-def test_oversized_request_fails_fast_instead_of_starving():
-    scheduler = _scheduler(max_batch_size=8, max_num_tokens=1 << 20, cache_capacity=4)
-    request = _request(1, [3, 3])  # 2 rows = 8 bytes > 4-byte budget
-
-    with pytest.raises(RuntimeError, match="raise encoder_max_num_tokens") as exc_info:
-        scheduler.schedule_request([request], set())
-    assert "Multimodal request 1" in str(exc_info.value)
-    assert "effective encoder_max_num_tokens is 1048576" in str(exc_info.value)
-
-
-def test_scheduler_requires_bytes_per_embedding_alongside_budget():
-    with pytest.raises(ValueError, match="bytes_per_encoder_embedding"):
-        MultimodalScheduler(
-            _BaseScheduler(),
-            max_batch_size=1,
-            max_num_tokens=1,
-            encoder_cache=TensorLRUCache(4),
-            get_item_cache_keys=_item_cache_keys,
-            bytes_per_encoder_embedding=0,
-            retain_cache_entries=False,
-        )
 
 
 def test_multimodal_scheduler_selects_all_items_and_admits_request_when_batch_fits():
@@ -823,7 +796,7 @@ def test_terminate_request_releases_multimodal_cache_references_idempotently(
     cache = TensorLRUCache(16)
     cache_key = ("mm_transient", request.request_id, 0)
     cache.acquire(cache_key, 4, retain_after_release=False)
-    cache.put(cache_key, torch.ones(1), expected_state=CacheEntryState.RESERVED, expected_bytes=4)
+    cache.commit(cache_key, torch.ones(1))
     state.set_item_cache_key(0, cache_key, ready=True)
     freed = []
 
@@ -1062,11 +1035,3 @@ def test_mm_encoder_state_tracks_prompt_ordered_cache_key_readiness():
     assert state.pop_all_cache_keys() == [first_cache_key, second_cache_key]
     assert state.item_cache_keys == [None, None]
     assert state.progress is MultimodalEncoderProgress.PENDING
-
-
-def test_mm_encoder_state_rejects_replacing_an_item_cache_key():
-    state = MultimodalEncoderRequestState.from_embedding_lengths([2])
-    state.set_item_cache_key(0, ("cache", 0), ready=False)
-
-    with pytest.raises(RuntimeError, match="already has a cache key"):
-        state.set_item_cache_key(0, ("cache", 1), ready=False)

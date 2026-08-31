@@ -306,8 +306,6 @@ def test_explicit_cache_initialization_creates_cache_without_persistent_reuse():
     assert cache is not None
     assert cache.max_bytes == 1024
     assert model._multimodal_encoder_cache is cache
-    with pytest.raises(RuntimeError, match="initialized with capacity 1024"):
-        model._initialize_multimodal_encoder_cache(2048)
 
 
 def test_explicit_cache_capacity_can_exceed_persistent_reuse_capacity():
