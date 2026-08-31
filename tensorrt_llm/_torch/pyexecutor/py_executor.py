@@ -334,6 +334,7 @@ class ScheduledBatchStats:
     num_gen_requests: Optional[int] = None
     num_gen_kv_tokens: Optional[int] = None
     num_paused_requests: Optional[int] = None
+    mm_encoder_stats: Optional[Dict[str, Union[int, float]]] = None
 
 
 @dataclasses.dataclass
@@ -1898,6 +1899,80 @@ class PyExecutor:
                 continue
             num_paused_requests += 1
 
+        mm_encoder_stats = None
+        if self._mm_encoder_item_scheduling_enabled:
+            scheduled_items = scheduled_batch.scheduled_mm_encoder_items or {}
+            has_mm_context = any(
+                request.py_mm_encoder_state is not None
+                for request in scheduled_batch.context_requests)
+            has_mm_activity = bool(
+                scheduled_items
+                or scheduled_batch.mm_encoder_blocked_request_ids
+                or scheduled_batch.mm_encoder_cache_removals
+                or scheduled_batch.mm_encoder_context_chunk_sizes
+                or has_mm_context)
+            if has_mm_activity:
+                request_by_id = {
+                    request.request_id: request
+                    for request in self.active_requests
+                }
+                num_items = 0
+                num_input_tokens = 0
+                num_output_rows = 0
+                for request_id, item_indices in scheduled_items.items():
+                    state = request_by_id[request_id].py_mm_encoder_state
+                    assert state is not None
+                    num_items += len(item_indices)
+                    num_input_tokens += sum(
+                        state.encoder_token_lengths[item_idx]
+                        for item_idx in item_indices)
+                    num_output_rows += sum(state.embedding_lengths[item_idx]
+                                           for item_idx in item_indices)
+
+                mm_encoder_stats = {
+                    "numItems":
+                    num_items,
+                    "numInputTokens":
+                    num_input_tokens,
+                    "numOutputRows":
+                    num_output_rows,
+                    "numBlockedRequests":
+                    len(scheduled_batch.mm_encoder_blocked_request_ids or ()),
+                    "numCacheRemovals":
+                    len(scheduled_batch.mm_encoder_cache_removals or ()),
+                }
+                bytes_per_embedding = getattr(self.model_engine,
+                                              "bytes_per_mm_encoder_embedding",
+                                              None)
+                if bytes_per_embedding is not None:
+                    mm_encoder_stats[
+                        "selectedOutputBytes"] = num_output_rows * bytes_per_embedding
+                schedule_time_ms = scheduled_batch.mm_encoder_schedule_time_ms
+                if schedule_time_ms is not None:
+                    mm_encoder_stats["scheduleTimeMS"] = schedule_time_ms
+
+                encoder_cache = self.model_engine.mm_encoder_cache
+                if encoder_cache is not None:
+                    cache_stats = encoder_cache.stats()
+                    mm_encoder_stats.update({
+                        "cacheMaxBytes":
+                        cache_stats.max_bytes,
+                        "cacheCurrentBytes":
+                        cache_stats.current_bytes,
+                        "cacheReservedBytes":
+                        cache_stats.reserved_bytes,
+                        "cacheInUseBytes":
+                        cache_stats.in_use_bytes,
+                        "cacheHits":
+                        cache_stats.hits,
+                        "cacheProducerMisses":
+                        cache_stats.producer_misses,
+                        "cacheReservationHits":
+                        cache_stats.inflight_deduplications,
+                        "cacheEvictions":
+                        cache_stats.evictions,
+                    })
+
         return ScheduledBatchStats(
             num_ctx_requests=num_context_requests,
             num_ctx_tokens=num_ctx_tokens,
@@ -1905,6 +1980,7 @@ class PyExecutor:
             num_gen_requests=num_gen_requests,
             num_gen_kv_tokens=num_gen_kv_tokens,
             num_paused_requests=num_paused_requests,
+            mm_encoder_stats=mm_encoder_stats,
         )
 
     def _populate_req_stats(
@@ -2266,14 +2342,16 @@ class PyExecutor:
             self.speculation_permanently_disabled = True
         return disabled_now, avg
 
-    def _append_iter_stats(self,
-                           stats: IterationStats,
-                           req_stats: Optional[List[RequestStats]] = None,
-                           kv_iter_stats: Optional[Dict[int, object]] = None,
-                           attention_dp_rank: Optional[int] = None,
-                           host_step_time_ms: Optional[float] = None,
-                           prev_device_step_time_ms: Optional[float] = None,
-                           gpu_forward_time_ms: Optional[float] = None):
+    def _append_iter_stats(
+            self,
+            stats: IterationStats,
+            req_stats: Optional[List[RequestStats]] = None,
+            kv_iter_stats: Optional[Dict[int, object]] = None,
+            attention_dp_rank: Optional[int] = None,
+            host_step_time_ms: Optional[float] = None,
+            prev_device_step_time_ms: Optional[float] = None,
+            gpu_forward_time_ms: Optional[float] = None,
+            mm_encoder_stats: Optional[Dict[str, Union[int, float]]] = None):
         """Append one iteration's finalized stats to the export buffer.
 
         The normal Attention-DP path fans out rank-local rows before calling
@@ -2299,6 +2377,8 @@ class PyExecutor:
             gpu_forward_time_ms: Batch-matched GPU forward time captured by
                 the events surrounding this batch's ``_forward_step``.
                 Surfaces as ``gpuForwardTimeMS`` in the /metrics JSON.
+            mm_encoder_stats: Optional MM scheduler, cache, and encoder timing
+                fields. Surfaces as ``multimodalEncoderStats``.
         """
         # Non-ADP appends immediately, so the latest KV stats belong to this
         # IterationStats. ADP appends later and passes the saved iter-matched
@@ -2342,6 +2422,8 @@ class PyExecutor:
                 local_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
             if gpu_forward_time_ms is not None:
                 local_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
+            if mm_encoder_stats is not None:
+                local_dict["multimodalEncoderStats"] = mm_encoder_stats
             local_dict["schedulerMode"] = scheduler_mode
             local_dict["rank"] = self.dist.tp_rank
             # Buffer for _flush_iter_stats_synced; in-place tp_allgather would
@@ -2360,6 +2442,7 @@ class PyExecutor:
         #   [5] prev_device_step_time_ms: Optional[float]
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
+        #   [8] mm_encoder_stats: Optional[Dict[str, int | float]]
         with self.stats_lock:
             if (not _stats_buffer_is_unbounded(self.max_stats_len)
                     and len(self.stats) > self.max_stats_len):
@@ -2367,7 +2450,7 @@ class PyExecutor:
             self.stats.append(
                 (stats, req_stats, kv_iter_stats, attention_dp_rank,
                  host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
-                 gpu_forward_time_ms))
+                 gpu_forward_time_ms, mm_encoder_stats))
 
     def _process_iter_stats(
         self,
@@ -2378,6 +2461,24 @@ class PyExecutor:
     ):
         """All ranks: build local stats; ADP queues them for later fanout."""
         iter_end_time = time.time()
+        scheduled_requests = batch_state.scheduled_requests
+        mm_encoder_stats = None
+        if (batch_state.scheduled_batch_stats is not None and
+                batch_state.scheduled_batch_stats.mm_encoder_stats is not None):
+            mm_encoder_stats = dict(
+                batch_state.scheduled_batch_stats.mm_encoder_stats)
+
+        mm_encoder_gpu_time_ms = self.perf_manager.try_compute_gpu_elapsed_time_ms(
+            scheduled_requests.mm_encoder_gpu_start_event,
+            scheduled_requests.mm_encoder_gpu_end_event)
+        if mm_encoder_stats is not None and mm_encoder_gpu_time_ms is not None:
+            mm_encoder_stats["gpuTimeMS"] = mm_encoder_gpu_time_ms
+        if scheduled_requests.mm_encoder_gpu_start_event is not None:
+            self.perf_manager.release_forward_timing_events(
+                scheduled_requests.mm_encoder_gpu_start_event,
+                scheduled_requests.mm_encoder_gpu_end_event)
+            scheduled_requests.mm_encoder_gpu_start_event = None
+            scheduled_requests.mm_encoder_gpu_end_event = None
         # iterLatencyMS semantics differ by scheduler:
         # - Overlap / PP: batch_state.iter_start_time was captured at the top
         #   of the loop that BUILT this batch (one or more loops ago). The
@@ -2432,14 +2533,16 @@ class PyExecutor:
                 is_rank0=self.dist.rank == 0,
                 host_step_time_ms=host_step_time_ms,
                 prev_device_step_time_ms=prev_device_step_time_ms,
-                gpu_forward_time_ms=gpu_forward_time_ms)
+                gpu_forward_time_ms=gpu_forward_time_ms,
+                mm_encoder_stats=mm_encoder_stats)
         else:
             self._append_iter_stats(
                 stats,
                 req_stats,
                 host_step_time_ms=host_step_time_ms,
                 prev_device_step_time_ms=prev_device_step_time_ms,
-                gpu_forward_time_ms=gpu_forward_time_ms)
+                gpu_forward_time_ms=gpu_forward_time_ms,
+                mm_encoder_stats=mm_encoder_stats)
 
     def _executor_loop_cleanup(self):
         # Wake any waiters in await_responses BEFORE potentially-blocking
@@ -5758,7 +5861,8 @@ class PyExecutor:
                         host_step_time_ms=record.host_step_time_ms,
                         prev_device_step_time_ms=record.
                         prev_device_step_time_ms,
-                        gpu_forward_time_ms=record.gpu_forward_time_ms)
+                        gpu_forward_time_ms=record.gpu_forward_time_ms,
+                        mm_encoder_stats=record.mm_encoder_stats)
             all_ranks_num_active_requests = [
                 s.num_active_requests for s in all_rank_states
             ]
@@ -6246,8 +6350,13 @@ class PyExecutor:
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
+        mm_schedule_start = (time.perf_counter() if self.enable_iter_perf_stats
+                             and isinstance(self.scheduler, MultimodalScheduler)
+                             else None)
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
+        mm_schedule_time_ms = ((time.perf_counter() - mm_schedule_start) *
+                               1e3 if mm_schedule_start is not None else None)
 
         if self._pending_mm_encoder_cache_removals:
             if not self._owns_mm_encoder_cache_references():
@@ -6318,6 +6427,7 @@ class PyExecutor:
             scheduler_output.mm_encoder_cache_removals)
         scheduled_requests.mm_encoder_context_chunk_sizes = (
             scheduler_output.mm_encoder_context_chunk_sizes)
+        scheduled_requests.mm_encoder_schedule_time_ms = mm_schedule_time_ms
 
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, num_fitting
 
@@ -6331,6 +6441,13 @@ class PyExecutor:
                 not any(request.py_mm_encoder_state is not None
                         for request in scheduled_requests.context_requests)):
             return None
+        gpu_start = gpu_end = None
+        if self.enable_iter_perf_stats and scheduled_items:
+            gpu_start, gpu_end = self.perf_manager.borrow_forward_timing_events(
+            )
+            scheduled_requests.mm_encoder_gpu_start_event = gpu_start
+            scheduled_requests.mm_encoder_gpu_end_event = gpu_end
+            gpu_start.record()
         try:
             self.model_engine.run_multimodal_encoder_schedule(
                 self.active_requests,
@@ -6346,6 +6463,9 @@ class PyExecutor:
             self._handle_multimodal_encoder_request_error(
                 scheduled_requests, error_msg, failed_request_ids)
             return error_msg, sorted(failed_request_ids)
+        finally:
+            if gpu_end is not None:
+                gpu_end.record()
         return None
 
     def _handle_multimodal_encoder_request_error(

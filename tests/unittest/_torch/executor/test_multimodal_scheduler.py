@@ -163,6 +163,45 @@ def _request(request_id, costs):
     return request
 
 
+def test_collect_scheduled_batch_stats_includes_multimodal_work():
+    request = _request(7, [11, 13])
+    scheduled = ScheduledRequests()
+    scheduled.scheduled_mm_encoder_items = {request.request_id: [0, 1]}
+    scheduled.mm_encoder_blocked_request_ids = [8]
+    scheduled.mm_encoder_cache_removals = [("old", 0)]
+    scheduled.mm_encoder_schedule_time_ms = 0.25
+    cache = TensorLRUCache(1 << 20)
+    executor = SimpleNamespace(
+        _mm_encoder_item_scheduling_enabled=True,
+        active_requests=[request],
+        model_engine=SimpleNamespace(
+            bytes_per_mm_encoder_embedding=4,
+            mm_encoder_cache=cache,
+        ),
+        _is_stats_dummy_request=PyExecutor._is_stats_dummy_request,
+    )
+
+    stats = PyExecutor._collect_scheduled_batch_stats(executor, scheduled)
+
+    assert stats.mm_encoder_stats == {
+        "numItems": 2,
+        "numInputTokens": 24,
+        "numOutputRows": 2,
+        "numBlockedRequests": 1,
+        "numCacheRemovals": 1,
+        "selectedOutputBytes": 8,
+        "scheduleTimeMS": 0.25,
+        "cacheMaxBytes": 1 << 20,
+        "cacheCurrentBytes": 0,
+        "cacheReservedBytes": 0,
+        "cacheInUseBytes": 0,
+        "cacheHits": 0,
+        "cacheProducerMisses": 0,
+        "cacheReservationHits": 0,
+        "cacheEvictions": 0,
+    }
+
+
 def test_mm_encoder_token_lengths_distinguishes_missing_and_invalid_data():
     request = _llm_request(1)
 
@@ -811,6 +850,7 @@ def test_forward_multimodal_encoder_step_scopes_failure_to_item_owners():
         unrelated_generation,
     ]
     executor.enable_attention_dp = False
+    executor.enable_iter_perf_stats = False
     executor._mm_encoder_item_scheduling_enabled = True
     executor.global_rank = 0
     executor.dist = SimpleNamespace(world_size=1, is_first_pp_rank=True, pp_size=1)
@@ -865,6 +905,7 @@ def test_forward_multimodal_encoder_step_contains_model_contract_error():
     executor = object.__new__(PyExecutor)
     executor.active_requests = [failed, unrelated]
     executor.enable_attention_dp = False
+    executor.enable_iter_perf_stats = False
     executor._mm_encoder_item_scheduling_enabled = True
     executor.global_rank = 0
     executor.dist = SimpleNamespace(world_size=1, is_first_pp_rank=True, pp_size=1)
@@ -894,6 +935,7 @@ def test_forward_multimodal_encoder_step_contains_stale_schedule():
     executor = object.__new__(PyExecutor)
     executor.active_requests = [unrelated]
     executor.enable_attention_dp = False
+    executor.enable_iter_perf_stats = False
     executor._mm_encoder_item_scheduling_enabled = True
     executor.global_rank = 0
     executor.dist = SimpleNamespace(world_size=1, is_first_pp_rank=True, pp_size=1)
@@ -928,6 +970,7 @@ def test_forward_multimodal_encoder_step_propagates_system_errors():
     executor = object.__new__(PyExecutor)
     executor.active_requests = [failed]
     executor.enable_attention_dp = False
+    executor.enable_iter_perf_stats = False
     executor._mm_encoder_item_scheduling_enabled = True
     executor.global_rank = 0
     executor.dist = SimpleNamespace(is_first_pp_rank=True, pp_size=1)

@@ -319,6 +319,20 @@ class TestStatsSerializer:
         assert d["schedulerMode"] == "overlap"
         assert d["gpuForwardTimeMS"] == 4.25
 
+    def test_serializer_9_tuple_emits_multimodal_encoder_stats(self):
+        iter_stats = _make_mock_iteration_stats()
+        mm_stats = {
+            "numItems": 2,
+            "numInputTokens": 128,
+            "gpuTimeMS": 3.5,
+        }
+
+        result = BaseWorker._stats_serializer(
+            (iter_stats, None, None, None, None, None, "overlap", None, mm_stats)
+        )
+
+        assert json.loads(result)["multimodalEncoderStats"] == mm_stats
+
     def test_serializer_with_v2_pool_group_stats(self):
         """KV cache manager V2 stats should include pool group breakdown."""
         iter_stats = _make_mock_iteration_stats()

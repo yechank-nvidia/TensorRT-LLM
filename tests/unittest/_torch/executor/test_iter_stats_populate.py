@@ -763,6 +763,7 @@ def _build_adp_stats_buffer(pending_stats, *, is_rank0=True):
         host_step_time_ms=11.0 if is_rank0 else None,
         prev_device_step_time_ms=9.0 if is_rank0 else None,
         gpu_forward_time_ms=7.0 if is_rank0 else None,
+        mm_encoder_stats={"numItems": 2} if is_rank0 else None,
     )
     return buffer
 
@@ -830,6 +831,7 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     assert rank0_record.host_step_time_ms == 11.0
     assert rank0_record.prev_device_step_time_ms == 9.0
     assert rank0_record.gpu_forward_time_ms == 7.0
+    assert rank0_record.mm_encoder_stats == {"numItems": 2}
 
     rank1_record = records[1]
     rank1_row = rank1_record.stats
@@ -855,6 +857,7 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     assert rank1_record.host_step_time_ms == 11.0
     assert rank1_record.prev_device_step_time_ms == 9.0
     assert rank1_record.gpu_forward_time_ms == 7.0
+    assert rank1_record.mm_encoder_stats is None
 
     assert buffer._payloads == {}
     assert buffer.next_payload() is None
