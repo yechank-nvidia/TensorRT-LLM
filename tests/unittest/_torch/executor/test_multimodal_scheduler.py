@@ -1275,6 +1275,24 @@ def test_llm_data_accepts_a_chunk_without_multimodal_rows():
     assert embedding.shape == (0, 1)
 
 
+def test_single_scheduled_segment_is_used_without_a_copy():
+    class _Model(MultimodalModelMixin):
+        @property
+        def text_embedding_layer(self):
+            return SimpleNamespace(weight=torch.empty(0, 1))
+
+        @property
+        def embedding_dim(self):
+            return 1
+
+    segment = torch.arange(3, dtype=torch.float32).unsqueeze(1)
+    params = MultimodalParams(multimodal_data={"multimodal_embedding": (segment,)})
+
+    embedding = _Model()._get_or_encode_multimodal_embeddings([params])
+
+    assert embedding is segment
+
+
 # ---------------------------------------------------------------------------
 # MultimodalEncoderRequestState unit behavior
 # ---------------------------------------------------------------------------

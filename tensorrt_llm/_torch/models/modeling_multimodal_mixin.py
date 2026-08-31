@@ -1089,7 +1089,11 @@ class MultimodalModelMixin:
             embedding_segments.extend(segments)
         if has_scheduled_segments:
             if embedding_segments:
-                embedding = torch.cat(embedding_segments, dim=0)
+                embedding = (
+                    embedding_segments[0]
+                    if len(embedding_segments) == 1
+                    else torch.cat(embedding_segments, dim=0)
+                )
             else:
                 embedding = self.text_embedding_layer.weight.new_empty((0, self.embedding_dim))
             self._validate_embeddings([embedding], multimodal_params, current_chunk_only=True)
