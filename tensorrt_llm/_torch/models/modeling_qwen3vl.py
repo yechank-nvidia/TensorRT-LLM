@@ -55,6 +55,7 @@ from .modeling_multimodal_mixin import (
     MultimodalModelMixin,
     PreparedLlmInputs,
     encode_multimodal_by_groups,
+    is_mm_encoder_item_scheduling_enabled,
     make_multimodal_encoder_model_config,
 )
 from .modeling_qwen2vl import (
@@ -1403,6 +1404,23 @@ class Qwen3VisionModelBase(nn.Module):
         return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
 
 
+def _validate_deepstack_pp_partition(
+    mapping: Mapping,
+    num_hidden_layers: int,
+    deepstack_num_levels: int,
+) -> None:
+    """Require every Qwen3-VL deepstack consumer layer to remain on PP0."""
+    if not mapping.has_pp() or deepstack_num_levels == 0:
+        return
+    last_consumer = deepstack_num_levels - 1
+    if mapping.pp_rank_of_layer(last_consumer, num_hidden_layers) != 0:
+        raise NotImplementedError(
+            "Qwen3-VL item scheduling requires PP0 to own every "
+            f"deepstack consumer layer [0, {deepstack_num_levels}); "
+            "a downstream deepstack sidecar is not implemented"
+        )
+
+
 class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
     supports_encoder_data_parallel = True
     supports_mm_encoder_item_scheduling = True
@@ -1520,7 +1538,9 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         # Normal workers own the encoder. MM E/P handoff uses attached
         # embeddings; disable_mm_encoder serves the checkpoint text-only and
         # saves the encoder's GPU memory for the KV cache pool.
-        if not (_is_mm_disagg() or model_config.disable_mm_encoder):
+        item_scheduling_enabled = is_mm_encoder_item_scheduling_enabled(model_config)
+        owns_mm_encoder = not item_scheduling_enabled or model_config.mapping.is_first_pp_rank()
+        if not (_is_mm_disagg() or model_config.disable_mm_encoder or not owns_mm_encoder):
             self.mm_encoder = Qwen3VisionModelBase(
                 make_multimodal_encoder_model_config(model_config),
                 kwargs.get("vision_model_class", None),
@@ -1539,20 +1559,28 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
             len(config.vision_config.deepstack_visual_indexes) if self.use_deepstack else 0
         )
         if self.deepstack_num_level > 0:
-            # Reuse one `(L, max_num_tokens, hidden)` scratch allocation for
-            # per-layer deepstack embeddings. The generic extra-embedding path
-            # allocates and scatters one full-sequence tensor per level.
-            self.register_buffer(
-                "deepstack_input_embeds",
-                torch.zeros(
+            mapping = model_config.mapping
+            if item_scheduling_enabled:
+                _validate_deepstack_pp_partition(
+                    mapping,
+                    config.text_config.num_hidden_layers,
                     self.deepstack_num_level,
-                    model_config.max_num_tokens,
-                    config.text_config.hidden_size,
-                    device="cuda",
-                    dtype=config.text_config.torch_dtype,
-                ),
-                persistent=False,
-            )
+                )
+            if owns_mm_encoder:
+                # Reuse one `(L, max_num_tokens, hidden)` scratch allocation for
+                # per-layer deepstack embeddings. The generic extra-embedding path
+                # allocates and scatters one full-sequence tensor per level.
+                self.register_buffer(
+                    "deepstack_input_embeds",
+                    torch.zeros(
+                        self.deepstack_num_level,
+                        model_config.max_num_tokens,
+                        config.text_config.hidden_size,
+                        device="cuda",
+                        dtype=config.text_config.torch_dtype,
+                    ),
+                    persistent=False,
+                )
 
         # Surface the in-vocab image / video placeholder IDs to the model
         # engine's ``_prepare_multimodal_indices`` so it selects the

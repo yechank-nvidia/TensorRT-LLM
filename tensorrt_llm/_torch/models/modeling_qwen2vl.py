@@ -72,7 +72,8 @@ from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import (
-    MultimodalModelMixin, make_multimodal_encoder_model_config,
+    MultimodalModelMixin, is_mm_encoder_item_scheduling_enabled,
+    make_multimodal_encoder_model_config,
     reorder_multimodal_embeddings_by_modality)
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter, find_input_mm_embeds,
@@ -2220,8 +2221,13 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         llm_model_config.extra_attrs = model_config.extra_attrs
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
-        # Normal worker owns encoder. MM E/P prefill worker gets attached embeddings.
-        if not _is_mm_disagg():
+        # Item-scheduled PP runs the encoder on PP0 and sends ordinary pipeline
+        # activations downstream. The legacy DISABLED path keeps its existing
+        # per-stage model construction.
+        owns_mm_encoder = (
+            not is_mm_encoder_item_scheduling_enabled(model_config)
+            or model_config.mapping.is_first_pp_rank())
+        if not _is_mm_disagg() and owns_mm_encoder:
             mm_encoder_config = make_multimodal_encoder_model_config(
                 model_config)
             self.mm_encoder = Qwen2VisionModelBase(

@@ -603,9 +603,9 @@ class MultimodalConfig(StrictBaseModel):
         default=1,
         description=
         ("Number of ranks used to distribute multimodal encoder items. A value "
-         "greater than 1 currently uses the model's full tensor-parallel group, "
-         "replicates the encoder on those ranks, and requires pipeline- and "
-         "context-parallel sizes of 1."),
+         "greater than 1 uses the tensor-parallel group of the encoder-owning "
+         "pipeline stage, replicates the encoder on those ranks, and requires "
+         "context-parallel size 1."),
         status="prototype",
     )
 

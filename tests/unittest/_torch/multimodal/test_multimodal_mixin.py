@@ -23,6 +23,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin,
     _assemble_multimodal_encoder_embeddings,
+    is_mm_encoder_item_scheduling_enabled,
     make_multimodal_encoder_model_config,
     reorder_multimodal_embeddings_by_modality,
 )
@@ -34,7 +35,7 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalRuntimeData,
 )
 from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
-from tensorrt_llm.llmapi.llm_args import MultimodalConfig
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderSchedulingPolicy
 from tensorrt_llm.mapping import Mapping
 
 
@@ -289,6 +290,54 @@ def test_attention_dp_replicates_encoder_mapping_without_explicit_encoder_dp():
 
 
 @pytest.mark.parametrize(
+    "rank,expected_tp_group",
+    [(0, [0, 1]), (2, [2, 3])],
+)
+def test_encoder_data_parallel_uses_each_pipeline_stages_tp_group(
+    rank,
+    expected_tp_group,
+):
+    mapping = Mapping(world_size=4, rank=rank, tp_size=2, pp_size=2)
+    model_config = ModelConfig(
+        mapping=mapping,
+        multimodal_config=MultimodalConfig(encoder_data_parallel_size=2),
+    )
+
+    encoder_config = make_multimodal_encoder_model_config(model_config)
+
+    assert mapping.tp_group == expected_tp_group
+    assert encoder_config.mapping.tp_size == 1
+    assert encoder_config.mapping.rank == rank
+    assert encoder_config.mapping.local_rank == mapping.local_rank
+
+
+@pytest.mark.parametrize(
+    "multimodal_config,disable_mm_encoder,expected",
+    [
+        (None, False, False),
+        (MultimodalConfig(), False, True),
+        (MultimodalConfig(), True, False),
+        (
+            MultimodalConfig(encoder_scheduling_policy=MultimodalEncoderSchedulingPolicy.DISABLED),
+            False,
+            False,
+        ),
+    ],
+)
+def test_is_mm_encoder_item_scheduling_enabled(
+    multimodal_config,
+    disable_mm_encoder,
+    expected,
+):
+    model_config = ModelConfig(
+        multimodal_config=multimodal_config,
+        disable_mm_encoder=disable_mm_encoder,
+    )
+
+    assert is_mm_encoder_item_scheduling_enabled(model_config) is expected
+
+
+@pytest.mark.parametrize(
     "mapping,error_match",
     [
         (
@@ -296,19 +345,15 @@ def test_attention_dp_replicates_encoder_mapping_without_explicit_encoder_dp():
             "cannot be combined with attention data parallelism",
         ),
         (
-            Mapping(world_size=4, rank=0, tp_size=2, pp_size=2),
-            "requires pipeline parallel size 1 and context parallel size 1",
-        ),
-        (
             Mapping(world_size=4, rank=0, tp_size=2, cp_size=2),
-            "requires pipeline parallel size 1 and context parallel size 1",
+            "requires context parallel size 1",
         ),
         (
             Mapping(world_size=4, rank=0, tp_size=4),
             "must equal the tensor parallel size",
         ),
     ],
-    ids=["attention_dp", "pipeline_parallel", "context_parallel", "partial_tp_group"],
+    ids=["attention_dp", "context_parallel", "partial_tp_group"],
 )
 def test_encoder_data_parallel_rejects_unsupported_parallelism(mapping, error_match):
     model_config = ModelConfig(

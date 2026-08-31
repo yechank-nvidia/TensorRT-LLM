@@ -27,7 +27,7 @@ from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.pyexecutor import resource_manager
 from tensorrt_llm.bindings import executor as executor_lib
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.llmapi.llm_args import MultimodalConfig
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderSchedulingPolicy
 from tensorrt_llm.models import modeling_utils
 
 _PATCH_SIZE = 14
@@ -177,6 +177,36 @@ def test_mistral_3_vlm_constructs_under_meta_init(mistral_small_3_1_24b_config):
     assert "_image_token_ids" not in model.state_dict()
     assert model._vision_tower is not None
     assert model._multi_modal_projector is not None
+
+
+@pytest.mark.parametrize(
+    "rank,scheduling_policy,owns_mm_encoder",
+    [
+        (0, MultimodalEncoderSchedulingPolicy.DEFAULT, True),
+        (1, MultimodalEncoderSchedulingPolicy.DEFAULT, False),
+        (1, MultimodalEncoderSchedulingPolicy.DISABLED, True),
+    ],
+)
+def test_mistral_item_scheduling_places_encoder_on_pp0(
+    mistral_small_3_1_24b_config,
+    rank,
+    scheduling_policy,
+    owns_mm_encoder,
+):
+    config_dict = mistral_small_3_1_24b_config
+    config_dict["text_config"]["num_hidden_layers"] = 2
+    config_dict["vision_config"]["num_hidden_layers"] = 1
+    model_config = model_config_lib.ModelConfig(
+        pretrained_config=transformers.Mistral3Config.from_dict(config_dict),
+        mapping=mapping_lib.Mapping(world_size=2, rank=rank, pp_size=2),
+        multimodal_config=MultimodalConfig(encoder_scheduling_policy=scheduling_policy),
+    )
+
+    with MetaInitMode():
+        model = modeling_mistral.Mistral3VLM(model_config)
+
+    assert (model._vision_tower is not None) is owns_mm_encoder
+    assert (model._multi_modal_projector is not None) is owns_mm_encoder
 
 
 def test_mistral_3_vlm_disable_mm_encoder_skips_vision_modules(mistral_small_3_1_24b_config):

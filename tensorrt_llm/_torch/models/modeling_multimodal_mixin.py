@@ -50,6 +50,7 @@ from tensorrt_llm.inputs.registry import (
     MultimodalEncoderItemMetadata,
     get_multimodal_encoder_item_metadata,
 )
+from tensorrt_llm.llmapi.llm_args import MultimodalEncoderSchedulingPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -321,6 +322,17 @@ def _encoder_data_parallel_size(model_config: ModelConfig) -> int:
     return multimodal_config.encoder_data_parallel_size
 
 
+def is_mm_encoder_item_scheduling_enabled(model_config: ModelConfig) -> bool:
+    """Return whether an item-capable model should use MM-item scheduling."""
+    multimodal_config = model_config.multimodal_config
+    return (
+        not model_config.disable_mm_encoder
+        and multimodal_config is not None
+        and multimodal_config.encoder_scheduling_policy
+        is not MultimodalEncoderSchedulingPolicy.DISABLED
+    )
+
+
 def make_multimodal_encoder_model_config(model_config: ModelConfig) -> ModelConfig:
     """Copy ``model_config`` and replicate encoder weights when MM DP is active.
 
@@ -343,10 +355,9 @@ def make_multimodal_encoder_model_config(model_config: ModelConfig) -> ModelConf
     if not replicate_encoder:
         return encoder_config
 
-    if mapping.pp_size != 1 or mapping.cp_size != 1:
+    if mapping.cp_size != 1:
         raise NotImplementedError(
-            "Multimodal encoder data parallelism currently requires pipeline "
-            "parallel size 1 and context parallel size 1."
+            "Multimodal encoder data parallelism currently requires context parallel size 1."
         )
     if not mapping.enable_attention_dp and encoder_dp_size != mapping.tp_size:
         raise ValueError(
@@ -355,8 +366,10 @@ def make_multimodal_encoder_model_config(model_config: ModelConfig) -> ModelConf
         )
 
     # Keep the process rank (and therefore local_rank) while making every TP
-    # group a singleton. pp_size is used only to satisfy Mapping's world-size
+    # rank a singleton. pp_size is used only to satisfy Mapping's world-size
     # invariant; multimodal encoders do not pipeline-partition their layers.
+    # The model's original mapping still owns the stage-local TP collective
+    # used to reconstruct encoder-DP outputs.
     replicated_mapping = Mapping(
         world_size=mapping.world_size,
         rank=mapping.rank,

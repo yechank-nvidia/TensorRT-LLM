@@ -23,8 +23,10 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VLInputProcessorBase,
     Qwen3VLModel,
     _triton_pos_embed_interpolate,
+    _validate_deepstack_pp_partition,
 )
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -84,6 +86,27 @@ QWEN3_VL_8B_CONFIG = {
     "_attn_implementation": "flash_attention_2",
     "_name_or_path": str(os.path.join(llm_models_root(), "Qwen3", "Qwen3-VL-8B-Instruct")),
 }
+
+
+def test_qwen3vl_deepstack_pp_partition_accepts_consumers_on_pp0():
+    mapping = Mapping(world_size=4, rank=0, tp_size=2, pp_size=2)
+
+    _validate_deepstack_pp_partition(
+        mapping,
+        num_hidden_layers=8,
+        deepstack_num_levels=3,
+    )
+
+
+def test_qwen3vl_deepstack_pp_partition_rejects_downstream_consumer():
+    mapping = Mapping(world_size=4, rank=0, tp_size=2, pp_size=2)
+
+    with pytest.raises(NotImplementedError, match="PP0 to own every deepstack consumer"):
+        _validate_deepstack_pp_partition(
+            mapping,
+            num_hidden_layers=4,
+            deepstack_num_levels=3,
+        )
 
 
 @dataclass(repr=False)
