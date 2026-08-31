@@ -3754,7 +3754,7 @@ class PyTorchModelEngine(ModelEngine):
                 "A model with MM encoder item scheduling must implement "
                 "get_max_mm_encoder_output_embeddings() and return a positive "
                 "aggregate embedding capacity")
-        bytes_per_embedding = self._resolve_bytes_per_mm_encoder_embedding()
+        bytes_per_embedding = self._get_mm_encoder_embedding_size_bytes()
         self.bytes_per_mm_encoder_embedding = bytes_per_embedding
         return max_output_embeddings * bytes_per_embedding
 
