@@ -1348,11 +1348,7 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         # Normal workers own the encoder. MM E/P handoff uses attached
         # embeddings; disable_mm_encoder serves the checkpoint text-only and
         # saves the encoder's GPU memory for the KV cache pool.
-        if not (
-            _is_mm_disagg()
-            or model_config.disable_mm_encoder
-            or not model_config.mapping.is_first_pp_rank()
-        ):
+        if not (_is_mm_disagg() or model_config.disable_mm_encoder):
             self.mm_encoder = Qwen3VisionModelBase(
                 copy.deepcopy(model_config), kwargs.get("vision_model_class", None)
             ).eval()
@@ -1370,36 +1366,20 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
             len(config.vision_config.deepstack_visual_indexes) if self.use_deepstack else 0
         )
         if self.deepstack_num_level > 0:
-            mapping = model_config.mapping
-            if mapping.has_pp():
-                local_layers = mapping.pp_layers(config.text_config.num_hidden_layers)
-                if mapping.is_first_pp_rank() and local_layers[-1] + 1 < self.deepstack_num_level:
-                    raise NotImplementedError(
-                        "Qwen3-VL pipeline parallelism requires PP0 to own every "
-                        f"deepstack consumer layer [0, {self.deepstack_num_level}); "
-                        f"PP0 ends at layer {local_layers[-1]}"
-                    )
-                if not mapping.is_first_pp_rank() and local_layers[0] < self.deepstack_num_level:
-                    raise NotImplementedError(
-                        "Qwen3-VL pipeline parallelism requires PP0 to own every "
-                        f"deepstack consumer layer [0, {self.deepstack_num_level}); "
-                        f"this stage starts at layer {local_layers[0]}"
-                    )
-            if mapping.is_first_pp_rank():
-                # Reuse one `(L, max_num_tokens, hidden)` scratch allocation for
-                # per-layer deepstack embeddings. The generic extra-embedding path
-                # allocates and scatters one full-sequence tensor per level.
-                self.register_buffer(
-                    "deepstack_input_embeds",
-                    torch.zeros(
-                        self.deepstack_num_level,
-                        model_config.max_num_tokens,
-                        config.text_config.hidden_size,
-                        device="cuda",
-                        dtype=config.text_config.torch_dtype,
-                    ),
-                    persistent=False,
-                )
+            # Reuse one `(L, max_num_tokens, hidden)` scratch allocation for
+            # per-layer deepstack embeddings. The generic extra-embedding path
+            # allocates and scatters one full-sequence tensor per level.
+            self.register_buffer(
+                "deepstack_input_embeds",
+                torch.zeros(
+                    self.deepstack_num_level,
+                    model_config.max_num_tokens,
+                    config.text_config.hidden_size,
+                    device="cuda",
+                    dtype=config.text_config.torch_dtype,
+                ),
+                persistent=False,
+            )
 
         # Surface the in-vocab image / video placeholder IDs to the model
         # engine's ``_prepare_multimodal_indices`` so it selects the
