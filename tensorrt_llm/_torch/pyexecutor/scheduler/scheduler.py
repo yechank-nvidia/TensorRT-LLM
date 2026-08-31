@@ -3,6 +3,7 @@
 
 """Request schedulers used by the PyTorch executor."""
 
+import bisect
 import dataclasses
 import inspect
 from abc import ABC, abstractmethod
@@ -662,26 +663,15 @@ class MultimodalScheduler(RequestScheduler):
             begin = max(begin, request.estimated_reusable_tokens)
         return begin
 
-    @staticmethod
-    def _get_item_embedding_ranges(request: LlmRequest) -> list[tuple[int, int]]:
-        """Return each item's row range in the combined encoder output."""
-        state = request.py_mm_encoder_state
-        if state is None:
-            return []
-        bounds = []
-        start = 0
-        for length in state.embedding_lengths:
-            end = start + length
-            bounds.append((start, end))
-            start = end
-        return bounds
-
     def _get_item_prompt_start(self, request: LlmRequest, item_idx: int) -> int:
         """Return the prompt position where one MM item starts."""
+        state = request.py_mm_encoder_state
+        if state is None:
+            return self._get_context_chunk_start(request)
         mm_data = request.py_multimodal_data
         cumsum = mm_data.get("multimodal_embed_mask_cumsum") if isinstance(mm_data, dict) else None
         if cumsum is not None:
-            row_start = self._get_item_embedding_ranges(request)[item_idx][0]
+            row_start = state.embedding_row_offsets[item_idx]
             return int(torch.searchsorted(cumsum, row_start + 1).item())
         positions = request.multimodal_positions
         if positions is not None:
@@ -698,11 +688,9 @@ class MultimodalScheduler(RequestScheduler):
         cumsum = mm_data.get("multimodal_embed_mask_cumsum") if isinstance(mm_data, dict) else None
         if cumsum is not None:
             consumed_rows = int(cumsum[begin - 1]) if begin > 0 else 0
-            return [
-                item_idx
-                for item_idx, (_, item_end) in enumerate(self._get_item_embedding_ranges(request))
-                if item_end > consumed_rows
-            ]
+            return state.items_overlapping_embedding_rows(
+                consumed_rows, state.embedding_row_offsets[-1]
+            )
         positions = request.multimodal_positions
         lengths = request.multimodal_lengths
         if positions is not None and lengths is not None:
@@ -723,13 +711,15 @@ class MultimodalScheduler(RequestScheduler):
         cumsum = mm_data.get("multimodal_embed_mask_cumsum") if isinstance(mm_data, dict) else None
         if cumsum is not None:
             consumed_rows = int(cumsum[begin - 1]) if begin > 0 else 0
-            return {
-                item_idx
-                for item_idx, (item_begin, item_end) in enumerate(
-                    self._get_item_embedding_ranges(request)
-                )
-                if item_begin < consumed_rows < item_end
-            }
+            item_idx = max(0, bisect.bisect_right(state.embedding_row_offsets, consumed_rows) - 1)
+            if (
+                item_idx < state.num_items
+                and state.embedding_row_offsets[item_idx]
+                < consumed_rows
+                < state.embedding_row_offsets[item_idx + 1]
+            ):
+                return {item_idx}
+            return set()
         if request.multimodal_positions is not None and request.multimodal_lengths is not None:
             return {
                 item_idx

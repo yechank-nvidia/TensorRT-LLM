@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Python extensions for executor requests."""
 
+import bisect
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from typing import (TYPE_CHECKING, Any, Dict, Hashable, Iterable, List,
@@ -126,6 +127,9 @@ class MultimodalEncoderRequestState:
     cannot be built, so this request uses request-local cache keys instead.
     """
 
+    embedding_row_offsets: List[int] = field(init=False)
+    """Cumulative encoder-output row offsets, including the final end."""
+
     @classmethod
     def from_embedding_lengths(
         cls,
@@ -146,6 +150,10 @@ class MultimodalEncoderRequestState:
                 == len(self.item_cache_keys)):
             raise ValueError("MM encoder token and embedding lengths must have "
                              "exactly one cache key per item slot")
+        self.embedding_row_offsets = [0]
+        for length in self.embedding_lengths:
+            self.embedding_row_offsets.append(self.embedding_row_offsets[-1] +
+                                              length)
 
     @property
     def num_items(self) -> int:
@@ -164,6 +172,23 @@ class MultimodalEncoderRequestState:
             raise RuntimeError(f"MM item {item_idx} has no cache key")
         self.item_cache_keys[item_idx] = None
         return cache_key
+
+    def items_overlapping_embedding_rows(self, row_start: int,
+                                         row_end: int) -> List[int]:
+        """Return item indices whose encoder-output rows overlap a range."""
+        if row_start >= row_end or not self.embedding_lengths:
+            return []
+        first = max(
+            0,
+            bisect.bisect_right(self.embedding_row_offsets, row_start) - 1)
+        stop = min(self.num_items,
+                   bisect.bisect_left(self.embedding_row_offsets, row_end))
+        return [
+            item_idx for item_idx in range(first, stop) if
+            self.embedding_row_offsets[item_idx] < self.embedding_row_offsets[
+                item_idx + 1] and self.embedding_row_offsets[item_idx] < row_end
+            and self.embedding_row_offsets[item_idx + 1] > row_start
+        ]
 
 
 if TYPE_CHECKING:
@@ -1298,14 +1323,7 @@ def get_mm_items_for_chunk(request: LlmRequest, chunk_start: int,
         row_count = runtime.num_mm_tokens_in_chunk
         assert row_begin is not None and row_count is not None
         row_end = row_begin + row_count
-        item_indices = []
-        item_begin = 0
-        for item_idx, length in enumerate(state.embedding_lengths):
-            item_end = item_begin + length
-            if item_begin < row_end and item_end > row_begin:
-                item_indices.append(item_idx)
-            item_begin = item_end
-        return item_indices
+        return state.items_overlapping_embedding_rows(row_begin, row_end)
 
     positions = request.multimodal_positions
     lengths = request.multimodal_lengths

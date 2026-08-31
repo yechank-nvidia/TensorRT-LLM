@@ -3796,20 +3796,11 @@ class PyTorchModelEngine(ModelEngine):
                 begin = max(begin, request.estimated_reusable_tokens)
             end = min(request.prompt_len, begin + request.context_chunk_size)
             row_begin = row_end = None
-        item_begin = 0
-        row_bounds = []
-        for length in state.embedding_lengths:
-            item_end = item_begin + length
-            row_bounds.append((item_begin, item_end))
-            item_begin = item_end
         if row_begin is None or row_end is None:
             item_indices = get_mm_items_for_chunk(request, begin, end)
         else:
-            item_indices = [
-                item_idx
-                for item_idx, (item_begin, item_end) in enumerate(row_bounds)
-                if item_begin < row_end and item_end > row_begin
-            ]
+            item_indices = state.items_overlapping_embedding_rows(
+                row_begin, row_end)
 
         segments: list[torch.Tensor] = []
         for item_idx in item_indices:
@@ -3828,7 +3819,8 @@ class PyTorchModelEngine(ModelEngine):
                     f"MM item {item_idx} cached output has {segment.shape[0]} embeddings; "
                     f"expected {expected_rows}")
             if row_begin is not None and row_end is not None:
-                item_begin, item_end = row_bounds[item_idx]
+                item_begin = state.embedding_row_offsets[item_idx]
+                item_end = state.embedding_row_offsets[item_idx + 1]
                 slice_begin = max(row_begin, item_begin) - item_begin
                 slice_end = min(row_end, item_end) - item_begin
                 segment = segment[slice_begin:slice_end]

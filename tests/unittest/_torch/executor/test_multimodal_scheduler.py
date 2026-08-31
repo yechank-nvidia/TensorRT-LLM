@@ -1321,6 +1321,16 @@ def test_mm_encoder_state_copies_validated_scheduler_costs_at_admission():
     assert output.scheduled_mm_encoder_items == {1: [0, 1]}
 
 
+def test_mm_encoder_state_finds_items_by_embedding_rows():
+    state = MultimodalEncoderRequestState.from_embedding_lengths([2, 0, 3])
+
+    assert state.embedding_row_offsets == [0, 2, 2, 5]
+    assert state.items_overlapping_embedding_rows(0, 2) == [0]
+    assert state.items_overlapping_embedding_rows(1, 3) == [0, 2]
+    assert state.items_overlapping_embedding_rows(2, 5) == [2]
+    assert state.items_overlapping_embedding_rows(5, 5) == []
+
+
 def test_mm_encoder_state_rejects_replacing_an_item_cache_key():
     state = MultimodalEncoderRequestState.from_embedding_lengths([2])
     state.set_item_cache_key(0, ("cache", 0))
