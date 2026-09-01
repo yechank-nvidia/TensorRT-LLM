@@ -54,8 +54,9 @@ def test_qwen2_5_vision_processor_artifact_reuse(modality, processor_name, outpu
     item = array if modality == "image" else SimpleNamespace(frames=[array])
     mm_data = {modality: [item]}
 
-    first = processor._preprocess("first", mm_data, {}, "same-media")
-    second = processor._preprocess("second", mm_data, {}, "same-media")
+    artifact_keys = {modality: "same-media"}
+    first = processor._preprocess("first", mm_data, {}, artifact_keys)
+    second = processor._preprocess("second", mm_data, {}, artifact_keys)
 
     assert vision_processor.call_count == 1
     torch.testing.assert_close(first[output_name], second[output_name])
@@ -65,24 +66,30 @@ def test_qwen2_5_vision_processor_artifact_reuse(modality, processor_name, outpu
     )
 
 
-@pytest.mark.parametrize("modality", ["image", "video"])
-def test_qwen_vision_hashes_select_one_modality_artifact(modality) -> None:
+@pytest.mark.parametrize("modalities", [("image",), ("video",), ("image", "video")])
+def test_qwen_vision_hashes_select_artifacts(modalities) -> None:
     processor = object.__new__(Qwen2_5VLInputProcessorBase)
     processor.call_with_text_prompt = MagicMock(return_value=([], None))
     inputs = {
         "prompt": "prompt",
-        "multi_modal_data": {modality: [object()]},
+        "multi_modal_data": {modality: [object()] for modality in modalities},
     }
 
     processor._process_with_hashes(
         inputs,
         MagicMock(),
-        {modality: ["media-hash"]},
+        {modality: [f"{modality}-hash"] for modality in modalities},
         "kwargs-hash",
     )
 
-    artifact_key = processor.call_with_text_prompt.call_args.kwargs["processor_artifact_key"]
-    assert artifact_key[1:] == (modality, "kwargs-hash", ("media-hash",))
+    artifact_keys = processor.call_with_text_prompt.call_args.kwargs["processor_artifact_keys"]
+    assert set(artifact_keys) == set(modalities)
+    for modality in modalities:
+        assert artifact_keys[modality][1:] == (
+            modality,
+            "kwargs-hash",
+            (f"{modality}-hash",),
+        )
 
 
 def test_qwen2_5_vision_patch_projection_matches_conv3d(monkeypatch) -> None:

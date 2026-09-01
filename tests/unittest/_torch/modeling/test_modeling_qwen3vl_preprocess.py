@@ -222,7 +222,7 @@ class TestImageProcessorSingleFlight:
                 "prompt",
                 {"image": [[1]]},
                 {},
-                ("same-key",),
+                {"image": ("same-key",)},
             )
 
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -249,7 +249,7 @@ class TestImageProcessorSingleFlight:
                 "prompt",
                 {"image": [[1]]},
                 {},
-                ("same-key",),
+                {"image": ("same-key",)},
             )
 
         assert image_processor.calls == 2
@@ -266,7 +266,7 @@ class TestImageProcessorSingleFlight:
                 "prompt",
                 {"image": [[1]]},
                 {},
-                ("same-key",),
+                {"image": ("same-key",)},
             )
             for _ in range(2)
         ]
@@ -286,7 +286,7 @@ class TestImageProcessorSingleFlight:
         processor.set_processor_artifact_cache_max_bytes(48)
 
         for key in (("first",), ("second",), ("first",)):
-            processor._preprocess("prompt", {"image": [[1]]}, {}, key)
+            processor._preprocess("prompt", {"image": [[1]]}, {}, {"image": key})
 
         assert image_processor.calls == 3
         assert list(processor._processor_artifacts_ready) == [("first",)]
@@ -302,7 +302,7 @@ class TestImageProcessorSingleFlight:
                 "prompt",
                 {"image": [[1]]},
                 {},
-                ("same-key",),
+                {"image": ("same-key",)},
             )
 
         assert processor._processor_artifacts_in_flight == {}
@@ -310,7 +310,7 @@ class TestImageProcessorSingleFlight:
             "prompt",
             {"image": [[1]]},
             {},
-            ("same-key",),
+            {"image": ("same-key",)},
         )
         assert output["pixel_values"].shape == (2, 3)
         assert image_processor.calls == 2

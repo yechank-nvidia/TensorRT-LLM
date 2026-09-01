@@ -363,7 +363,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         text: Dict[str, Any],
         mm_data: Dict[str, Any],
         mm_processor_kwargs: Dict[str, Any],
-        processor_artifact_key: Optional[Hashable] = None,
+        processor_artifact_keys: Optional[TypingMapping[str, Hashable]] = None,
     ):
         images = mm_data.get("image")
         video_datas = mm_data.get("video")
@@ -427,19 +427,21 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                 video_metadata.append(m)
 
         processor = self.processor
-        if processor_artifact_key is not None:
+        if processor_artifact_keys:
             processor = copy.copy(processor)
-            if images is not None:
+            image_artifact_key = processor_artifact_keys.get("image")
+            if image_artifact_key is not None:
                 processor.image_processor = _QwenVLVisionProcessorSingleFlight(
                     self,
                     processor.image_processor,
-                    processor_artifact_key,
+                    image_artifact_key,
                 )
-            else:
+            video_artifact_key = processor_artifact_keys.get("video")
+            if video_artifact_key is not None:
                 processor.video_processor = _QwenVLVisionProcessorSingleFlight(
                     self,
                     processor.video_processor,
-                    processor_artifact_key,
+                    video_artifact_key,
                 )
 
         return processor(

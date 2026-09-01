@@ -352,24 +352,27 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         if inputs.get("prompt") is None or mm_processor_kwargs_hash is None:
             return self(inputs, sampling_params)
 
-        modality = next(iter(mm_data)) if len(mm_data) == 1 else None
-        items = mm_data.get(modality) if modality in ("image",
-                                                      "video") else None
-        item_hashes = mm_hashes.get(modality) if modality is not None else None
-        if (not isinstance(items, list) or not item_hashes
-                or len(items) != len(item_hashes)):
+        modalities = set(mm_data)
+        if not modalities or not modalities.issubset({"image", "video"}):
             return self(inputs, sampling_params)
 
-        artifact_key = (
-            "qwen-vl-vision-processor-v2",
-            modality,
-            mm_processor_kwargs_hash,
-            tuple(item_hashes),
-        )
+        artifact_keys = {}
+        for modality in modalities:
+            items = mm_data[modality]
+            item_hashes = mm_hashes.get(modality)
+            if (not isinstance(items, list) or not item_hashes
+                    or len(items) != len(item_hashes)):
+                return self(inputs, sampling_params)
+            artifact_keys[modality] = (
+                "qwen-vl-vision-processor-v2",
+                modality,
+                mm_processor_kwargs_hash,
+                tuple(item_hashes),
+            )
         return self.call_with_text_prompt(
             inputs,
             sampling_params,
-            processor_artifact_key=artifact_key,
+            processor_artifact_keys=artifact_keys,
         )
 
     def _get_vision_processor_artifact(
@@ -1313,7 +1316,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         text: Dict[str, any],
         mm_data: Dict[str, any],
         mm_processor_kwargs: Dict[str, Any],
-        processor_artifact_key: Optional[Hashable] = None,
+        processor_artifact_keys: Optional[Mapping[str, Hashable]] = None,
     ):
         images = mm_data.get("image")
         video_datas = mm_data.get("video")
@@ -1336,19 +1339,21 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         # (called from ``__init__``) installs a process-wide filter that drops
         # those keys before the validator sees them.
         processor = self.processor
-        if processor_artifact_key is not None:
+        if processor_artifact_keys:
             processor = copy.copy(processor)
-            if images is not None:
+            image_artifact_key = processor_artifact_keys.get("image")
+            if image_artifact_key is not None:
                 processor.image_processor = _QwenVLVisionProcessorSingleFlight(
                     self,
                     processor.image_processor,
-                    processor_artifact_key,
+                    image_artifact_key,
                 )
-            else:
+            video_artifact_key = processor_artifact_keys.get("video")
+            if video_artifact_key is not None:
                 processor.video_processor = _QwenVLVisionProcessorSingleFlight(
                     self,
                     processor.video_processor,
-                    processor_artifact_key,
+                    video_artifact_key,
                 )
         return processor(text=[text],
                          images=images,
@@ -1485,7 +1490,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         inputs: TextPrompt,
         sampling_params: SamplingParams,
         *,
-        processor_artifact_key: Optional[Hashable] = None,
+        processor_artifact_keys: Optional[Mapping[str, Hashable]] = None,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data, mm_processor_kwargs = inputs.get("prompt"), \
                         inputs.get("multi_modal_data", {}), inputs.get("mm_processor_kwargs", {})
@@ -1509,7 +1514,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             text_prompt,
             mm_data,
             mm_processor_kwargs,
-            processor_artifact_key,
+            processor_artifact_keys,
         )
 
         multimodal_data = {}
