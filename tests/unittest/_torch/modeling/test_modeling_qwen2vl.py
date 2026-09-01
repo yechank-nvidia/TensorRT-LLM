@@ -50,6 +50,7 @@ def test_qwen2_5_vision_processor_artifact_reuse(modality, processor_name, outpu
     processor._processor_artifacts_ready = OrderedDict()
     processor._processor_artifacts_ready_bytes = 0
     processor._processor_artifact_cache_max_bytes = 1 << 20
+    processor._dtype = torch.bfloat16
     array = np.zeros((4, 4, 3), dtype=np.uint8)
     item = array if modality == "image" else SimpleNamespace(frames=[array])
     mm_data = {modality: [item]}
@@ -60,6 +61,7 @@ def test_qwen2_5_vision_processor_artifact_reuse(modality, processor_name, outpu
 
     assert vision_processor.call_count == 1
     torch.testing.assert_close(first[output_name], second[output_name])
+    assert first[output_name].dtype == torch.bfloat16
     assert (
         first[output_name].untyped_storage().data_ptr()
         != second[output_name].untyped_storage().data_ptr()

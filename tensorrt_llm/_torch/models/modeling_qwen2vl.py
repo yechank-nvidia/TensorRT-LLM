@@ -320,6 +320,18 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             for key, value in artifact.items()
         }
 
+    def _copy_vision_processor_artifact_for_cache(self,
+                                                  artifact) -> Dict[str, Any]:
+        """Own cached tensors and store model-visible pixels in final dtype."""
+        pixel_keys = {"pixel_values", "pixel_values_videos"}
+        return {
+            key:
+            value.to(dtype=self.dtype, copy=True)
+            if isinstance(value, torch.Tensor) and key in pixel_keys else
+            value.clone() if isinstance(value, torch.Tensor) else value
+            for key, value in artifact.items()
+        }
+
     def _cache_vision_processor_artifact(self, artifact_key: Hashable,
                                          artifact) -> None:
         artifact_bytes = self._vision_processor_artifact_bytes(artifact)
@@ -398,10 +410,11 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
         try:
             artifact = vision_processor(*args, **kwargs)
-            cached_artifact = self._clone_vision_processor_artifact(artifact)
+            cached_artifact = self._copy_vision_processor_artifact_for_cache(
+                artifact)
             self._cache_vision_processor_artifact(artifact_key, cached_artifact)
             future.set_result(cached_artifact)
-            return artifact
+            return self._clone_vision_processor_artifact(cached_artifact)
         except Exception as error:
             future.set_exception(error)
             raise

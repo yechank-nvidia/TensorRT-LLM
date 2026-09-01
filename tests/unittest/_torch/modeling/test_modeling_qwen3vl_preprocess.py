@@ -99,6 +99,7 @@ def _processor_with_single_flight(image_processor):
     processor._processor_artifacts_ready = OrderedDict()
     processor._processor_artifacts_ready_bytes = 0
     processor._processor_artifact_cache_max_bytes = 0
+    processor._dtype = torch.bfloat16
     return processor
 
 
@@ -277,7 +278,7 @@ class TestImageProcessorSingleFlight:
         assert torch.equal(outputs[0]["pixel_values"], outputs[1]["pixel_values"])
         assert outputs[0]["pixel_values"].data_ptr() != cached["pixel_values"].data_ptr()
         assert outputs[1]["pixel_values"].data_ptr() != cached["pixel_values"].data_ptr()
-        assert processor._processor_artifacts_ready_bytes == 48
+        assert processor._processor_artifacts_ready_bytes == 36
 
     def test_cache_evicts_lru_artifact_to_stay_within_byte_limit(self):
         image_processor = _ControlledImageProcessor()
@@ -290,7 +291,7 @@ class TestImageProcessorSingleFlight:
 
         assert image_processor.calls == 3
         assert list(processor._processor_artifacts_ready) == [("first",)]
-        assert processor._processor_artifacts_ready_bytes == 48
+        assert processor._processor_artifacts_ready_bytes == 36
 
     def test_failed_producer_is_removed_and_can_retry(self):
         image_processor = _ControlledImageProcessor(fail_first=True)
