@@ -169,12 +169,11 @@ def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
 
 
 def strip_mm_encoder_inputs(mm_data: Dict[str, Any]) -> None:
-    """Drop raw encoder payloads while preserving cached MM embeddings.
+    """Drop raw encoder payloads while preserving embeddings and metadata.
 
-    Item-level encoder scheduling keeps the original request payload on CPU
-    and transfers only selected items to GPU. Once every item is encoded, the
-    raw modality dictionaries are no longer needed and must not be moved to
-    GPU by the subsequent LLM input-preparation path.
+    Callers may apply this to a temporary current-window view before LLM input
+    preparation, or to the request data after its encoder inputs are no longer
+    needed. Only the top-level modality dictionaries are removed.
     """
     for modality in ("image", "video", "audio"):
         mm_data.pop(modality, None)

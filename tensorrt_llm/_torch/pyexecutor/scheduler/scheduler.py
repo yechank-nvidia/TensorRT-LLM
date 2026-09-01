@@ -1169,6 +1169,9 @@ class MultimodalScheduler(RequestScheduler):
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
+        if not any(request.py_mm_encoder_state is not None for request in active_requests):
+            return self.scheduler.schedule_request(active_requests, inflight_request_ids)
+
         if self.scheduling_policy is MultimodalEncoderSchedulingPolicy.DEFAULT and isinstance(
             self.scheduler, SimpleScheduler
         ):
