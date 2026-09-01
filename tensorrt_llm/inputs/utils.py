@@ -5,6 +5,7 @@ import asyncio
 import base64
 import tempfile
 from collections import defaultdict
+from dataclasses import fields, is_dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
@@ -48,7 +49,7 @@ class MultimodalDataTooLargeError(ValueError):
 
 def _cpu_storage_bytes(
         value: Any,
-        seen_storages: Optional[set[tuple[str, int, int]]] = None) -> int:
+        seen_storages: Optional[set[tuple[Any, ...]]] = None) -> int:
     """Count unique CPU tensor, array, and image storage reachable from value."""
     if seen_storages is None:
         seen_storages = set()
@@ -87,10 +88,29 @@ def _cpu_storage_bytes(
     if isinstance(value, BaseModalityData):
         return _cpu_storage_bytes(vars(value), seen_storages)
     if isinstance(value, dict):
+        if ("method_key" in value and "storage_size" in value
+                and "storage_dtype" in value):
+            dtype = getattr(
+                torch,
+                str(value["storage_dtype"]).removeprefix("torch."),
+                None,
+            )
+            if isinstance(dtype, torch.dtype):
+                size_bytes = (int(value["storage_size"]) * torch.empty(
+                    (), dtype=dtype).element_size())
+                key = ("shared_cpu", value.get("storage_handle"), size_bytes)
+                if key in seen_storages:
+                    return 0
+                seen_storages.add(key)
+                return size_bytes
         return sum(
             _cpu_storage_bytes(item, seen_storages) for item in value.values())
     if isinstance(value, (list, tuple)):
         return sum(_cpu_storage_bytes(item, seen_storages) for item in value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return sum(
+            _cpu_storage_bytes(getattr(value, field.name), seen_storages)
+            for field in fields(value))
     return 0
 
 
@@ -422,6 +442,7 @@ class MultimodalDataTracker:
         model_type: str,
         multimodal_server_config: Optional[MultimodalServerConfig] = None,
         request_media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+        initial_cpu_bytes: int = 0,
     ):
         self._model_type = model_type
         self._data = defaultdict[str, list](list)
@@ -441,6 +462,9 @@ class MultimodalDataTracker:
         # Per-request override merged with the server default at media-load
         # time; see `BaseMediaIO.merge_kwargs` in `inputs/media_io.py`.
         self._request_media_io_kwargs = request_media_io_kwargs
+        if initial_cpu_bytes < 0:
+            raise ValueError("initial_cpu_bytes must be non-negative")
+        self._initial_cpu_bytes = initial_cpu_bytes
 
     @property
     def request_media_io_kwargs(self) -> Optional[Dict[str, Dict[str, Any]]]:
@@ -503,8 +527,8 @@ class MultimodalDataTracker:
             for index, (_, _, item) in enumerate(pairs)
         ]
         results: list[Any] = [None] * len(tasks)
-        seen_storages: set[tuple[str, int, int]] = set()
-        resident_bytes = 0
+        seen_storages: set[tuple[Any, ...]] = set()
+        resident_bytes = self._initial_cpu_bytes
         try:
             for completed in asyncio.as_completed(tasks):
                 index, result = await completed

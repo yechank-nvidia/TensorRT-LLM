@@ -448,6 +448,7 @@ def parse_chat_messages_coroutines(
     multimodal_server_config: Optional[MultimodalServerConfig] = None,
     request_media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
     model_type_override: Optional[str] = None,
+    initial_cpu_bytes: int = 0,
 ) -> Tuple[List[ConversationMessage], Coroutine[Any, Any, tuple[Optional[Dict[
         str, List[Any]]], Optional[Dict[str, List[Any]]]]], list[dict[str,
                                                                       int]]]:
@@ -478,7 +479,8 @@ def parse_chat_messages_coroutines(
     mm_data_tracker = MultimodalDataTracker(
         model_type,
         multimodal_server_config,
-        request_media_io_kwargs=request_media_io_kwargs)
+        request_media_io_kwargs=request_media_io_kwargs,
+        initial_cpu_bytes=initial_cpu_bytes)
 
     # Determine content format to decide placeholder strategy.
     #

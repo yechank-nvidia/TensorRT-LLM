@@ -30,6 +30,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import (
     MultimodalDataTooLargeError,
     MultimodalDataTracker,
+    _cpu_storage_bytes,
     async_load_audio,
     async_load_image,
 )
@@ -265,6 +266,18 @@ class TestRetrieveAllAsync:
         assert len(data["image"]) == 2
 
     @pytest.mark.asyncio
+    async def test_raw_body_bytes_reduce_decoded_capacity(self):
+        tracker = MultimodalDataTracker(
+            model_type="test_model",
+            multimodal_server_config=MultimodalServerConfig(max_cpu_bytes_per_request=16),
+            initial_cpu_bytes=8,
+        )
+        self._inject(tracker, "image", [np.zeros((9,), dtype=np.uint8)])
+
+        with pytest.raises(MultimodalDataTooLargeError, match="17 CPU bytes"):
+            await tracker.retrieve_all_async()
+
+    @pytest.mark.asyncio
     async def test_limit_cancels_remaining_items(self):
         cancelled = asyncio.Event()
 
@@ -296,3 +309,14 @@ def test_multimodal_server_cpu_limits_are_consistent():
             max_cpu_bytes=1024,
             max_cpu_bytes_per_request=2048,
         )
+
+
+def test_cpu_storage_bytes_counts_shared_tensor_metadata_once():
+    handle = {
+        "method_key": 2,
+        "storage_handle": "same-storage",
+        "storage_size": 12,
+        "storage_dtype": "torch.float32",
+    }
+
+    assert _cpu_storage_bytes([handle, dict(handle)]) == 48
