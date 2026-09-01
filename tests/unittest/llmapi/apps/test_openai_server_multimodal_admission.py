@@ -2,13 +2,65 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
+import torch
 from fastapi import FastAPI
 
-from tensorrt_llm.serve.openai_server import OpenAIServer, _MultimodalRequestBodyLimitMiddleware
+import tensorrt_llm.serve.openai_server as openai_server_module
+from tensorrt_llm.serve.openai_server import (
+    OpenAIServer,
+    _multimodal_processor_torch_initializer,
+    _MultimodalRequestBodyLimitMiddleware,
+)
 
 pytestmark = pytest.mark.cpu_only
+
+
+class _FakeMultimodalInputProcessor:
+    pass
+
+
+def test_limits_multimodal_processor_torch_threads(monkeypatch):
+    monkeypatch.setattr(
+        openai_server_module, "BaseMultimodalInputProcessor", _FakeMultimodalInputProcessor
+    )
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 72)
+    observed = []
+    monkeypatch.setattr(torch, "set_num_threads", observed.append)
+
+    initializer = _multimodal_processor_torch_initializer(
+        SimpleNamespace(args=SimpleNamespace(gather_generation_logits=False)),
+        _FakeMultimodalInputProcessor(),
+    )
+    assert initializer is not None
+    initializer()
+
+    assert observed == [16]
+
+
+@pytest.mark.parametrize(
+    "single_process,gather_generation_logits",
+    [(True, False), (False, True)],
+)
+def test_does_not_limit_threads_shared_with_gpu_worker(
+    monkeypatch, single_process, gather_generation_logits
+):
+    monkeypatch.setattr(
+        openai_server_module, "BaseMultimodalInputProcessor", _FakeMultimodalInputProcessor
+    )
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1" if single_process else "0")
+    observed = []
+    monkeypatch.setattr(torch, "set_num_threads", observed.append)
+
+    initializer = _multimodal_processor_torch_initializer(
+        SimpleNamespace(args=SimpleNamespace(gather_generation_logits=gather_generation_logits)),
+        _FakeMultimodalInputProcessor(),
+    )
+
+    assert initializer is None
+    assert observed == []
 
 
 async def _run_body_limit(

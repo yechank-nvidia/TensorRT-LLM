@@ -122,6 +122,33 @@ if TYPE_CHECKING:
     from tensorrt_llm.visual_gen import VisualGen
 
 
+_MAX_MULTIMODAL_PROCESSOR_TORCH_THREADS = 16
+
+
+def _multimodal_processor_torch_initializer(generator, input_processor):
+    """Build a frontend-worker initializer that caps PyTorch CPU work."""
+    if not isinstance(input_processor, BaseMultimodalInputProcessor):
+        return None
+
+    args = getattr(generator, "args", None)
+    worker_shares_frontend = (
+        os.environ.get("TLLM_WORKER_USE_SINGLE_PROCESS", "0") == "1"
+        or bool(args and getattr(args, "gather_generation_logits", False)))
+    if worker_shares_frontend:
+        return None
+
+    import torch
+
+    current_threads = torch.get_num_threads()
+    if current_threads <= _MAX_MULTIMODAL_PROCESSOR_TORCH_THREADS:
+        return None
+    logger.info(
+        "Limiting multimodal input processor PyTorch threads from %d to %d",
+        current_threads, _MAX_MULTIMODAL_PROCESSOR_TORCH_THREADS)
+    return functools.partial(torch.set_num_threads,
+                             _MAX_MULTIMODAL_PROCESSOR_TORCH_THREADS)
+
+
 def _is_visual_gen_instance(obj) -> bool:
     """isinstance(obj, VisualGen) without importing the visual_gen tree.
 
@@ -753,6 +780,8 @@ class OpenAIServer(_VideoRoutesMixin):
         # let the server's --media_io_kwargs win (per-request kwargs still
         # override at request time).
         ip = getattr(self.generator, "input_processor", None)
+        input_proc_initializer = _multimodal_processor_torch_initializer(
+            self.generator, ip)
         if isinstance(ip, BaseMultimodalInputProcessor):
             model_pref = ip.get_preferred_media_io_kwargs() or {}
             if model_pref:
@@ -794,6 +823,7 @@ class OpenAIServer(_VideoRoutesMixin):
         self._input_proc_executor = ThreadPoolExecutor(
             max_workers=input_processor_workers,
             thread_name_prefix="trtllm_inputproc",
+            initializer=input_proc_initializer,
         )
         self._media_load_executor = ThreadPoolExecutor(
             max_workers=media_load_workers,
