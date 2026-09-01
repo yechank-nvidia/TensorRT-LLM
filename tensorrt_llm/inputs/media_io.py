@@ -262,11 +262,6 @@ def _decode_jpeg_image(source: Union[bytes, str, Path]) -> Optional[torch.Tensor
     if header != b"\xff\xd8\xff":
         return None
 
-    pil_source = BytesIO(source) if isinstance(source, bytes) else source
-    with Image.open(pil_source) as image:
-        if image.format != "JPEG" or image.mode not in ("RGB", "L"):
-            return None
-
     from torchvision.io import ImageReadMode, decode_image
 
     if isinstance(source, bytes):

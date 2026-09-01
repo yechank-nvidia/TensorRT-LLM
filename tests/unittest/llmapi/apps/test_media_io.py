@@ -28,7 +28,7 @@ class CustomError(Exception):
 
 @pytest.mark.parametrize(
     ("mode", "image_format"),
-    [("RGB", "JPEG"), ("L", "JPEG"), ("RGBA", "PNG")],
+    [("RGB", "JPEG"), ("L", "JPEG"), ("CMYK", "JPEG"), ("RGBA", "PNG")],
 )
 def test_image_loading_preserves_rgb_pixels(mode, image_format, tmp_path):
     shape = (7, 8) if mode == "L" else (7, 8, len(mode))
