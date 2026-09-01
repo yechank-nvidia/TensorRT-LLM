@@ -200,6 +200,8 @@ def _make_keyed_image_param(
             },
             "multimodal_embedding_lengths": embedding_lengths,
             "mm_processor_kwargs_hash": "kwargs-a",
+            "mm_processor_version": "processor-v1",
+            "mm_encoder_version": 0,
         },
         multimodal_runtime=MultimodalRuntimeData(
             embed_mask_cumsum=torch.arange(1, sum(embedding_lengths) + 1, dtype=torch.int64),
@@ -222,6 +224,8 @@ def _make_keyed_video_param(item_hashes: list[list[int]]) -> MultimodalParams:
             "video": {"pixel_values": torch.arange(item_count).reshape(item_count, 1, 1)},
             "multimodal_embedding_lengths": embedding_lengths,
             "mm_processor_kwargs_hash": "kwargs-a",
+            "mm_processor_version": "processor-v1",
+            "mm_encoder_version": 0,
         },
         multimodal_runtime=MultimodalRuntimeData(
             embed_mask_cumsum=torch.arange(1, sum(embedding_lengths) + 1, dtype=torch.int64),
@@ -247,6 +251,8 @@ def _make_keyed_audio_param(item_hashes: list[list[int]]) -> MultimodalParams:
             },
             "multimodal_embedding_lengths": embedding_lengths,
             "mm_processor_kwargs_hash": "kwargs-a",
+            "mm_processor_version": "processor-v1",
+            "mm_encoder_version": 0,
         },
         multimodal_runtime=MultimodalRuntimeData(
             embed_mask_cumsum=torch.arange(1, sum(embedding_lengths) + 1, dtype=torch.int64),

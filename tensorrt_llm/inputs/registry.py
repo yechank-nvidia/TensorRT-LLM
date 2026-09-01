@@ -264,6 +264,28 @@ class BaseMultimodalInputProcessor(ABC):
         self._trust_remote_code = trust_remote_code
         self._multimodal_hashing_supported: Optional[bool] = None
 
+        # Encoder outputs depend on the processor implementation and its
+        # startup configuration, not only on per-request processor kwargs.
+        # Keep this fingerprint internal and stable for the lifetime of the
+        # processor; process-local caches do not survive a service restart.
+        version_identity = {
+            "format": "mm-processor-v1",
+            "processor": f"{type(self).__module__}.{type(self).__qualname__}",
+            "model_path": str(model_path),
+            "config_commit": str(getattr(config, "_commit_hash", "") or ""),
+            "use_fast": self._use_fast,
+            "trust_remote_code": trust_remote_code,
+            "video_pruning_rate": repr(kwargs.get("video_pruning_rate")),
+        }
+        version_hasher = default_hasher()
+        version_hasher.update(serialize_item(version_identity))
+        self._processor_version = version_hasher.hexdigest()
+
+    @property
+    def processor_version(self) -> str:
+        """Return the immutable cache namespace for this processor instance."""
+        return self._processor_version
+
     def attach_multimodal_embeddings(
         self,
         inputs: TextPrompt,
@@ -1346,6 +1368,8 @@ def create_input_processor_with_hash(
             multimodal_data[
                 "mm_processor_kwargs_hash"] = _hash_mm_processor_kwargs(
                     inputs.get("mm_processor_kwargs") or {}, hash_lib)
+            multimodal_data[
+                "mm_processor_version"] = input_processor.processor_version
 
         # TODO: here we assume there is only one modality for now
         num_mm_tokens_by_key = find_mm_token_lengths(

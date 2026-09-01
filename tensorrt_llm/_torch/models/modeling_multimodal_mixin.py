@@ -313,6 +313,7 @@ if TYPE_CHECKING:
 _MM_DATA_INPUT_MODALITY_KEYS = frozenset({"audio", "image", "video"})
 _MM_AUX_STREAM: Optional[tuple[int, torch.cuda.Stream]] = None
 _MM_ENCODER_CACHE_LOG_NAME = "mm_encoder_cache"
+_MM_ENCODER_CACHE_KEY_FORMAT = "mm-encoder-v2"
 
 
 def _encoder_data_parallel_size(model_config: ModelConfig) -> int:
@@ -534,6 +535,7 @@ class MultimodalModelMixin:
 
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
+    _multimodal_encoder_version: int = 0
 
     @classmethod
     def _cast_multimodal_encoder_dtype(
@@ -1608,17 +1610,29 @@ class MultimodalModelMixin:
                 item_metadata.item_refs,
                 item_metadata.output_embedding_lengths,
                 mm_data.get("mm_processor_kwargs_hash"),
+                processor_version=mm_data.get("mm_processor_version"),
+                encoder_version=mm_data.get("mm_encoder_version"),
             )
 
         modality = cls._encoder_cache_modality(param)
         embedding_lengths = mm_data.get("multimodal_embedding_lengths")
         kwargs_hash = mm_data.get("mm_processor_kwargs_hash")
-        if modality is None or not isinstance(embedding_lengths, list) or kwargs_hash is None:
+        processor_version = mm_data.get("mm_processor_version")
+        encoder_version = mm_data.get("mm_encoder_version")
+        if (
+            modality is None
+            or not isinstance(embedding_lengths, list)
+            or kwargs_hash is None
+            or processor_version is None
+            or encoder_version is None
+        ):
             logger.debug(
                 f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping unkeyable params, "
                 f"has_modality={modality is not None}, "
                 f"has_embedding_lengths={isinstance(embedding_lengths, list)}, "
-                f"has_processor_kwargs_hash={kwargs_hash is not None}"
+                f"has_processor_kwargs_hash={kwargs_hash is not None}, "
+                f"has_processor_version={processor_version is not None}, "
+                f"has_encoder_version={encoder_version is not None}"
             )
             return None
         if len(mm_input.multimodal_hashes) != len(embedding_lengths):
@@ -1633,7 +1647,14 @@ class MultimodalModelMixin:
         # different request layout; the current request order is restored when cached item tensors
         # are concatenated below.
         return [
-            cls._encoder_cache_item_key(modality, item_hash, embedding_length, kwargs_hash)
+            cls._encoder_cache_item_key(
+                modality,
+                item_hash,
+                embedding_length,
+                kwargs_hash,
+                processor_version=processor_version,
+                encoder_version=encoder_version,
+            )
             for item_hash, embedding_length in zip(
                 mm_input.multimodal_hashes,
                 embedding_lengths,
@@ -1647,10 +1668,21 @@ class MultimodalModelMixin:
         item_hash: Sequence[int],
         embedding_length: int,
         kwargs_hash: str,
+        *,
+        processor_version: str,
+        encoder_version: int,
     ) -> Hashable:
         # Sole definition of the key format, so entries written by the
         # full-request path and the item-scheduling path hit from either.
-        return (modality, tuple(item_hash), int(embedding_length), kwargs_hash)
+        return (
+            _MM_ENCODER_CACHE_KEY_FORMAT,
+            encoder_version,
+            processor_version,
+            modality,
+            tuple(item_hash),
+            int(embedding_length),
+            kwargs_hash,
+        )
 
     @classmethod
     def build_encoder_cache_item_keys(
@@ -1659,6 +1691,9 @@ class MultimodalModelMixin:
         item_refs: Sequence[tuple[str, int]],
         embedding_lengths: Sequence[int],
         kwargs_hash: Optional[str],
+        *,
+        processor_version: Optional[str],
+        encoder_version: Optional[int],
     ) -> Optional[list[Hashable]]:
         """Build per-item cache keys from request-level item metadata.
 
@@ -1666,7 +1701,12 @@ class MultimodalModelMixin:
         keyable per item. Returns `None` when the request cannot participate in the cache (missing
         hashes or kwargs hash, or item counts that do not line up).
         """
-        if multimodal_hashes is None or kwargs_hash is None:
+        if (
+            multimodal_hashes is None
+            or kwargs_hash is None
+            or processor_version is None
+            or encoder_version is None
+        ):
             return None
         if not (len(multimodal_hashes) == len(item_refs) == len(embedding_lengths)):
             # Malformed metadata rather than a normal miss: the request loses
@@ -1680,7 +1720,14 @@ class MultimodalModelMixin:
             )
             return None
         return [
-            cls._encoder_cache_item_key(modality, item_hash, embedding_length, kwargs_hash)
+            cls._encoder_cache_item_key(
+                modality,
+                item_hash,
+                embedding_length,
+                kwargs_hash,
+                processor_version=processor_version,
+                encoder_version=encoder_version,
+            )
             for (modality, _), item_hash, embedding_length in zip(
                 item_refs,
                 multimodal_hashes,

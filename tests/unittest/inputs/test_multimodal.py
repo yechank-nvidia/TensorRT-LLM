@@ -2,6 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Tests for MultimodalRuntimeData cumsum math and the flat-mask producer."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -19,6 +20,7 @@ from tensorrt_llm.inputs.multimodal import (
 )
 from tensorrt_llm.inputs.multimodal_data import VideoData
 from tensorrt_llm.inputs.registry import (
+    BaseMultimodalInputProcessor,
     MultimodalEncoderItemMetadata,
     create_input_processor_with_hash,
     maybe_compute_mm_embed_cumsum,
@@ -206,6 +208,7 @@ def test_tokenized_multimodal_overwrites_stale_embedding_lengths():
 
 class _KwargsHashFakeProcessor:
     multimodal_hashing_supported = True
+    processor_version = "processor-v1"
 
     def __call__(self, inputs, sampling_params):
         return [10, 101, 102, 20], {"multimodal_data": {}}
@@ -221,6 +224,42 @@ class _KwargsHashFakeProcessor:
 
     def get_mm_special_token_ids(self):
         return None
+
+
+def test_processor_version_is_stable_for_startup_identity():
+    class FakeProcessor(BaseMultimodalInputProcessor):
+        @property
+        def processor(self):
+            return None
+
+        @property
+        def tokenizer(self):
+            return self._tokenizer
+
+        @property
+        def config(self):
+            return self._config
+
+        @property
+        def dtype(self):
+            return torch.float32
+
+        def call_with_text_prompt(self, inputs, sampling_params):
+            return [], None
+
+    def make_processor(commit: str) -> BaseMultimodalInputProcessor:
+        return FakeProcessor(
+            model_path="model",
+            config=SimpleNamespace(_commit_hash=commit),
+            tokenizer=None,
+        )
+
+    first = make_processor("revision-a")
+    same = make_processor("revision-a")
+    changed = make_processor("revision-b")
+
+    assert first.processor_version == same.processor_version
+    assert first.processor_version != changed.processor_version
 
 
 def test_mm_processor_kwargs_hash_is_stable_for_canonical_values():
@@ -254,6 +293,7 @@ def test_mm_processor_kwargs_hash_is_stable_for_canonical_values():
     )
 
     assert first["multimodal_data"]["mm_processor_kwargs_hash"] is not None
+    assert first["multimodal_data"]["mm_processor_version"] == "processor-v1"
     assert (
         first["multimodal_data"]["mm_processor_kwargs_hash"]
         == second["multimodal_data"]["mm_processor_kwargs_hash"]
@@ -276,6 +316,7 @@ def test_unserializable_mm_processor_kwargs_disable_persistent_cache_keying():
     )
 
     assert extra["multimodal_data"]["mm_processor_kwargs_hash"] is None
+    assert extra["multimodal_data"]["mm_processor_version"] == "processor-v1"
 
 
 def test_disabled_encoder_cache_skips_mm_processor_kwargs_hash():
@@ -293,6 +334,7 @@ def test_disabled_encoder_cache_skips_mm_processor_kwargs_hash():
 
     kwargs_hash.assert_not_called()
     assert "mm_processor_kwargs_hash" not in extra["multimodal_data"]
+    assert "mm_processor_version" not in extra["multimodal_data"]
 
 
 def test_multimodal_embedding_lengths_exclude_special_tokens():

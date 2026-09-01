@@ -193,6 +193,8 @@ def make_keyed_multimodal_param(
     item_hashes: list[list[int]] | None = None,
     embedding_lengths: list[int] | None = None,
     kwargs_hash: str | None = "kwargs-a",
+    processor_version: str | None = "processor-v1",
+    encoder_version: int | None = 0,
     local_embedding: torch.Tensor | None = None,
 ) -> MultimodalParams:
     if item_hashes is None:
@@ -213,6 +215,8 @@ def make_keyed_multimodal_param(
         },
         "multimodal_embedding_lengths": embedding_lengths,
         "mm_processor_kwargs_hash": kwargs_hash,
+        "mm_processor_version": processor_version,
+        "mm_encoder_version": encoder_version,
     }
     if local_embedding is not None:
         mm_data["multimodal_embedding"] = local_embedding
@@ -808,6 +812,25 @@ def test_encoder_cache_mm_processor_kwargs_do_not_collide():
     assert not torch.equal(first_embeddings, second_embeddings)
 
 
+def test_encoder_cache_versions_do_not_collide():
+    model = CountingEncoderMultimodalModel(
+        make_embedding(hidden_size=4),
+        torch.tensor([7]),
+        encoder_cache_max_bytes=4096,
+    )
+    first = make_keyed_multimodal_param(processor_version="processor-v1")
+    changed_processor = make_keyed_multimodal_param(processor_version="processor-v2")
+    changed_encoder = make_keyed_multimodal_param(
+        processor_version="processor-v2", encoder_version=1
+    )
+
+    model._get_or_encode_multimodal_embeddings([first])
+    model._get_or_encode_multimodal_embeddings([changed_processor])
+    model._get_or_encode_multimodal_embeddings([changed_encoder])
+
+    assert model.encode_calls == 3
+
+
 def test_disabled_encoder_cache_preserves_current_behavior():
     model = CountingEncoderMultimodalModel(
         make_embedding(hidden_size=4),
@@ -834,8 +857,15 @@ def test_disabled_encoder_cache_preserves_current_behavior():
             multimodal_runtime=make_runtime(2),
         ),
         make_keyed_multimodal_param(kwargs_hash=None),
+        make_keyed_multimodal_param(processor_version=None),
+        make_keyed_multimodal_param(encoder_version=None),
     ],
-    ids=["missing_hashes", "unserializable_kwargs"],
+    ids=[
+        "missing_hashes",
+        "unserializable_kwargs",
+        "missing_processor_version",
+        "missing_encoder_version",
+    ],
 )
 def test_unkeyable_requests_skip_persistent_encoder_cache(param):
     model = CountingEncoderMultimodalModel(

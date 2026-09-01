@@ -3766,11 +3766,25 @@ class PyTorchModelEngine(ModelEngine):
             return None
         return model._multimodal_encoder_cache
 
+    @property
+    def mm_encoder_version(self) -> int:
+        """Return the current model-owned encoder-output namespace."""
+        model = self.model
+        if not isinstance(model, MultimodalModelMixin):
+            return 0
+        return model._multimodal_encoder_version
+
     def invalidate_multimodal_encoder_cache(self) -> None:
-        """Clear cached MM encoder outputs when no request is using them."""
+        """Clear cached MM outputs and retire their weight-derived namespace."""
         encoder_cache = self.mm_encoder_cache
         if encoder_cache is not None:
             encoder_cache.clear()
+        model = self.model
+        if isinstance(model, MultimodalModelMixin):
+            # Weight reload is in-place and may partially mutate the model
+            # before failing. Advance before reload so neither a successful nor
+            # a failed update can reuse outputs from the previous weights.
+            model._multimodal_encoder_version += 1
 
     def _build_multimodal_data_for_llm(
         self,
@@ -3859,6 +3873,8 @@ class PyTorchModelEngine(ModelEngine):
                 item_metadata.item_refs,
                 item_metadata.output_embedding_lengths,
                 mm_data.get("mm_processor_kwargs_hash"),
+                processor_version=mm_data.get("mm_processor_version"),
+                encoder_version=mm_data.get("mm_encoder_version"),
             ))
         if state is not None:
             state.stable_item_cache_keys = keys

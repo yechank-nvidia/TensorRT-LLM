@@ -5963,6 +5963,13 @@ class PyExecutor:
             handled.
             """
             try:
+                mm_data = request.py_multimodal_data
+                if (isinstance(mm_data, dict)
+                        and self.model_engine.mm_encoder_cache is not None):
+                    # Capture the model-owned namespace once at admission so
+                    # every cache consumer uses the same weight generation.
+                    mm_data["mm_encoder_version"] = (
+                        self.model_engine.mm_encoder_version)
                 self._validate_request(request)
                 if self._mm_encoder_item_scheduling_enabled:
                     initialize_multimodal_encoder_request(

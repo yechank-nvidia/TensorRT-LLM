@@ -1169,6 +1169,40 @@ def test_weight_invalidation_clears_old_removal_delta_and_rejects_live_refs():
     assert invalidations == [True]
 
 
+def test_model_engine_invalidation_advances_encoder_version():
+    class _Model(MultimodalModelMixin):
+        pass
+
+    model = _Model()
+    model._multimodal_encoder_cache = TensorLRUCache(16)
+    cache_key = ("old", 0)
+    model._multimodal_encoder_cache.put(cache_key, torch.ones(1))
+
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = model
+    engine.mm_encoder_item_scheduling_enabled = True
+    engine.mapping = SimpleNamespace(is_first_pp_rank=lambda: True)
+
+    engine.invalidate_multimodal_encoder_cache()
+
+    assert engine.mm_encoder_version == 1
+    assert model._multimodal_encoder_cache.get(cache_key) is None
+
+
+def test_executor_stamps_encoder_version_when_admitting_cached_request():
+    request = _llm_request(1, multimodal_data={"image": {}})
+    executor = object.__new__(PyExecutor)
+    executor.waiting_queue = []
+    executor.active_requests = []
+    executor.model_engine = SimpleNamespace(mm_encoder_cache=object(), mm_encoder_version=7)
+    executor._mm_encoder_item_scheduling_enabled = False
+    executor._fetch_new_requests = lambda *_: [request]
+    executor._validate_request = lambda _: None
+
+    assert executor._fetch_and_activate_new_requests() == [request]
+    assert request.py_multimodal_data["mm_encoder_version"] == 7
+
+
 def test_item_outputs_commit_to_prompt_ordered_cache_entries(monkeypatch):
     cache = TensorLRUCache(1 << 20, name="test")
 
