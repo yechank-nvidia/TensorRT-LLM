@@ -1045,7 +1045,18 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         return self.load_bytes(base64.b64decode(data))
 
     def load_file(self, url: str) -> VideoData:
-        return self.load_bytes(Path(_normalize_file_uri(url)).read_bytes())
+        path = Path(_normalize_file_uri(url))
+        raw_bytes_hasher = blake3()
+        raw_bytes_hasher.update_mmap(str(path))
+        return _load_video_by_cv2(
+            str(path),
+            self._num_frames,
+            self._fps,
+            self._format,
+            self._device,
+            extract_audio=self._extract_audio,
+            raw_bytes_hash=raw_bytes_hasher.hexdigest(),
+        )
 
 
 MEDIA_IO_REGISTRY: Mapping[MediaModality, Type[BaseMediaIO]] = MappingProxyType(

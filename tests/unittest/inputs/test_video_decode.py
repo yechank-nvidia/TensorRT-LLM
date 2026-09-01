@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
+from blake3 import blake3
 from PIL import Image
 from transformers.video_utils import make_batched_videos
 
@@ -15,7 +18,7 @@ pytest.importorskip("cv2")
 import cv2  # noqa: E402
 
 import tensorrt_llm.inputs.media_io as media_io_module  # noqa: E402
-from tensorrt_llm.inputs.media_io import _load_video_by_cv2  # noqa: E402
+from tensorrt_llm.inputs.media_io import VideoMediaIO, _load_video_by_cv2  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
 
@@ -67,6 +70,19 @@ def test_np_format_hits_hf_video_processor_fast_path(sample_video_path: str) -> 
 
     assert len(batched) == 1
     assert np.shares_memory(video.frames, batched[0])
+
+
+def test_load_file_does_not_buffer_entire_video(sample_video_path: str, monkeypatch) -> None:
+    expected_hash = blake3(Path(sample_video_path).read_bytes()).hexdigest()
+
+    def fail_read_bytes(self):
+        raise AssertionError(f"unexpected full-file read: {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    video = VideoMediaIO(num_frames=10, fps=-1, format="np").load_file(sample_video_path)
+
+    assert video.raw_bytes_hash == expected_hash
+    assert len(video.frames) == 10
 
 
 def test_sparse_seek_preserves_sampled_frames(sample_video_path: str, monkeypatch) -> None:
