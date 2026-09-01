@@ -14,6 +14,7 @@ from transformers.video_utils import make_batched_videos
 pytest.importorskip("cv2")
 import cv2  # noqa: E402
 
+import tensorrt_llm.inputs.media_io as media_io_module  # noqa: E402
 from tensorrt_llm.inputs.media_io import _load_video_by_cv2  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
@@ -66,3 +67,42 @@ def test_np_format_hits_hf_video_processor_fast_path(sample_video_path: str) -> 
 
     assert len(batched) == 1
     assert np.shares_memory(video.frames, batched[0])
+
+
+def test_sparse_seek_preserves_sampled_frames(sample_video_path: str, monkeypatch) -> None:
+    sequential = _load_video_by_cv2(sample_video_path, num_frames=10, fps=-1, format="np")
+    monkeypatch.setattr(media_io_module, "_VIDEO_SPARSE_SEEK_MIN_FRAME_RATIO", 1)
+    sparse = _load_video_by_cv2(sample_video_path, num_frames=10, fps=-1, format="np")
+
+    np.testing.assert_array_equal(sparse.frames, sequential.frames)
+    assert sparse.metadata["frames_indices"] == sequential.metadata["frames_indices"]
+
+
+def test_sparse_seek_failure_falls_back_to_sequential(sample_video_path: str, monkeypatch) -> None:
+    sequential = _load_video_by_cv2(sample_video_path, num_frames=10, fps=-1, format="np")
+    original_video_capture = cv2.VideoCapture
+    captures = []
+
+    class FailSecondSeekCapture:
+        def __init__(self, *args, **kwargs):
+            self.capture = original_video_capture(*args, **kwargs)
+            self.seek_calls = 0
+            captures.append(self)
+
+        def set(self, prop, value):
+            if prop == cv2.CAP_PROP_POS_FRAMES:
+                self.seek_calls += 1
+                if self.seek_calls == 2:
+                    return False
+            return self.capture.set(prop, value)
+
+        def __getattr__(self, name):
+            return getattr(self.capture, name)
+
+    monkeypatch.setattr(media_io_module, "_VIDEO_SPARSE_SEEK_MIN_FRAME_RATIO", 1)
+    monkeypatch.setattr(cv2, "VideoCapture", FailSecondSeekCapture)
+    fallback = _load_video_by_cv2(sample_video_path, num_frames=10, fps=-1, format="np")
+
+    assert len(captures) == 2
+    np.testing.assert_array_equal(fallback.frames, sequential.frames)
+    assert fallback.metadata["frames_indices"] == sequential.metadata["frames_indices"]

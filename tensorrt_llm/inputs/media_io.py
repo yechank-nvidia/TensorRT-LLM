@@ -563,6 +563,11 @@ _VIDEO_TEMPFILE_DIR: Optional[str] = (  # nosec B108
     else None
 )
 
+# Seeking has a fixed per-sample cost, while sequential ``grab`` scales with
+# the number of frames traversed. This conservative crossover kept sparse
+# seeking non-regressive across the measured Video-MME sample.
+_VIDEO_SPARSE_SEEK_MIN_FRAME_RATIO = 250
+
 
 def _load_video_by_cv2(
     video: Union[str, bytes],
@@ -600,18 +605,20 @@ def _load_video_by_cv2(
     #   (b) `video` is mp4 bytes -> feed cv2 from an in-memory BytesIO via
     #       the caller-supplied stream-buffered backend. The buffer is held
     #       alive in `video_buf` because cv2 keeps a non-owning view into it.
-    video_buf: Optional[BytesIO] = None
-    if isinstance(video, (bytes, bytearray, memoryview)):
-        if cv2_backend is None:
-            raise ValueError(
-                "cv2_backend must be provided when `video` is bytes; "
-                "callers without a stream-buffered backend should spill "
-                "the bytes to a tempfile and pass the path instead."
-            )
-        video_buf = BytesIO(bytes(video))
-        vidcap = cv2.VideoCapture(video_buf, cv2_backend, [])
-    else:
-        vidcap = cv2.VideoCapture(video)
+    def open_video_capture():
+        if isinstance(video, (bytes, bytearray, memoryview)):
+            if cv2_backend is None:
+                raise ValueError(
+                    "cv2_backend must be provided when `video` is bytes; "
+                    "callers without a stream-buffered backend should spill "
+                    "the bytes to a tempfile and pass the path instead."
+                )
+            buffer = BytesIO(bytes(video))
+            return cv2.VideoCapture(buffer, cv2_backend, []), buffer
+        return cv2.VideoCapture(video), None
+
+    # Keep the buffer alive because VideoCapture holds a non-owning view.
+    vidcap, video_buf = open_video_capture()
 
     try:
         if not vidcap.isOpened():
@@ -653,36 +660,74 @@ def _load_video_by_cv2(
         # Log at most once per decode to avoid spamming when a whole stream is
         # affected (e.g. every frame retrieves with a drifted shape).
         skip_warned = False
-        frame_idx = 0
-        while frame_idx <= max_idx and vidcap.grab():
-            if frame_idx in target_set:
-                # Reuse a single BGR buffer across retrieves; cv2 replaces its
-                # contents in place when the argument is shape-compatible.
+
+        def store_rgb_frame(frame_idx: int, bgr_frame: np.ndarray) -> None:
+            nonlocal H, W, skip_warned, stacked_rgb
+            fh, fw = bgr_frame.shape[:2]
+            if stacked_rgb is None:
+                H, W = fh, fw
+                stacked_rgb = np.empty((num_frames_to_sample, H, W, 3), dtype=np.uint8)
+            if (fh, fw) == (H, W):
+                cv2.cvtColor(
+                    bgr_frame,
+                    cv2.COLOR_BGR2RGB,
+                    dst=stacked_rgb[len(valid_indices)],
+                )
+                valid_indices.append(frame_idx)
+            elif not skip_warned:
+                logger.warning(
+                    f"Skipping frame {frame_idx} and subsequent size-drifted frames: "
+                    f"shape={(fh, fw)} differs from first decoded shape=({H}, {W})."
+                )
+                skip_warned = True
+
+        use_sparse_seek = max_idx + 1 >= _VIDEO_SPARSE_SEEK_MIN_FRAME_RATIO * len(indices)
+        sparse_seek_complete = False
+        if use_sparse_seek:
+            sparse_seek_complete = True
+            for frame_idx in indices:
+                if not vidcap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx):
+                    sparse_seek_complete = False
+                    break
+                if not vidcap.grab():
+                    sparse_seek_complete = False
+                    break
                 ok, bgr_scratch = vidcap.retrieve(bgr_scratch)
-                if ok:
-                    fh, fw = bgr_scratch.shape[:2]
-                    if stacked_rgb is None:
-                        H, W = fh, fw
-                        stacked_rgb = np.empty((num_frames_to_sample, H, W, 3), dtype=np.uint8)
-                    if (fh, fw) == (H, W):
-                        cv2.cvtColor(
-                            bgr_scratch,
-                            cv2.COLOR_BGR2RGB,
-                            dst=stacked_rgb[len(valid_indices)],
-                        )
-                        valid_indices.append(frame_idx)
+                reported_position = vidcap.get(cv2.CAP_PROP_POS_FRAMES)
+                if not ok or (
+                    reported_position > 0 and abs(reported_position - (frame_idx + 1)) > 0.5
+                ):
+                    sparse_seek_complete = False
+                    break
+                store_rgb_frame(frame_idx, bgr_scratch)
+
+        if use_sparse_seek and not sparse_seek_complete:
+            stacked_rgb = None
+            H = W = None
+            valid_indices.clear()
+            skip_warned = False
+            bgr_scratch = None
+            vidcap.release()
+            vidcap, video_buf = open_video_capture()
+            if not vidcap.isOpened():
+                raise ValueError("Video could not be reopened after sparse seek failed.")
+
+        if not sparse_seek_complete:
+            frame_idx = 0
+            while frame_idx <= max_idx and vidcap.grab():
+                if frame_idx in target_set:
+                    # Reuse a single BGR buffer across retrieves; cv2 replaces
+                    # its contents when the argument is shape-compatible.
+                    ok, bgr_scratch = vidcap.retrieve(bgr_scratch)
+                    if ok:
+                        store_rgb_frame(frame_idx, bgr_scratch)
                     elif not skip_warned:
                         logger.warning(
-                            f"Skipping frame {frame_idx} and subsequent size-drifted frames: "
-                            f"shape={(fh, fw)} differs from first decoded shape=({H}, {W})."
+                            f"Skipping frame {frame_idx} and subsequent retrieve failures: "
+                            "retrieve returned ok=False."
                         )
                         skip_warned = True
-                elif not skip_warned:
-                    logger.warning(
-                        f"Skipping frame {frame_idx} and subsequent retrieve failures: retrieve returned ok=False."
-                    )
-                    skip_warned = True
-            frame_idx += 1
+                frame_idx += 1
         vidcap.release()
 
         if stacked_rgb is None or not valid_indices:
