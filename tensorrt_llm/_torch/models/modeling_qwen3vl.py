@@ -64,7 +64,7 @@ from .modeling_qwen2vl import (
     Qwen2VLInputProcessorBase,
     _prepare_qwen_vl_mrope_config,
     _prepare_qwen_vl_vision_attn_metadata,
-    _QwenVLImageProcessorSingleFlight,
+    _QwenVLVisionProcessorSingleFlight,
 )
 from .modeling_utils import (
     ModelConfig,
@@ -429,11 +429,18 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         processor = self.processor
         if processor_artifact_key is not None:
             processor = copy.copy(processor)
-            processor.image_processor = _QwenVLImageProcessorSingleFlight(
-                self,
-                processor.image_processor,
-                processor_artifact_key,
-            )
+            if images is not None:
+                processor.image_processor = _QwenVLVisionProcessorSingleFlight(
+                    self,
+                    processor.image_processor,
+                    processor_artifact_key,
+                )
+            else:
+                processor.video_processor = _QwenVLVisionProcessorSingleFlight(
+                    self,
+                    processor.video_processor,
+                    processor_artifact_key,
+                )
 
         return processor(
             text=[text],

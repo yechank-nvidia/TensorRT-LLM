@@ -208,10 +208,16 @@ class TestImageProcessorSingleFlight:
     def test_concurrent_same_key_runs_image_processor_once(self):
         image_processor = _ControlledImageProcessor()
         processor = _processor_with_single_flight(image_processor)
-        barrier = threading.Barrier(3)
+        entered = threading.Barrier(3)
+        get_artifact = processor._get_vision_processor_artifact
+
+        def synchronized_get(*args, **kwargs):
+            entered.wait()
+            return get_artifact(*args, **kwargs)
+
+        processor._get_vision_processor_artifact = synchronized_get
 
         def preprocess():
-            barrier.wait()
             return processor._preprocess(
                 "prompt",
                 {"image": [[1]]},
@@ -221,7 +227,7 @@ class TestImageProcessorSingleFlight:
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = [pool.submit(preprocess) for _ in range(2)]
-            barrier.wait()
+            entered.wait()
             assert image_processor.started.wait(timeout=5)
             assert all(future.running() for future in futures)
             image_processor.release.set()

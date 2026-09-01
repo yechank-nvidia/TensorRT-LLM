@@ -89,26 +89,26 @@ from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
 PAD_INDEX = -100  # NOTE: refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py#L269
 
 
-class _QwenVLImageProcessorSingleFlight:
+class _QwenVLVisionProcessorSingleFlight:
     """Preserve the HF processor interface while sharing one active call."""
 
     def __init__(
         self,
         owner: "Qwen2VLInputProcessorBase",
-        image_processor: Any,
+        vision_processor: Any,
         artifact_key: Hashable,
     ) -> None:
         self._owner = owner
-        self._image_processor = image_processor
+        self._vision_processor = vision_processor
         self._artifact_key = artifact_key
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._image_processor, name)
+        return getattr(self._vision_processor, name)
 
     def __call__(self, *args, **kwargs) -> Dict[str, Any]:
-        artifact = self._owner._get_image_processor_artifact(
+        artifact = self._owner._get_vision_processor_artifact(
             self._artifact_key,
-            self._image_processor,
+            self._vision_processor,
             *args,
             **kwargs,
         )
@@ -280,7 +280,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                            'temporal_patch_size', 1)
 
     def set_processor_artifact_cache_max_bytes(self, max_bytes: int) -> None:
-        """Set the byte-bounded LRU capacity for completed image artifacts."""
+        """Set the byte-bounded LRU capacity for completed vision artifacts."""
         if max_bytes < 0:
             raise ValueError("processor artifact cache size cannot be negative")
         with self._processor_artifacts_lock:
@@ -297,7 +297,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         return self._processor_artifact_cache_max_bytes > 0
 
     @staticmethod
-    def _image_processor_artifact_bytes(artifact) -> int:
+    def _vision_processor_artifact_bytes(artifact) -> int:
         seen_storages = set()
         total_bytes = 0
         for value in artifact.values():
@@ -313,16 +313,16 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         return total_bytes
 
     @staticmethod
-    def _clone_image_processor_artifact(artifact) -> Dict[str, Any]:
+    def _clone_vision_processor_artifact(artifact) -> Dict[str, Any]:
         """Give one request private tensors before CPU IPC conversion."""
         return {
             key: value.clone() if isinstance(value, torch.Tensor) else value
             for key, value in artifact.items()
         }
 
-    def _cache_image_processor_artifact(self, artifact_key: Hashable,
-                                        artifact) -> None:
-        artifact_bytes = self._image_processor_artifact_bytes(artifact)
+    def _cache_vision_processor_artifact(self, artifact_key: Hashable,
+                                         artifact) -> None:
+        artifact_bytes = self._vision_processor_artifact_bytes(artifact)
         with self._processor_artifacts_lock:
             max_bytes = self._processor_artifact_cache_max_bytes
             if artifact_bytes <= 0 or artifact_bytes > max_bytes:
@@ -347,20 +347,24 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         mm_hashes: Mapping[str, List[str]],
         mm_processor_kwargs_hash: Optional[str],
     ):
-        """Share concurrent image preprocessing without caching prompt state."""
+        """Share concurrent vision preprocessing without caching prompt state."""
         mm_data = inputs.get("multi_modal_data") or {}
-        images = mm_data.get("image")
-        image_hashes = mm_hashes.get("image")
-        if (inputs.get("prompt") is None or set(mm_data) != {"image"}
-                or not isinstance(images, list) or not image_hashes
-                or len(images) != len(image_hashes)
-                or mm_processor_kwargs_hash is None):
+        if inputs.get("prompt") is None or mm_processor_kwargs_hash is None:
+            return self(inputs, sampling_params)
+
+        modality = next(iter(mm_data)) if len(mm_data) == 1 else None
+        items = mm_data.get(modality) if modality in ("image",
+                                                      "video") else None
+        item_hashes = mm_hashes.get(modality) if modality is not None else None
+        if (not isinstance(items, list) or not item_hashes
+                or len(items) != len(item_hashes)):
             return self(inputs, sampling_params)
 
         artifact_key = (
-            "qwen-vl-image-processor-v1",
+            "qwen-vl-vision-processor-v2",
+            modality,
             mm_processor_kwargs_hash,
-            tuple(image_hashes),
+            tuple(item_hashes),
         )
         return self.call_with_text_prompt(
             inputs,
@@ -368,10 +372,10 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             processor_artifact_key=artifact_key,
         )
 
-    def _get_image_processor_artifact(
+    def _get_vision_processor_artifact(
         self,
         artifact_key: Hashable,
-        image_processor,
+        vision_processor,
         *args,
         **kwargs,
     ):
@@ -379,7 +383,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             ready = self._processor_artifacts_ready.pop(artifact_key, None)
             if ready is not None:
                 self._processor_artifacts_ready[artifact_key] = ready
-                return self._clone_image_processor_artifact(ready[0])
+                return self._clone_vision_processor_artifact(ready[0])
             future = self._processor_artifacts_in_flight.get(artifact_key)
             is_producer = future is None
             if is_producer:
@@ -387,12 +391,12 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 self._processor_artifacts_in_flight[artifact_key] = future
 
         if not is_producer:
-            return self._clone_image_processor_artifact(future.result())
+            return self._clone_vision_processor_artifact(future.result())
 
         try:
-            artifact = image_processor(*args, **kwargs)
-            cached_artifact = self._clone_image_processor_artifact(artifact)
-            self._cache_image_processor_artifact(artifact_key, cached_artifact)
+            artifact = vision_processor(*args, **kwargs)
+            cached_artifact = self._clone_vision_processor_artifact(artifact)
+            self._cache_vision_processor_artifact(artifact_key, cached_artifact)
             future.set_result(cached_artifact)
             return artifact
         except Exception as error:
@@ -1334,11 +1338,18 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         processor = self.processor
         if processor_artifact_key is not None:
             processor = copy.copy(processor)
-            processor.image_processor = _QwenVLImageProcessorSingleFlight(
-                self,
-                processor.image_processor,
-                processor_artifact_key,
-            )
+            if images is not None:
+                processor.image_processor = _QwenVLVisionProcessorSingleFlight(
+                    self,
+                    processor.image_processor,
+                    processor_artifact_key,
+                )
+            else:
+                processor.video_processor = _QwenVLVisionProcessorSingleFlight(
+                    self,
+                    processor.video_processor,
+                    processor_artifact_key,
+                )
         return processor(text=[text],
                          images=images,
                          videos=videos,

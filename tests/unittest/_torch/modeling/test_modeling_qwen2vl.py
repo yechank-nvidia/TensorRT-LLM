@@ -3,9 +3,11 @@
 
 import threading
 from collections import OrderedDict
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 import torch
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VisionPatchEmbed
 
@@ -17,20 +19,29 @@ from tensorrt_llm._torch.models.modeling_qwen2vl import (
 )
 
 
-def test_qwen2_5_image_processor_artifact_reuse() -> None:
-    image_processor = MagicMock(
+@pytest.mark.parametrize(
+    ("modality", "processor_name", "output_name"),
+    [
+        ("image", "image_processor", "pixel_values"),
+        ("video", "video_processor", "pixel_values_videos"),
+    ],
+)
+def test_qwen2_5_vision_processor_artifact_reuse(modality, processor_name, output_name) -> None:
+    vision_processor = MagicMock(
         return_value={
-            "pixel_values": torch.ones(2, 3),
-            "image_grid_thw": torch.tensor([[1, 2, 2]]),
+            output_name: torch.ones(2, 3),
         }
     )
 
     class CombinedProcessor:
         def __init__(self):
-            self.image_processor = image_processor
+            self.image_processor = MagicMock()
+            self.video_processor = MagicMock()
+            setattr(self, processor_name, vision_processor)
 
-        def __call__(self, *, images, **kwargs):
-            return self.image_processor(images=images)
+        def __call__(self, *, images, videos, **kwargs):
+            values = images if images is not None else videos
+            return getattr(self, processor_name)(**{f"{modality}s": values})
 
     processor = object.__new__(Qwen2_5VLInputProcessorBase)
     processor._processor = CombinedProcessor()
@@ -39,17 +50,39 @@ def test_qwen2_5_image_processor_artifact_reuse() -> None:
     processor._processor_artifacts_ready = OrderedDict()
     processor._processor_artifacts_ready_bytes = 0
     processor._processor_artifact_cache_max_bytes = 1 << 20
-    mm_data = {"image": [np.zeros((4, 4, 3), dtype=np.uint8)]}
+    array = np.zeros((4, 4, 3), dtype=np.uint8)
+    item = array if modality == "image" else SimpleNamespace(frames=[array])
+    mm_data = {modality: [item]}
 
-    first = processor._preprocess("first", mm_data, {}, "same-image")
-    second = processor._preprocess("second", mm_data, {}, "same-image")
+    first = processor._preprocess("first", mm_data, {}, "same-media")
+    second = processor._preprocess("second", mm_data, {}, "same-media")
 
-    assert image_processor.call_count == 1
-    torch.testing.assert_close(first["pixel_values"], second["pixel_values"])
+    assert vision_processor.call_count == 1
+    torch.testing.assert_close(first[output_name], second[output_name])
     assert (
-        first["pixel_values"].untyped_storage().data_ptr()
-        != second["pixel_values"].untyped_storage().data_ptr()
+        first[output_name].untyped_storage().data_ptr()
+        != second[output_name].untyped_storage().data_ptr()
     )
+
+
+@pytest.mark.parametrize("modality", ["image", "video"])
+def test_qwen_vision_hashes_select_one_modality_artifact(modality) -> None:
+    processor = object.__new__(Qwen2_5VLInputProcessorBase)
+    processor.call_with_text_prompt = MagicMock(return_value=([], None))
+    inputs = {
+        "prompt": "prompt",
+        "multi_modal_data": {modality: [object()]},
+    }
+
+    processor._process_with_hashes(
+        inputs,
+        MagicMock(),
+        {modality: ["media-hash"]},
+        "kwargs-hash",
+    )
+
+    artifact_key = processor.call_with_text_prompt.call_args.kwargs["processor_artifact_key"]
+    assert artifact_key[1:] == (modality, "kwargs-hash", ("media-hash",))
 
 
 def test_qwen2_5_vision_patch_projection_matches_conv3d(monkeypatch) -> None:
