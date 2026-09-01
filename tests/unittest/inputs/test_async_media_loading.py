@@ -122,6 +122,7 @@ class TestAsyncLoadAudio:
             wav_path = _make_audio_file(f.name)
         audio_array, sample_rate = await async_load_audio(wav_path)
         assert isinstance(audio_array, np.ndarray)
+        assert audio_array.dtype == np.float32
         assert sample_rate == 16000  # matches the sr=16000 used in _make_audio_file
 
     @pytest.mark.asyncio

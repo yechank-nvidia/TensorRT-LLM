@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import numpy as np
 import pytest
+import soundfile
 import torch
 from PIL import Image
 
@@ -73,6 +74,25 @@ def test_image_loading_preserves_rgb_pixels(mode, image_format, tmp_path):
     assert tensor_from_bytes.is_contiguous()
     assert tensor_from_base64.is_contiguous()
     assert tensor_from_file.is_contiguous()
+
+
+def test_audio_loading_returns_float32(tmp_path):
+    samples = np.linspace(-1, 1, 32, dtype=np.float32)
+    buffer = BytesIO()
+    soundfile.write(buffer, samples, 16_000, format="WAV", subtype="PCM_16")
+    encoded = buffer.getvalue()
+    path = tmp_path / "input.wav"
+    path.write_bytes(encoded)
+    loader = AudioMediaIO()
+
+    from_bytes, bytes_rate = loader.load_bytes(encoded)
+    from_base64, base64_rate = loader.load_base64("audio/wav", base64.b64encode(encoded).decode())
+    from_file, file_rate = loader.load_file(str(path))
+
+    assert from_bytes.dtype == np.float32
+    np.testing.assert_array_equal(from_base64, from_bytes)
+    np.testing.assert_array_equal(from_file, from_bytes)
+    assert bytes_rate == base64_rate == file_rate == 16_000
 
 
 class TestMultimodalLoadErrorPropagation:
