@@ -28,9 +28,9 @@ class CustomError(Exception):
 
 @pytest.mark.parametrize(
     ("mode", "image_format"),
-    [("RGB", "JPEG"), ("L", "PNG"), ("RGBA", "PNG")],
+    [("RGB", "JPEG"), ("L", "JPEG"), ("RGBA", "PNG")],
 )
-def test_image_loading_preserves_rgb_pixels(mode, image_format):
+def test_image_loading_preserves_rgb_pixels(mode, image_format, tmp_path):
     shape = (7, 8) if mode == "L" else (7, 8, len(mode))
     pixels = np.arange(np.prod(shape), dtype=np.uint8).reshape(shape)
     image = Image.fromarray(pixels, mode=mode)
@@ -38,6 +38,8 @@ def test_image_loading_preserves_rgb_pixels(mode, image_format):
     buffer = BytesIO()
     image.save(buffer, format=image_format)
     encoded = buffer.getvalue()
+    image_path = tmp_path / f"input.{image_format.lower()}"
+    image_path.write_bytes(encoded)
     expected = np.asarray(convert_image_mode(Image.open(BytesIO(encoded)), "RGB"))
     numpy_io = ImageMediaIO(format="np")
     tensor_io = ImageMediaIO(format="pt")
@@ -50,6 +52,8 @@ def test_image_loading_preserves_rgb_pixels(mode, image_format):
     tensor_from_base64 = tensor_io.load_base64(
         f"image/{image_format.lower()}", base64.b64encode(encoded).decode()
     )
+    numpy_from_file = numpy_io.load_file(str(image_path))
+    tensor_from_file = tensor_io.load_file(str(image_path))
     expected_tensor = (
         torch.from_numpy(np.array(expected, copy=True))
         .permute(2, 0, 1)
@@ -59,12 +63,16 @@ def test_image_loading_preserves_rgb_pixels(mode, image_format):
 
     np.testing.assert_array_equal(numpy_from_bytes, expected)
     np.testing.assert_array_equal(numpy_from_base64, expected)
+    np.testing.assert_array_equal(numpy_from_file, expected)
     torch.testing.assert_close(tensor_from_bytes, expected_tensor, rtol=0, atol=0)
     torch.testing.assert_close(tensor_from_base64, expected_tensor, rtol=0, atol=0)
+    torch.testing.assert_close(tensor_from_file, expected_tensor, rtol=0, atol=0)
     assert numpy_from_bytes.flags.c_contiguous
     assert numpy_from_base64.flags.c_contiguous
+    assert numpy_from_file.flags.c_contiguous
     assert tensor_from_bytes.is_contiguous()
     assert tensor_from_base64.is_contiguous()
+    assert tensor_from_file.is_contiguous()
 
 
 class TestMultimodalLoadErrorPropagation:

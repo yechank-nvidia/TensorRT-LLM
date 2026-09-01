@@ -248,16 +248,32 @@ def _load_and_convert_image(image):
     return convert_image_mode(image, "RGB")
 
 
-def _decode_common_image(data: bytes) -> Optional[torch.Tensor]:
-    """Decode common 8-bit images directly to an RGB tensor.
+def _decode_jpeg_image(source: Union[bytes, str, Path]) -> Optional[torch.Tensor]:
+    """Decode an 8-bit JPEG directly to an RGB tensor.
 
-    Return ``None`` for formats or modes whose conversion semantics differ so
-    the caller can keep PIL as the compatibility path.
+    Return ``None`` for other formats or JPEG modes whose conversion semantics
+    differ so the caller can keep PIL as the compatibility path.
     """
+    if isinstance(source, bytes):
+        header = source[:3]
+    else:
+        with Path(source).open("rb") as image_file:
+            header = image_file.read(3)
+    if header != b"\xff\xd8\xff":
+        return None
+
+    pil_source = BytesIO(source) if isinstance(source, bytes) else source
+    with Image.open(pil_source) as image:
+        if image.format != "JPEG" or image.mode not in ("RGB", "L"):
+            return None
+
     from torchvision.io import ImageReadMode, decode_image
 
+    if isinstance(source, bytes):
+        encoded = torch.frombuffer(bytearray(source), dtype=torch.uint8)
+    else:
+        encoded = str(source)
     try:
-        encoded = torch.frombuffer(bytearray(data), dtype=torch.uint8)
         decoded = decode_image(
             encoded,
             mode=ImageReadMode.UNCHANGED,
@@ -917,18 +933,21 @@ class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
             return np.asarray(image)
         return image
 
+    def _postprocess_decoded(self, decoded: torch.Tensor) -> Union[torch.Tensor, np.ndarray]:
+        if self._format == "np":
+            return decoded.permute(1, 2, 0).contiguous().numpy()
+        return (
+            decoded.contiguous()
+            .to(dtype=torch.get_default_dtype())
+            .div_(255)
+            .to(device=self._device)
+        )
+
     def load_bytes(self, data: bytes) -> Union[Image.Image, torch.Tensor, np.ndarray]:
         if self._format in ("np", "pt"):
-            decoded = _decode_common_image(data)
+            decoded = _decode_jpeg_image(data)
             if decoded is not None:
-                if self._format == "np":
-                    return decoded.permute(1, 2, 0).contiguous().numpy()
-                return (
-                    decoded.contiguous()
-                    .to(dtype=torch.get_default_dtype())
-                    .div_(255)
-                    .to(device=self._device)
-                )
+                return self._postprocess_decoded(decoded)
         return self._postprocess(_load_and_convert_image(BytesIO(data)))
 
     def load_base64(
@@ -937,7 +956,12 @@ class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
         return self.load_bytes(base64.b64decode(data))
 
     def load_file(self, url: str) -> Union[Image.Image, torch.Tensor, np.ndarray]:
-        return self._postprocess(_load_and_convert_image(Path(_normalize_file_uri(url))))
+        path = Path(_normalize_file_uri(url))
+        if self._format in ("np", "pt"):
+            decoded = _decode_jpeg_image(path)
+            if decoded is not None:
+                return self._postprocess_decoded(decoded)
+        return self._postprocess(_load_and_convert_image(path))
 
 
 class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
