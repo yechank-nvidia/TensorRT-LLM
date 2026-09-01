@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import threading
+from collections import OrderedDict
+from unittest.mock import MagicMock
+
+import numpy as np
 import torch
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VisionPatchEmbed
 
@@ -8,7 +13,43 @@ from tensorrt_llm._torch.models import modeling_qwen2vl
 from tensorrt_llm._torch.models.modeling_qwen2vl import (
     Qwen2_5_VisionModel,
     Qwen2_5_VLVisionAttention,
+    Qwen2_5VLInputProcessorBase,
 )
+
+
+def test_qwen2_5_image_processor_artifact_reuse() -> None:
+    image_processor = MagicMock(
+        return_value={
+            "pixel_values": torch.ones(2, 3),
+            "image_grid_thw": torch.tensor([[1, 2, 2]]),
+        }
+    )
+
+    class CombinedProcessor:
+        def __init__(self):
+            self.image_processor = image_processor
+
+        def __call__(self, *, images, **kwargs):
+            return self.image_processor(images=images)
+
+    processor = object.__new__(Qwen2_5VLInputProcessorBase)
+    processor._processor = CombinedProcessor()
+    processor._processor_artifacts_in_flight = {}
+    processor._processor_artifacts_lock = threading.Lock()
+    processor._processor_artifacts_ready = OrderedDict()
+    processor._processor_artifacts_ready_bytes = 0
+    processor._processor_artifact_cache_max_bytes = 1 << 20
+    mm_data = {"image": [np.zeros((4, 4, 3), dtype=np.uint8)]}
+
+    first = processor._preprocess("first", mm_data, {}, "same-image")
+    second = processor._preprocess("second", mm_data, {}, "same-image")
+
+    assert image_processor.call_count == 1
+    torch.testing.assert_close(first["pixel_values"], second["pixel_values"])
+    assert (
+        first["pixel_values"].untyped_storage().data_ptr()
+        != second["pixel_values"].untyped_storage().data_ptr()
+    )
 
 
 def test_qwen2_5_vision_patch_projection_matches_conv3d(monkeypatch) -> None:
