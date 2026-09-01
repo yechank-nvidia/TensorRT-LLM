@@ -1,11 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import base64
+from io import BytesIO
 from unittest.mock import AsyncMock, patch
 
+import numpy as np
 import pytest
+import torch
+from PIL import Image
 
 from tensorrt_llm.inputs import MultimodalDataTracker
-from tensorrt_llm.inputs.media_io import AudioMediaIO, BaseMediaIO, ImageMediaIO, VideoMediaIO
+from tensorrt_llm.inputs.media_io import (
+    AudioMediaIO,
+    BaseMediaIO,
+    ImageMediaIO,
+    VideoMediaIO,
+    convert_image_mode,
+)
 from tensorrt_llm.serve.chat_utils import parse_chat_message_content_part
 
 pytestmark = pytest.mark.cpu_only
@@ -13,6 +24,47 @@ pytestmark = pytest.mark.cpu_only
 
 class CustomError(Exception):
     pass
+
+
+@pytest.mark.parametrize(
+    ("mode", "image_format"),
+    [("RGB", "JPEG"), ("L", "PNG"), ("RGBA", "PNG")],
+)
+def test_image_loading_preserves_rgb_pixels(mode, image_format):
+    shape = (7, 8) if mode == "L" else (7, 8, len(mode))
+    pixels = np.arange(np.prod(shape), dtype=np.uint8).reshape(shape)
+    image = Image.fromarray(pixels, mode=mode)
+
+    buffer = BytesIO()
+    image.save(buffer, format=image_format)
+    encoded = buffer.getvalue()
+    expected = np.asarray(convert_image_mode(Image.open(BytesIO(encoded)), "RGB"))
+    numpy_io = ImageMediaIO(format="np")
+    tensor_io = ImageMediaIO(format="pt")
+
+    numpy_from_bytes = numpy_io.load_bytes(encoded)
+    numpy_from_base64 = numpy_io.load_base64(
+        f"image/{image_format.lower()}", base64.b64encode(encoded).decode()
+    )
+    tensor_from_bytes = tensor_io.load_bytes(encoded)
+    tensor_from_base64 = tensor_io.load_base64(
+        f"image/{image_format.lower()}", base64.b64encode(encoded).decode()
+    )
+    expected_tensor = (
+        torch.from_numpy(np.array(expected, copy=True))
+        .permute(2, 0, 1)
+        .to(dtype=torch.get_default_dtype())
+        .div_(255)
+    )
+
+    np.testing.assert_array_equal(numpy_from_bytes, expected)
+    np.testing.assert_array_equal(numpy_from_base64, expected)
+    torch.testing.assert_close(tensor_from_bytes, expected_tensor, rtol=0, atol=0)
+    torch.testing.assert_close(tensor_from_base64, expected_tensor, rtol=0, atol=0)
+    assert numpy_from_bytes.flags.c_contiguous
+    assert numpy_from_base64.flags.c_contiguous
+    assert tensor_from_bytes.is_contiguous()
+    assert tensor_from_base64.is_contiguous()
 
 
 class TestMultimodalLoadErrorPropagation:

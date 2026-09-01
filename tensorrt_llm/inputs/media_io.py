@@ -248,6 +248,37 @@ def _load_and_convert_image(image):
     return convert_image_mode(image, "RGB")
 
 
+def _decode_common_image(data: bytes) -> Optional[torch.Tensor]:
+    """Decode common 8-bit images directly to an RGB tensor.
+
+    Return ``None`` for formats or modes whose conversion semantics differ so
+    the caller can keep PIL as the compatibility path.
+    """
+    from torchvision.io import ImageReadMode, decode_image
+
+    try:
+        encoded = torch.frombuffer(bytearray(data), dtype=torch.uint8)
+        decoded = decode_image(
+            encoded,
+            mode=ImageReadMode.UNCHANGED,
+            apply_exif_orientation=False,
+        )
+    except RuntimeError:
+        decoded = None
+
+    if (
+        decoded is not None
+        and decoded.dtype is torch.uint8
+        and decoded.ndim == 3
+        and decoded.shape[0] in (1, 3)
+    ):
+        if decoded.shape[0] == 1:
+            decoded = decoded.expand(3, -1, -1)
+        return decoded
+
+    return None
+
+
 def _audio_frame_to_array(frame, mono: bool) -> np.ndarray:
     """Convert a PyAV audio frame to a NumPy array, averaging channels if mono."""
     chunk = frame.to_ndarray()
@@ -842,12 +873,23 @@ class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
         return image
 
     def load_bytes(self, data: bytes) -> Union[Image.Image, torch.Tensor, np.ndarray]:
+        if self._format in ("np", "pt"):
+            decoded = _decode_common_image(data)
+            if decoded is not None:
+                if self._format == "np":
+                    return decoded.permute(1, 2, 0).contiguous().numpy()
+                return (
+                    decoded.contiguous()
+                    .to(dtype=torch.get_default_dtype())
+                    .div_(255)
+                    .to(device=self._device)
+                )
         return self._postprocess(_load_and_convert_image(BytesIO(data)))
 
     def load_base64(
         self, media_type: str, data: str
     ) -> Union[Image.Image, torch.Tensor, np.ndarray]:
-        return self._postprocess(_load_and_convert_image(BytesIO(base64.b64decode(data))))
+        return self.load_bytes(base64.b64decode(data))
 
     def load_file(self, url: str) -> Union[Image.Image, torch.Tensor, np.ndarray]:
         return self._postprocess(_load_and_convert_image(Path(_normalize_file_uri(url))))
