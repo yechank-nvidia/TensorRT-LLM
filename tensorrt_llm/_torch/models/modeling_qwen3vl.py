@@ -14,6 +14,7 @@ from typing import Mapping as TypingMapping
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from PIL import Image
@@ -1385,7 +1386,15 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         cos, sin = self.rot_pos_emb(grid_rows)
         pos_embeds = self.fast_pos_embed_interpolate(grid_rows)
 
-        hidden_states = self.patch_embed(pixel_values)
+        # The patch projection's kernel and stride both cover one complete
+        # patch, so its Conv3d is exactly a linear projection of independent
+        # flattened patches. GEMM avoids the much slower convolution setup.
+        patch_weight = self.patch_embed.proj.weight
+        hidden_states = F.linear(
+            pixel_values.reshape(-1, patch_weight[0].numel()).to(patch_weight.dtype),
+            patch_weight.flatten(1),
+            self.patch_embed.proj.bias,
+        )
         hidden_states += pos_embeds
         hidden_states = hidden_states.flatten(1)
 

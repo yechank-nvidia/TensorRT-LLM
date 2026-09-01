@@ -530,6 +530,37 @@ def test_qwen3_vision_prepare_metadata_passes_fixed_max_seq_len(
     assert calls == [(seq_lens, metadata, fixed_max_seq_len)]
 
 
+def test_qwen3_vision_patch_projection_matches_conv3d() -> None:
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionPatchEmbed
+
+    config = SimpleNamespace(
+        patch_size=4,
+        temporal_patch_size=2,
+        in_channels=3,
+        hidden_size=8,
+    )
+    patch_embed = Qwen3VLVisionPatchEmbed(config)
+    pixel_values = torch.randn(6, 3 * 2 * 4 * 4)
+    expected = patch_embed(pixel_values)
+
+    vision = Qwen3VisionModel.__new__(Qwen3VisionModel)
+    torch.nn.Module.__init__(vision)
+    vision.patch_embed = patch_embed
+    vision.attn_metadata = object()
+    vision._rope_position_ids_buffer = None
+    vision.rot_pos_emb = lambda grid: (
+        torch.empty(6, 0),
+        torch.empty(6, 0),
+    )
+    vision.fast_pos_embed_interpolate = lambda grid: torch.zeros_like(expected)
+    vision.prepare_attn_metadata = lambda seq_lens, metadata: metadata
+    vision._run_blocks = lambda hidden_states, *args: (hidden_states, [])
+
+    actual, _ = vision(pixel_values, torch.tensor([[1, 2, 3]]))
+
+    torch.testing.assert_close(actual, expected)
+
+
 def test_qwen3_vision_run_blocks_uses_encoder_graph() -> None:
     class FakeGraphRunner:
         def __init__(self) -> None:
