@@ -15,7 +15,8 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
-from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import (MultimodalParams,
+                                            MultimodalRuntimeData)
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.sampling_params import LogprobMode
 
@@ -1488,6 +1489,14 @@ def executor_request_to_llm_request(
     if getattr(executor_request, "py_scheduling_params", None) is not None:
         agent_hierarchy = executor_request.py_scheduling_params.agent_hierarchy
 
+    py_multimodal_data = getattr(executor_request, "py_multimodal_data", None)
+    if py_multimodal_data is not None:
+        # The request broadcaster sends small shared-memory handles instead of
+        # pickling raw tensors. Rebuild a local tensor view on each executor rank.
+        multimodal_params = MultimodalParams(multimodal_data=py_multimodal_data)
+        multimodal_params.to_tensor("multimodal_data")
+        py_multimodal_data = multimodal_params.multimodal_data
+
     # Audio encoder-decoder models (e.g. Whisper) carry the encoder input as a
     # feature tensor, not encoder token ids. Route it into the request's native
     # encoder_input_features / encoder_output_len fields so the C++ state machine
@@ -1495,7 +1504,7 @@ def executor_request_to_llm_request(
     # length rather than a token count.
     encoder_input_features = None
     encoder_output_len = None
-    py_mm_data = getattr(executor_request, "py_multimodal_data", None) or {}
+    py_mm_data = py_multimodal_data or {}
     audio_mm_data = py_mm_data.get("audio") or {}
     if isinstance(audio_mm_data, dict):
         # Only enc-dec input processors emit encoder_input_features (decoder-only
@@ -1581,8 +1590,7 @@ def executor_request_to_llm_request(
         context_phase_params=executor_request.context_phase_params,
         cache_salt=executor_request.cache_salt,
         arrival_time=getattr(executor_request, "py_arrival_time", None),
-        py_multimodal_data=getattr(executor_request, "py_multimodal_data",
-                                   None),
+        py_multimodal_data=py_multimodal_data,
         py_mm_item_order=getattr(executor_request, "py_mm_item_order", None),
         kv_cache_retention_config=executor_request.kv_cache_retention_config,
         agent_hierarchy=agent_hierarchy,

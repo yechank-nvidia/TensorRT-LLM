@@ -539,10 +539,18 @@ class BaseWorker(GenerationExecutor):
                 executor_request.py_disaggregated_params = request.disaggregated_params
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
-                    # Resolve SharedTensorContainer dicts inside multimodal_data, including
-                    # E/P handoff embedding handles parked under "multimodal_embedding".
-                    request.multimodal_params.to_tensor("multimodal_data")
-                    executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
+                    if "multimodal_embedding" in request.multimodal_params.multimodal_data:
+                        # Preserve the existing CUDA-IPC handoff for precomputed
+                        # embeddings; the deferred path below targets raw CPU inputs.
+                        request.multimodal_params.to_tensor("multimodal_data")
+                        executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
+                    else:
+                        # Broadcast only the handles, but retain local views on the
+                        # GenerationRequest so their shared storage stays alive until
+                        # every executor rank has rebuilt its own view.
+                        shared_multimodal_data = request.multimodal_params.multimodal_data
+                        request.multimodal_params.to_tensor("multimodal_data")
+                        executor_request.py_multimodal_data = shared_multimodal_data
                 if request.multimodal_params.mm_item_order:
                     executor_request.py_mm_item_order = request.multimodal_params.mm_item_order
 

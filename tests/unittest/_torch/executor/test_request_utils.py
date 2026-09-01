@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.request_utils import (
@@ -28,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.conversation_params import ConversationParams
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.mapping import CpType
 
 pytestmark = pytest.mark.cpu_only
@@ -133,6 +135,25 @@ def test_executor_request_to_llm_request_adopts_context_phase_draft_tokens() -> 
     assert llm_request.draft_tokens == draft_tokens
     assert llm_request.py_draft_tokens == draft_tokens
     assert llm_request.context_phase_params.draft_tokens == draft_tokens
+
+
+def test_executor_request_restores_shared_multimodal_tensors() -> None:
+    pixel_values = torch.arange(12, dtype=torch.float32).reshape(1, 3, 2, 2)
+    multimodal_params = MultimodalParams(multimodal_data={"image": {"pixel_values": pixel_values}})
+    multimodal_params.to_handle("multimodal_data")
+
+    executor_request = trtllm.Request(input_token_ids=[1], max_tokens=1)
+    executor_request.py_multimodal_data = multimodal_params.multimodal_data
+
+    llm_request = executor_request_to_llm_request(
+        42,
+        executor_request,
+        child_req_ids=[],
+        exclude_last_generation_logits=False,
+    )
+
+    restored = llm_request.py_multimodal_data["image"]["pixel_values"]
+    assert torch.equal(restored, pixel_values)
 
 
 def test_merge_helix_requests_with_padding():

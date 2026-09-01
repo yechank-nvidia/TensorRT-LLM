@@ -1,6 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import sys
 import time
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -17,6 +21,7 @@ from utils.util import skip_single_gpu
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
 from tensorrt_llm.executor.utils import RequestError
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -49,6 +54,49 @@ def test_enqueue_request_wraps_lora_load_error():
 
     with pytest.raises(RequestError, match="Failed to load LoRA adapter"):
         worker._enqueue_request(request)
+
+
+@pytest.mark.cpu_only
+def test_enqueue_request_keeps_shared_multimodal_storage_alive():
+    import tensorrt_llm.executor.base_worker as base_worker_module
+
+    class CapturingRequest:
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+    pixel_values = torch.arange(12, dtype=torch.float32).reshape(1, 3, 2, 2)
+    multimodal_params = MultimodalParams(
+        multimodal_data={"image": {
+            "pixel_values": pixel_values
+        }})
+    multimodal_params.to_handle("multimodal_data")
+    request = GenerationRequest(
+        prompt_token_ids=[1],
+        sampling_params=SamplingParams(max_tokens=1),
+        multimodal_params=multimodal_params,
+    )
+    request.set_id(42)
+
+    worker = MagicMock()
+    worker._lora_manager = None
+    worker._is_pytorch_backend = True
+    worker._executor_config = None
+    worker.llm_args = MagicMock()
+    worker.llm_args.max_beam_width = 1
+    worker.llm_args.return_perf_metrics = False
+    worker.max_seq_len = None
+    worker.engine.enqueue_request.return_value = 42
+
+    with patch.object(base_worker_module.tllm, "Request", CapturingRequest):
+        BaseWorker._enqueue_request(worker, request)
+
+    wire_data = worker.engine.enqueue_request.call_args.args[
+        0].py_multimodal_data
+    assert "method_key" in wire_data["image"]["pixel_values"]
+    assert torch.equal(
+        request.multimodal_params.multimodal_data["image"]["pixel_values"],
+        pixel_values)
 
 
 def test_lora_request_does_not_probe_filesystem_on_init(tmp_path):
