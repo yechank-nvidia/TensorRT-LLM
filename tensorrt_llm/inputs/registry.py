@@ -397,6 +397,32 @@ class BaseMultimodalInputProcessor(ABC):
             inputs = self._detokenize_to_text_prompt(inputs, sampling_params)
         return self.call_with_text_prompt(inputs, sampling_params)
 
+    def _process_with_hashes(
+        self,
+        inputs: TextPrompt,
+        sampling_params: SamplingParams,
+        mm_hashes: Mapping[str, List[str]],
+        mm_processor_kwargs_hash: Optional[str],
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        """Process one request after its existing media hashes are available.
+
+        The default preserves the ordinary processor path. Models that can
+        safely share prompt-independent work override this internal hook.
+        """
+        return self(inputs, sampling_params)
+
+    def set_processor_artifact_cache_max_bytes(self, max_bytes: int) -> None:
+        """Configure retained processor artifacts for an opted-in model."""
+        if max_bytes:
+            raise ValueError(
+                f"{type(self).__name__} does not support processor artifact caching"
+            )
+
+    @property
+    def processor_artifact_cache_enabled(self) -> bool:
+        """Whether request processing should reuse cached processor artifacts."""
+        return False
+
     @abstractmethod
     def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
@@ -1355,8 +1381,23 @@ def create_input_processor_with_hash(
         mm_hashes, mm_uuids_by_key = apply_mm_hashes(mm_data, mm_uuids,
                                                      hash_lib)
 
-        prompt_token_ids, extra_processed_inputs = input_processor(
-            inputs, sampling_params)
+        processor_artifact_cache_enabled = bool(
+            getattr(input_processor, "processor_artifact_cache_enabled", False))
+        mm_processor_kwargs_hash = None
+        if encoder_cache_enabled or processor_artifact_cache_enabled:
+            mm_processor_kwargs_hash = _hash_mm_processor_kwargs(
+                inputs.get("mm_processor_kwargs") or {}, hash_lib)
+
+        if processor_artifact_cache_enabled:
+            prompt_token_ids, extra_processed_inputs = input_processor._process_with_hashes(
+                inputs,
+                sampling_params,
+                mm_hashes,
+                mm_processor_kwargs_hash,
+            )
+        else:
+            prompt_token_ids, extra_processed_inputs = input_processor(
+                inputs, sampling_params)
         if extra_processed_inputs is None:
             extra_processed_inputs = {}
         multimodal_data = extra_processed_inputs.setdefault(
@@ -1366,8 +1407,7 @@ def create_input_processor_with_hash(
                 "extra_processed_inputs['multimodal_data'] must be a dict")
         if encoder_cache_enabled:
             multimodal_data[
-                "mm_processor_kwargs_hash"] = _hash_mm_processor_kwargs(
-                    inputs.get("mm_processor_kwargs") or {}, hash_lib)
+                "mm_processor_kwargs_hash"] = mm_processor_kwargs_hash
             multimodal_data[
                 "mm_processor_version"] = input_processor.processor_version
 

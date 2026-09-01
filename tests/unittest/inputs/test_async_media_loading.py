@@ -310,6 +310,23 @@ def test_multimodal_server_cpu_limits_are_consistent():
             max_cpu_bytes_per_request=2048,
         )
 
+    config = MultimodalServerConfig(
+        max_cpu_bytes=4096,
+        max_cpu_bytes_per_request=1024,
+        processor_cache_max_bytes=2048,
+    )
+    assert config.processor_cache_max_bytes == 2048
+
+    with pytest.raises(ValueError, match="max_cpu_bytes is required"):
+        MultimodalServerConfig(processor_cache_max_bytes=1024)
+
+    with pytest.raises(ValueError, match="one request must fit"):
+        MultimodalServerConfig(
+            max_cpu_bytes=2048,
+            max_cpu_bytes_per_request=1024,
+            processor_cache_max_bytes=2048,
+        )
+
 
 def test_cpu_storage_bytes_counts_shared_tensor_metadata_once():
     handle = {

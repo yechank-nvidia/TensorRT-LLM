@@ -762,12 +762,20 @@ class OpenAIServer(_VideoRoutesMixin):
                     merged.setdefault(modality, {}).update(kw)
                 cfg.media_io_kwargs = merged
                 self.multimodal_server_config = cfg
+            cache_max_bytes = (
+                self.multimodal_server_config.processor_cache_max_bytes
+                if self.multimodal_server_config is not None else 0)
+            if cache_max_bytes:
+                ip.set_processor_artifact_cache_max_bytes(cache_max_bytes)
         self._mm_cpu_request_slots: Optional[asyncio.BoundedSemaphore] = None
         if (self.multimodal_server_config is not None
                 and self.multimodal_server_config.max_cpu_bytes is not None):
             request_bytes = self.multimodal_server_config.max_cpu_bytes_per_request
             assert request_bytes is not None
-            num_slots = self.multimodal_server_config.max_cpu_bytes // request_bytes
+            live_bytes = (
+                self.multimodal_server_config.max_cpu_bytes -
+                self.multimodal_server_config.processor_cache_max_bytes)
+            num_slots = live_bytes // request_bytes
             self._mm_cpu_request_slots = asyncio.BoundedSemaphore(num_slots)
         self.allow_request_chat_template = allow_request_chat_template
         self._internal_disagg_auth_key = internal_disagg_auth_key

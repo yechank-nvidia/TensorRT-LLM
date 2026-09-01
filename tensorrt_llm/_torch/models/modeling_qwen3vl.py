@@ -4,8 +4,11 @@
 import copy
 import math
 import re
+import threading
+from collections import OrderedDict
+from concurrent.futures import Future
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Sequence, Tuple, Union
 from typing import Mapping as TypingMapping
 
 import numpy as np
@@ -38,6 +41,7 @@ from ...inputs import (
 )
 from ...inputs.multimodal import DisaggPrefillMultimodalInputs, MultimodalParams
 from ...logger import logger
+from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..attention_backend.utils import get_attention_backend
@@ -231,6 +235,35 @@ def _decide_do_sample_frames(
     return False
 
 
+class _Qwen3VLImageProcessorSingleFlight:
+    """Preserve the HF processor interface while sharing one active call."""
+
+    def __init__(
+        self,
+        owner: "Qwen3VLInputProcessorBase",
+        image_processor: Any,
+        artifact_key: Hashable,
+    ) -> None:
+        self._owner = owner
+        self._image_processor = image_processor
+        self._artifact_key = artifact_key
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._image_processor, name)
+
+    def __call__(self, *args, **kwargs) -> Dict[str, Any]:
+        artifact = self._owner._get_image_processor_artifact(
+            self._artifact_key,
+            self._image_processor,
+            *args,
+            **kwargs,
+        )
+        # HF may mutate the top-level mapping while constructing its combined
+        # output. The owner also returns request-owned tensor storage because
+        # downstream CPU IPC conversion changes the tensor's storage lifetime.
+        return dict(artifact)
+
+
 class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
     """Qwen3-VL input processor.
 
@@ -258,6 +291,138 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         )
         # Qwen3-VL keeps ``torch_dtype`` only on ``text_config`` under transformers 5.x.
         self._dtype = self.config.text_config.dtype
+        self._processor_artifacts_in_flight: Dict[Hashable, Future] = {}
+        self._processor_artifacts_lock = threading.Lock()
+        self._processor_artifacts_ready: OrderedDict[Hashable, Tuple[Any, int]] = OrderedDict()
+        self._processor_artifacts_ready_bytes = 0
+        self._processor_artifact_cache_max_bytes = 0
+
+    def set_processor_artifact_cache_max_bytes(self, max_bytes: int) -> None:
+        """Set the byte-bounded LRU capacity for completed image artifacts."""
+        if max_bytes < 0:
+            raise ValueError("processor artifact cache size cannot be negative")
+        with self._processor_artifacts_lock:
+            self._processor_artifact_cache_max_bytes = max_bytes
+            while (
+                self._processor_artifacts_ready
+                and self._processor_artifacts_ready_bytes > max_bytes
+            ):
+                _, (_, artifact_bytes) = self._processor_artifacts_ready.popitem(last=False)
+                self._processor_artifacts_ready_bytes -= artifact_bytes
+
+    @property
+    def processor_artifact_cache_enabled(self) -> bool:
+        return self._processor_artifact_cache_max_bytes > 0
+
+    @staticmethod
+    def _image_processor_artifact_bytes(artifact) -> int:
+        seen_storages = set()
+        total_bytes = 0
+        for value in artifact.values():
+            if not isinstance(value, torch.Tensor) or value.device.type != "cpu":
+                continue
+            storage = value.untyped_storage()
+            storage_key = (storage.data_ptr(), storage.nbytes())
+            if storage_key in seen_storages:
+                continue
+            seen_storages.add(storage_key)
+            total_bytes += storage.nbytes()
+        return total_bytes
+
+    @staticmethod
+    def _clone_image_processor_artifact(artifact) -> Dict[str, Any]:
+        """Give one request private tensors before CPU IPC conversion."""
+        return {
+            key: value.clone() if isinstance(value, torch.Tensor) else value
+            for key, value in artifact.items()
+        }
+
+    def _cache_image_processor_artifact(self, artifact_key: Hashable, artifact) -> None:
+        artifact_bytes = self._image_processor_artifact_bytes(artifact)
+        with self._processor_artifacts_lock:
+            max_bytes = self._processor_artifact_cache_max_bytes
+            if artifact_bytes <= 0 or artifact_bytes > max_bytes:
+                return
+            existing = self._processor_artifacts_ready.pop(artifact_key, None)
+            if existing is not None:
+                self._processor_artifacts_ready_bytes -= existing[1]
+            while (
+                self._processor_artifacts_ready
+                and self._processor_artifacts_ready_bytes + artifact_bytes > max_bytes
+            ):
+                _, (_, evicted_bytes) = self._processor_artifacts_ready.popitem(last=False)
+                self._processor_artifacts_ready_bytes -= evicted_bytes
+            self._processor_artifacts_ready[artifact_key] = (artifact, artifact_bytes)
+            self._processor_artifacts_ready_bytes += artifact_bytes
+
+    def _process_with_hashes(
+        self,
+        inputs: TextPrompt,
+        sampling_params: SamplingParams,
+        mm_hashes: TypingMapping[str, List[str]],
+        mm_processor_kwargs_hash: Optional[str],
+    ):
+        """Share concurrent image preprocessing without caching prompt state."""
+        mm_data = inputs.get("multi_modal_data") or {}
+        images = mm_data.get("image")
+        image_hashes = mm_hashes.get("image")
+        if (
+            inputs.get("prompt") is None
+            or set(mm_data) != {"image"}
+            or not isinstance(images, list)
+            or not image_hashes
+            or len(images) != len(image_hashes)
+            or mm_processor_kwargs_hash is None
+        ):
+            return self(inputs, sampling_params)
+
+        artifact_key = (
+            "qwen3vl-image-processor-v1",
+            mm_processor_kwargs_hash,
+            tuple(image_hashes),
+        )
+        return self.call_with_text_prompt(
+            inputs,
+            sampling_params,
+            processor_artifact_key=artifact_key,
+        )
+
+    def _get_image_processor_artifact(
+        self,
+        artifact_key: Hashable,
+        image_processor,
+        *args,
+        **kwargs,
+    ):
+        with self._processor_artifacts_lock:
+            ready = self._processor_artifacts_ready.pop(artifact_key, None)
+            if ready is not None:
+                self._processor_artifacts_ready[artifact_key] = ready
+                return self._clone_image_processor_artifact(ready[0])
+            future = self._processor_artifacts_in_flight.get(artifact_key)
+            is_producer = future is None
+            if is_producer:
+                future = Future()
+                self._processor_artifacts_in_flight[artifact_key] = future
+
+        if not is_producer:
+            return self._clone_image_processor_artifact(future.result())
+
+        try:
+            artifact = image_processor(*args, **kwargs)
+            cached_artifact = self._clone_image_processor_artifact(artifact)
+            self._cache_image_processor_artifact(artifact_key, cached_artifact)
+            future.set_result(cached_artifact)
+            return artifact
+        except Exception as error:
+            future.set_exception(error)
+            raise
+        finally:
+            if not future.done():
+                future.cancel()
+            with self._processor_artifacts_lock:
+                if self._processor_artifacts_in_flight.get(artifact_key) is future:
+                    del self._processor_artifacts_in_flight[artifact_key]
 
     @classmethod
     def _build_temporal_block(
@@ -361,6 +526,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         text: Dict[str, Any],
         mm_data: Dict[str, Any],
         mm_processor_kwargs: Dict[str, Any],
+        processor_artifact_key: Optional[Hashable] = None,
     ):
         images = mm_data.get("image")
         video_datas = mm_data.get("video")
@@ -423,7 +589,16 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                 m["total_num_frames"] = len(vd.frames)
                 video_metadata.append(m)
 
-        return self.processor(
+        processor = self.processor
+        if processor_artifact_key is not None:
+            processor = copy.copy(processor)
+            processor.image_processor = _Qwen3VLImageProcessorSingleFlight(
+                self,
+                processor.image_processor,
+                processor_artifact_key,
+            )
+
+        return processor(
             text=[text],
             images=images,
             videos=videos,

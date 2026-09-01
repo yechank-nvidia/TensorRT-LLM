@@ -25,10 +25,14 @@ The tests bind ``_preprocess`` to a stand-in object so they exercise the
 control flow without constructing a real HF processor.
 """
 
+import threading
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VLInputProcessorBase,
@@ -53,6 +57,49 @@ def _call_preprocess(mm_data, mm_processor_kwargs):
         mm_processor_kwargs,
     )
     return fake_processor
+
+
+class _ControlledImageProcessor:
+    merge_size = 2
+
+    def __init__(self, *, fail_first=False):
+        self.calls = 0
+        self.fail_first = fail_first
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self._lock = threading.Lock()
+
+    def __call__(self, **kwargs):
+        with self._lock:
+            self.calls += 1
+            call = self.calls
+        self.started.set()
+        assert self.release.wait(timeout=5)
+        if self.fail_first and call == 1:
+            raise ValueError("processor failed")
+        return {
+            "pixel_values": torch.ones(2, 3),
+            "image_grid_thw": torch.tensor([[1, 2, 2]]),
+        }
+
+
+class _FakeCombinedProcessor:
+    def __init__(self, image_processor):
+        self.image_processor = image_processor
+
+    def __call__(self, *, images, **kwargs):
+        return self.image_processor(images=images)
+
+
+def _processor_with_single_flight(image_processor):
+    processor = object.__new__(Qwen3VLInputProcessorBase)
+    processor._processor = _FakeCombinedProcessor(image_processor)
+    processor._processor_artifacts_in_flight = {}
+    processor._processor_artifacts_lock = threading.Lock()
+    processor._processor_artifacts_ready = OrderedDict()
+    processor._processor_artifacts_ready_bytes = 0
+    processor._processor_artifact_cache_max_bytes = 0
+    return processor
 
 
 class TestDecideDoSampleFrames:
@@ -155,3 +202,109 @@ class TestPreprocessKwargsForwarding:
         # Resize/normalize knobs flow through unchanged.
         processor = _call_preprocess({}, {"max_pixels": 1234})
         assert processor.call_args.kwargs["max_pixels"] == 1234
+
+
+class TestImageProcessorSingleFlight:
+    def test_concurrent_same_key_runs_image_processor_once(self):
+        image_processor = _ControlledImageProcessor()
+        processor = _processor_with_single_flight(image_processor)
+        barrier = threading.Barrier(3)
+
+        def preprocess():
+            barrier.wait()
+            return processor._preprocess(
+                "prompt",
+                {"image": [[1]]},
+                {},
+                ("same-key",),
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(preprocess) for _ in range(2)]
+            barrier.wait()
+            assert image_processor.started.wait(timeout=5)
+            assert all(future.running() for future in futures)
+            image_processor.release.set()
+            outputs = [future.result(timeout=5) for future in futures]
+
+        assert image_processor.calls == 1
+        assert outputs[0] is not outputs[1]
+        assert torch.equal(outputs[0]["pixel_values"], outputs[1]["pixel_values"])
+        assert outputs[0]["pixel_values"].data_ptr() != outputs[1]["pixel_values"].data_ptr()
+        assert processor._processor_artifacts_in_flight == {}
+
+    def test_completed_artifact_is_not_retained(self):
+        image_processor = _ControlledImageProcessor()
+        image_processor.release.set()
+        processor = _processor_with_single_flight(image_processor)
+
+        for _ in range(2):
+            processor._preprocess(
+                "prompt",
+                {"image": [[1]]},
+                {},
+                ("same-key",),
+            )
+
+        assert image_processor.calls == 2
+        assert processor._processor_artifacts_in_flight == {}
+
+    def test_completed_artifact_is_reused_when_cache_is_enabled(self):
+        image_processor = _ControlledImageProcessor()
+        image_processor.release.set()
+        processor = _processor_with_single_flight(image_processor)
+        processor.set_processor_artifact_cache_max_bytes(48)
+
+        outputs = [
+            processor._preprocess(
+                "prompt",
+                {"image": [[1]]},
+                {},
+                ("same-key",),
+            )
+            for _ in range(2)
+        ]
+
+        assert image_processor.calls == 1
+        assert outputs[0] is not outputs[1]
+        cached = processor._processor_artifacts_ready[("same-key",)][0]
+        assert torch.equal(outputs[0]["pixel_values"], outputs[1]["pixel_values"])
+        assert outputs[0]["pixel_values"].data_ptr() != cached["pixel_values"].data_ptr()
+        assert outputs[1]["pixel_values"].data_ptr() != cached["pixel_values"].data_ptr()
+        assert processor._processor_artifacts_ready_bytes == 48
+
+    def test_cache_evicts_lru_artifact_to_stay_within_byte_limit(self):
+        image_processor = _ControlledImageProcessor()
+        image_processor.release.set()
+        processor = _processor_with_single_flight(image_processor)
+        processor.set_processor_artifact_cache_max_bytes(48)
+
+        for key in (("first",), ("second",), ("first",)):
+            processor._preprocess("prompt", {"image": [[1]]}, {}, key)
+
+        assert image_processor.calls == 3
+        assert list(processor._processor_artifacts_ready) == [("first",)]
+        assert processor._processor_artifacts_ready_bytes == 48
+
+    def test_failed_producer_is_removed_and_can_retry(self):
+        image_processor = _ControlledImageProcessor(fail_first=True)
+        image_processor.release.set()
+        processor = _processor_with_single_flight(image_processor)
+
+        with pytest.raises(ValueError, match="processor failed"):
+            processor._preprocess(
+                "prompt",
+                {"image": [[1]]},
+                {},
+                ("same-key",),
+            )
+
+        assert processor._processor_artifacts_in_flight == {}
+        output = processor._preprocess(
+            "prompt",
+            {"image": [[1]]},
+            {},
+            ("same-key",),
+        )
+        assert output["pixel_values"].shape == (2, 3)
+        assert image_processor.calls == 2

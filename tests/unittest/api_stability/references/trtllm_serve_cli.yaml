@@ -274,6 +274,15 @@ commands:
         is_flag: false
         flags:
         - "--max_multimodal_cpu_bytes_per_request"
+      max_multimodal_processor_cache_bytes:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--max_multimodal_processor_cache_bytes"
       max_seq_len:
         type: int
         default: null

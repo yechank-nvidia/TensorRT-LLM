@@ -226,6 +226,27 @@ class _KwargsHashFakeProcessor:
         return None
 
 
+class _ArtifactHashFakeProcessor(_KwargsHashFakeProcessor):
+    def __init__(self):
+        self.received_hashes = None
+        self.received_kwargs_hash = None
+
+    @property
+    def processor_artifact_cache_enabled(self):
+        return True
+
+    def _process_with_hashes(
+        self,
+        inputs,
+        sampling_params,
+        mm_hashes,
+        mm_processor_kwargs_hash,
+    ):
+        self.received_hashes = mm_hashes
+        self.received_kwargs_hash = mm_processor_kwargs_hash
+        return self(inputs, sampling_params)
+
+
 def test_processor_version_is_stable_for_startup_identity():
     class FakeProcessor(BaseMultimodalInputProcessor):
         @property
@@ -335,6 +356,24 @@ def test_disabled_encoder_cache_skips_mm_processor_kwargs_hash():
     kwargs_hash.assert_not_called()
     assert "mm_processor_kwargs_hash" not in extra["multimodal_data"]
     assert "mm_processor_version" not in extra["multimodal_data"]
+
+
+def test_artifact_processor_reuses_wrapper_hashes():
+    processor = _ArtifactHashFakeProcessor()
+    input_processor = create_input_processor_with_hash(processor)
+
+    _, extra = input_processor(
+        {
+            "prompt": "unused",
+            "multi_modal_data": {"image": [torch.tensor([1])]},
+            "mm_processor_kwargs": {"max_pixels": 1024},
+        },
+        sampling_params=None,
+    )
+
+    assert len(processor.received_hashes["image"]) == 1
+    assert processor.received_kwargs_hash is not None
+    assert "mm_processor_kwargs_hash" not in extra["multimodal_data"]
 
 
 def test_multimodal_embedding_lengths_exclude_special_tokens():

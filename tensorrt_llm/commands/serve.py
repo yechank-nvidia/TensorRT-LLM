@@ -1210,6 +1210,14 @@ def launch_visual_gen_server(
           "byte values such as '1GiB'. Defaults to the total multimodal CPU "
           "limit when that limit is set."),
     status="prototype")
+@stability_option(
+    "--max_multimodal_processor_cache_bytes",
+    type=str,
+    default=None,
+    help=("Maximum CPU storage retained for multimodal processor artifacts. "
+          "Accepts byte values such as '4GiB' and is reserved from "
+          "--max_multimodal_cpu_bytes. Disabled by default."),
+    status="prototype")
 @stability_option("--video_pruning_rate",
                   type=float,
                   default=None,
@@ -1315,6 +1323,7 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
           media_io_kwargs: Optional[str],
           max_multimodal_cpu_bytes: Optional[str],
           max_multimodal_cpu_bytes_per_request: Optional[str],
+          max_multimodal_processor_cache_bytes: Optional[str],
           agent_percentage: float, agent_types: Optional[str],
           video_pruning_rate: Optional[float], telemetry: bool,
           custom_module_dirs: list[Path], chat_template: Optional[str],
@@ -1489,6 +1498,9 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             max_cpu_bytes=_parse_binary_byte_string(max_multimodal_cpu_bytes),
             max_cpu_bytes_per_request=_parse_binary_byte_string(
                 max_multimodal_cpu_bytes_per_request),
+            processor_cache_max_bytes=(
+                _parse_binary_byte_string(max_multimodal_processor_cache_bytes)
+                or 0),
         )
 
         if grpc:

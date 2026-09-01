@@ -825,6 +825,7 @@ class MultimodalServerConfig():
     media_io_kwargs: Optional[dict] = None
     max_cpu_bytes: Optional[int] = None
     max_cpu_bytes_per_request: Optional[int] = None
+    processor_cache_max_bytes: int = 0
 
     def __post_init__(self) -> None:
         if self.max_cpu_bytes is not None and self.max_cpu_bytes <= 0:
@@ -832,6 +833,8 @@ class MultimodalServerConfig():
         if (self.max_cpu_bytes_per_request is not None
                 and self.max_cpu_bytes_per_request <= 0):
             raise ValueError("max_cpu_bytes_per_request must be positive")
+        if self.processor_cache_max_bytes < 0:
+            raise ValueError("processor_cache_max_bytes cannot be negative")
         if (self.max_cpu_bytes is not None
                 and self.max_cpu_bytes_per_request is None):
             self.max_cpu_bytes_per_request = self.max_cpu_bytes
@@ -840,6 +843,17 @@ class MultimodalServerConfig():
                 and self.max_cpu_bytes_per_request > self.max_cpu_bytes):
             raise ValueError(
                 "max_cpu_bytes_per_request cannot exceed max_cpu_bytes")
+        if self.processor_cache_max_bytes:
+            if self.max_cpu_bytes is None:
+                raise ValueError(
+                    "max_cpu_bytes is required when processor artifact cache is enabled"
+                )
+            assert self.max_cpu_bytes_per_request is not None
+            if (self.processor_cache_max_bytes + self.max_cpu_bytes_per_request
+                    > self.max_cpu_bytes):
+                raise ValueError(
+                    "processor cache and one request must fit within max_cpu_bytes"
+                )
 
 
 def _update_hash(hasher, item: object) -> None:

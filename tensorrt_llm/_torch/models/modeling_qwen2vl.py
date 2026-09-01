@@ -5,7 +5,7 @@ import copy
 import math
 import re
 from functools import lru_cache
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, Hashable, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -1139,8 +1139,13 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                              device=input_device).unsqueeze(1)
         return position_ids, mrope_position_deltas
 
-    def _preprocess(self, text: Dict[str, any], mm_data: Dict[str, any],
-                    mm_processor_kwargs: Dict[str, Any]):
+    def _preprocess(
+        self,
+        text: Dict[str, any],
+        mm_data: Dict[str, any],
+        mm_processor_kwargs: Dict[str, Any],
+        processor_artifact_key: Optional[Hashable] = None,
+    ):
         images = mm_data.get("image")
         video_datas = mm_data.get("video")
         if video_datas is not None:
@@ -1295,6 +1300,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         self,
         inputs: TextPrompt,
         sampling_params: SamplingParams,
+        *,
+        processor_artifact_key: Optional[Hashable] = None,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data, mm_processor_kwargs = inputs.get("prompt"), \
                         inputs.get("multi_modal_data", {}), inputs.get("mm_processor_kwargs", {})
@@ -1314,8 +1321,12 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                        return_tensors="pt").input_ids
             return input_ids[0].to(torch.int32).tolist(), None
 
-        processed_inputs = self._preprocess(text_prompt, mm_data,
-                                            mm_processor_kwargs)
+        processed_inputs = self._preprocess(
+            text_prompt,
+            mm_data,
+            mm_processor_kwargs,
+            processor_artifact_key,
+        )
 
         multimodal_data = {}
         pixel_values = processed_inputs.get('pixel_values', None)
