@@ -2090,7 +2090,16 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
     def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor,
                 **kwargs) -> torch.Tensor:
 
-        hidden_states = self.patch_embed(pixel_values)
+        # The patch projection's kernel and stride both cover one complete
+        # patch, so its Conv3d is exactly a linear projection of independent
+        # flattened patches. GEMM avoids the much slower convolution setup.
+        patch_weight = self.patch_embed.proj.weight
+        hidden_states = F.linear(
+            pixel_values.reshape(-1, patch_weight[0].numel()).to(
+                patch_weight.dtype),
+            patch_weight.flatten(1),
+            self.patch_embed.proj.bias,
+        )
 
         seq_len, _ = hidden_states.size()
         grid_rows = grid_thw.tolist()
