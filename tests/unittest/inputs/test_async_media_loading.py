@@ -9,6 +9,7 @@ Covers:
 - MultimodalDataTracker.retrieve_all_async gathers all modalities concurrently
 """
 
+import asyncio
 import base64
 import tempfile
 import threading
@@ -25,7 +26,13 @@ from PIL import Image
 import tensorrt_llm.inputs.media_io as media_io_module
 import tensorrt_llm.inputs.utils as utils_module
 from tensorrt_llm.inputs.media_io import _get_aiohttp_session
-from tensorrt_llm.inputs.utils import MultimodalDataTracker, async_load_audio, async_load_image
+from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
+from tensorrt_llm.inputs.utils import (
+    MultimodalDataTooLargeError,
+    MultimodalDataTracker,
+    async_load_audio,
+    async_load_image,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -183,8 +190,11 @@ class TestSessionReuse:
 
 
 class TestRetrieveAllAsync:
-    def _make_tracker(self) -> MultimodalDataTracker:
-        return MultimodalDataTracker(model_type="test_model")
+    def _make_tracker(self, max_bytes: int | None = None) -> MultimodalDataTracker:
+        return MultimodalDataTracker(
+            model_type="test_model",
+            multimodal_server_config=MultimodalServerConfig(max_cpu_bytes_per_request=max_bytes),
+        )
 
     def _inject(
         self,
@@ -243,3 +253,46 @@ class TestRetrieveAllAsync:
         data, embeddings = await tracker.retrieve_all_async()
         assert data is None
         assert embeddings is None
+
+    @pytest.mark.asyncio
+    async def test_shared_storage_is_counted_once(self):
+        storage = np.zeros((16,), dtype=np.uint8)
+        tracker = self._make_tracker(max_bytes=16)
+        self._inject(tracker, "image", [storage[:8], storage[8:]])
+
+        data, _ = await tracker.retrieve_all_async()
+
+        assert len(data["image"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_limit_cancels_remaining_items(self):
+        cancelled = asyncio.Event()
+
+        async def _oversized():
+            return np.zeros((17,), dtype=np.uint8)
+
+        async def _pending():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        tracker = self._make_tracker(max_bytes=16)
+        tracker._data["image"].extend([_oversized(), _pending()])
+
+        with pytest.raises(MultimodalDataTooLargeError, match="17 CPU bytes"):
+            await tracker.retrieve_all_async()
+
+        assert cancelled.is_set()
+
+
+def test_multimodal_server_cpu_limits_are_consistent():
+    config = MultimodalServerConfig(max_cpu_bytes=1024)
+    assert config.max_cpu_bytes_per_request == 1024
+
+    with pytest.raises(ValueError, match="cannot exceed"):
+        MultimodalServerConfig(
+            max_cpu_bytes=1024,
+            max_cpu_bytes_per_request=2048,
+        )

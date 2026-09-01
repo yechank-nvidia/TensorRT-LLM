@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 from collections import deque
 from types import SimpleNamespace
@@ -125,3 +126,18 @@ async def test_metrics_endpoint_reads_visual_gen_stats():
     assert _response_content(response) == stats
     assert server.generator.stats_timeouts == [None]
     assert server.metrics_collector.logged_stats == []
+
+
+@pytest.mark.asyncio
+async def test_multimodal_cpu_admission_limits_concurrent_requests():
+    server = object.__new__(OpenAIServer)
+    server._mm_cpu_request_slots = asyncio.BoundedSemaphore(1)
+
+    await server._acquire_mm_cpu_slot()
+    next_request = asyncio.create_task(server._acquire_mm_cpu_slot())
+    await asyncio.sleep(0)
+    assert not next_request.done()
+
+    server._mm_cpu_request_slots.release()
+    await next_request
+    server._mm_cpu_request_slots.release()
