@@ -2218,8 +2218,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         # Each `_process_*` helper below returns the *expanded prompt string*
         # (not tokenized ids) so mixed-modality requests can chain image →
         # video → audio expansions on one running prompt and tokenize once
-        # at the end. Single-modality requests take the same path (one
-        # expansion → tokenize), so single-modality behavior is unchanged.
+        # at the end. Image-only requests expand the already-tokenized short
+        # prompt below to avoid tokenizing thousands of repeated placeholders.
         text_prompt, mm_data = inputs.get("prompt"), inputs.get("multi_modal_data", {})
         images = mm_data.get("image", None)
         videos = mm_data.get("video", None)
@@ -2227,12 +2227,18 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
         multimodal_data: Dict[str, Any] = {}
         prompt = text_prompt
+        num_image_embeddings: List[int] = []
 
         if images is not None:
             if self.dynamic_tiler is not None:
                 image_data, prompt = self._process_images_dynamic(images, prompt)
+                num_image_embeddings = image_data["num_tokens_per_image"]
             else:
                 processed_images, prompt = self._process_images(images, prompt)
+                num_image_embeddings = [
+                    int(num_patches) * self.num_image_token
+                    for num_patches in processed_images["num_patches"]
+                ]
                 image_data = {
                     "pixel_values": processed_images["pixel_values"].to(self.dtype),
                     "num_patches": processed_images["num_patches"].sum(dim=0, keepdim=True),
@@ -2280,7 +2286,17 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             audio_data, prompt = self._process_audio(prompt, audios)
             multimodal_data["audio"] = audio_data
 
-        input_ids = self.tokenizer.encode(prompt, add_special_tokens=False, return_tensors="pt")
+        if images is not None and videos is None and audios is None:
+            num_wrapper_tokens = len(self._img_start_token_ids) + len(self._img_end_token_ids)
+            num_mm_tokens = [
+                num_embeddings + num_wrapper_tokens for num_embeddings in num_image_embeddings
+            ]
+            prompt_token_ids = self.tokenizer.encode(text_prompt, add_special_tokens=False)
+            input_ids = torch.tensor(
+                [self._expand_image_placeholders_in_token_ids(prompt_token_ids, num_mm_tokens)]
+            )
+        else:
+            input_ids = self.tokenizer.encode(prompt, add_special_tokens=False, return_tensors="pt")
         if not multimodal_data:
             return input_ids[0].to(torch.int32).tolist(), {}
 

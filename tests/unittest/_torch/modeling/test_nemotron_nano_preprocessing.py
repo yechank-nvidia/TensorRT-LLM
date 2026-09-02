@@ -379,6 +379,34 @@ class TestNanoV2VLInputProcessor:
         with pytest.raises(ValueError, match="doesn't match"):
             proc._process_images_dynamic(imgs, prompt)
 
+    def test_image_only_prompt_expands_token_ids(self):
+        proc = _make_processor()
+        proc.video_pruning_rate = 0.0
+        image = Image.new("RGB", (32, 32))
+        image_data = {
+            "pixel_values": [torch.zeros(3, 32, 32)],
+            "num_patches": torch.tensor([1]),
+            "image_sizes": [(32, 32)],
+            "num_tokens_per_image": [3],
+        }
+        proc._process_images_dynamic = mock.Mock(
+            return_value=(image_data, "unused expanded prompt")
+        )
+        proc.tokenizer.encode = mock.Mock(return_value=[1, proc.img_context_token_id, 2])
+
+        input_ids, _ = proc.call_with_text_prompt(
+            {
+                "prompt": "before <image> after",
+                "multi_modal_data": {"image": [image]},
+            },
+            sampling_params=None,
+        )
+
+        assert input_ids == [1, 500, 20, 20, 20, 501, 2]
+        proc.tokenizer.encode.assert_called_once_with(
+            "before <image> after", add_special_tokens=False
+        )
+
 
 @pytest.fixture
 def vision_encoder():
