@@ -672,10 +672,12 @@ def llms_and_encoder(
     encoder = instances[-1]
 
     with ExitStack() as stack:
+        # CUDA-IPC consumers must release their rebuilt views before the
+        # encoder process that exported the storage is shut down.
+        stack.enter_context(encoder)
         stack.enter_context(llm)
         if llm_decode is not None:
             stack.enter_context(llm_decode)
-        stack.enter_context(encoder)
         yield (llm, llm_decode), encoder
 
 
@@ -757,7 +759,7 @@ def _assert_handles_are_different(x: dict | None, y: dict | None) -> None:
         "tensor_stride",
     ]
 
-    different_keys = [
+    identity_keys = [
         "event_handle",
         "ref_counter_handle",
         "ref_counter_offset",
@@ -765,12 +767,21 @@ def _assert_handles_are_different(x: dict | None, y: dict | None) -> None:
         "storage_offset_bytes",
     ]
 
-    assert set(matching_keys + different_keys) == x.keys() == y.keys()
+    assert set(matching_keys + identity_keys) == x.keys() == y.keys()
 
     for key in matching_keys:
         assert x[key] == y[key]
-    for key in different_keys:
-        assert x[key] != y[key]
+    # CUDA caching allocations can have the same internal byte offset, and
+    # ref-counter slots can reuse either their handle or offset independently.
+    # The pairs, rather than every component, identify distinct resources.
+    assert (x["storage_handle"], x["storage_offset_bytes"]) != (
+        y["storage_handle"],
+        y["storage_offset_bytes"],
+    )
+    assert (x["ref_counter_handle"], x["ref_counter_offset"]) != (
+        y["ref_counter_handle"],
+        y["ref_counter_offset"],
+    )
 
 
 @pytest.mark.threadleak(enabled=False)
@@ -1190,7 +1201,8 @@ def test_epd_disagg_mm_hash_kv_cache_reuse(prompts):
 
     inputs = _load_inputs(llm_prefill, prompts, media)
 
-    with llm_prefill, encoder, llm_decode:
+    # Enter the IPC producer first so it exits after both consumers.
+    with encoder, llm_prefill, llm_decode:
         all_ep_hashes = []
         for inp in inputs:
             # E: encode
