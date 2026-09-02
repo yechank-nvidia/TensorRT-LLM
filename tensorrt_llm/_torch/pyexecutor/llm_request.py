@@ -15,7 +15,8 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
-from tensorrt_llm.inputs.multimodal import (MultimodalParams,
+from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
+                                            MultimodalParams,
                                             MultimodalRuntimeData)
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.sampling_params import LogprobMode
@@ -431,6 +432,7 @@ class PyResult:
                                list[float] | None] | None = None
         first_gen_log_probs: TokenLogprobs | None = None
         mm_embeddings: list[dict[str, Any] | None] = None
+        multimodal_layout: DisaggPrefillMultimodalInputs | None = None
         mrope_position_ids: dict[str, Any] | None = None
         mrope_position_deltas: dict[str, Any] | None = None
         additional_context_outputs_list: list[tuple[str, torch.Tensor]] = field(
@@ -476,6 +478,7 @@ class PyResult:
         self._log_probs = LogProbStorage() if return_log_probs else None
         self._first_gen_log_probs: Optional[TokenLogprobs] = None
         self._mm_embeddings: Optional[List[Dict[str, Any]]] = None
+        self._multimodal_layout: Optional[DisaggPrefillMultimodalInputs] = None
         self._mrope_position_ids = None
         self._mrope_position_deltas = None
         self._additional_context_outputs = {
@@ -516,6 +519,8 @@ class PyResult:
             self._first_gen_log_probs = diff.first_gen_log_probs
         if diff.mm_embeddings is not None:
             self._mm_embeddings = diff.mm_embeddings
+        if diff.multimodal_layout is not None:
+            self._multimodal_layout = diff.multimodal_layout
         if diff.mrope_position_ids is not None:
             self._mrope_position_ids = diff.mrope_position_ids
             self._mrope_position_deltas = diff.mrope_position_deltas
@@ -552,14 +557,20 @@ class PyResult:
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
 
-    def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
-                             mm_embedding_lengths: List[int]):
+    def append_mm_embeddings(
+        self,
+        mm_embeddings: torch.Tensor,
+        mm_embedding_lengths: List[int],
+        multimodal_layout: Optional[DisaggPrefillMultimodalInputs] = None,
+    ) -> None:
         """Split concatenated embeddings by per-item lengths and create handles.
 
         Args:
             mm_embeddings: Concatenated multimodal embeddings tensor of shape
                 [total_tokens, hidden_dim].
             mm_embedding_lengths: Per-item encoder-output embedding lengths.
+            multimodal_layout: Encoder-side prompt and item layout to reuse on
+                the prefill worker.
         """
         split_embeddings = torch.split(mm_embeddings,
                                        mm_embedding_lengths,
@@ -570,6 +581,8 @@ class PyResult:
             for emb in split_embeddings
         ]
         self.diff.mm_embeddings = self._mm_embeddings
+        self._multimodal_layout = multimodal_layout
+        self.diff.multimodal_layout = multimodal_layout
 
     def set_mrope_position(
         self,
@@ -681,6 +694,11 @@ class PyResult:
         return self._mm_embeddings
 
     @property
+    def multimodal_layout(self) -> DisaggPrefillMultimodalInputs | None:
+        """Return the encoder-side prompt and item layout for E/P handoff."""
+        return self._multimodal_layout
+
+    @property
     def mrope_position_ids_handle(self) -> Dict[str, Any] | None:
         # NOTE: when populated, the returned `dict` contains the information necessary to rebuild
         # the `SharedTensorContainer` using the `from_dict` class method.
@@ -725,7 +743,7 @@ class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
-         'first_gen_log_probs', 'mm_embedding_handles',
+         'first_gen_log_probs', 'mm_embedding_handles', 'multimodal_layout',
          'additional_context_outputs', 'additional_generation_outputs',
          'encoder_output', 'mrope_position_ids_handle',
          'mrope_position_deltas_handle'))

@@ -609,6 +609,7 @@ class GenerationResultBase:
                     ctx_dp_rank=context_phase_params.ctx_dp_rank,
                     ctx_info_endpoint=context_phase_params.disagg_info_endpoint,
                     multimodal_embedding_handles=None,
+                    multimodal_layout=None,
                 )
 
             finish_reasons = response_result.finish_reasons
@@ -655,10 +656,15 @@ class GenerationResultBase:
                 if self._disaggregated_params is not None:
                     self._disaggregated_params.multimodal_embedding_handles = mm_embedding_handles
                     self._disaggregated_params.multimodal_hashes = self._multimodal_hashes
+                    self._disaggregated_params.multimodal_layout = getattr(
+                        response_result, "multimodal_layout", None)
                 else:
                     self._disaggregated_params = DisaggregatedParams(
                         multimodal_embedding_handles=mm_embedding_handles,
-                        multimodal_hashes=self._multimodal_hashes)
+                        multimodal_hashes=self._multimodal_hashes,
+                        multimodal_layout=getattr(response_result,
+                                                  "multimodal_layout", None),
+                    )
 
             # Handle mrope handles for both:
             # 1. Regular mm_embedding case (disaggregated_params was just created/updated above)

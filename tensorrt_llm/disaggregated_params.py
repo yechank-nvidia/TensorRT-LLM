@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from tensorrt_llm.bindings import executor as tllme
+from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs
 
 
 class DisaggScheduleStyle(IntEnum):
@@ -48,6 +49,8 @@ class DisaggregatedParams:
          usage accounting on the generation server.
         multimodal_embedding_handles (List[Dict[str, Any]]): The resulting multimodal embedding handles from ViT.
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
+        multimodal_layout (DisaggPrefillMultimodalInputs): Encoder-side prompt
+         and item layout consumed by the prefill worker.
     """
 
     request_type: Optional[str] = None
@@ -72,6 +75,7 @@ class DisaggregatedParams:
     multimodal_hashes: Optional[List[List[int]]] = (
         None  # user provided mm hashes should be a list of 8 integers
     )
+    multimodal_layout: Optional[DisaggPrefillMultimodalInputs] = None
     mrope_position_ids_handle: Optional[Dict[str, Any]] = None
     mrope_position_deltas_handle: Optional[Dict[str, Any]] = None
 
@@ -135,3 +139,10 @@ class DisaggregatedParams:
                     np.iinfo(np.int32).min, np.iinfo(np.int32).max, size=8, dtype=np.int32
                 ).tolist()
                 self.multimodal_hashes = [vals] * len(self.multimodal_embedding_handles)
+            if self.multimodal_layout is not None and len(self.multimodal_embedding_handles) != len(
+                self.multimodal_layout.multimodal_embedding_lengths
+            ):
+                raise ValueError(
+                    "multimodal_embedding_handles and multimodal_layout must "
+                    "describe the same number of items"
+                )

@@ -14,6 +14,10 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 from tensorrt_llm._torch.pyexecutor.sampler import EarlyStopWithMMResult, MultimodalResult
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings.executor import FinishReason
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
+from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs
+from tensorrt_llm.llmapi.llm import BaseLLM
+from tensorrt_llm.sampling_params import SamplingParams
 
 
 @pytest.mark.parametrize(
@@ -169,18 +173,78 @@ def test_mm_encoder_sampler_aligns_mixed_batch_by_request_index():
 
 
 @pytest.mark.cpu_only
+def test_disagg_prefill_reuses_encoder_side_multimodal_layout():
+    """Prefill adopts the encoder layout without calling the legacy rebuilder."""
+
+    class _InputProcessor:
+        support_mm_disagg = True
+        mm_bidirectional_blocks = False
+
+        def build_disagg_prefill_multimodal_inputs(self, inputs, mm_handles):
+            raise AssertionError("encoder-provided layout should be reused")
+
+        def get_vocab_size(self):
+            return 128
+
+        def get_mm_token_ids(self):
+            return torch.tensor([99])
+
+        def get_mm_special_token_ids(self):
+            return None
+
+    layout = DisaggPrefillMultimodalInputs(
+        prompt_token_ids=[7, 99, 99, 8],
+        multimodal_lengths=[2],
+        multimodal_positions=[1],
+        multimodal_embedding_lengths=[2],
+        multimodal_item_run_cu_offsets=[0, 1],
+        multimodal_run_positions=[1],
+        multimodal_run_lengths=[2],
+    )
+    disaggregated_params = DisaggregatedParams(
+        multimodal_embedding_handles=[{"tensor_size": [2, 4]}],
+        multimodal_layout=layout,
+    )
+    llm = object.__new__(BaseLLM)
+    llm.args = SimpleNamespace(backend="pytorch")
+    llm._hf_model_config = SimpleNamespace(is_encoder_decoder=False)
+    llm.input_processor = _InputProcessor()
+
+    prompt_token_ids, _, multimodal_params, _ = llm._preprocess(
+        {"prompt": "unused by the encoder-provided layout"},
+        SamplingParams(),
+        disaggregated_params,
+    )
+
+    assert prompt_token_ids == layout.prompt_token_ids
+    assert multimodal_params.multimodal_input.multimodal_positions == [1]
+    assert multimodal_params.multimodal_input.multimodal_lengths == [2]
+    assert multimodal_params.multimodal_data["multimodal_embedding_lengths"] == [2]
+
+
+@pytest.mark.cpu_only
 def test_py_result_mm_embedding_handles_use_shared_tensor_handles():
     """MM encoder result handles should preserve the producer tensor device."""
     result = PyResult(prompt_len=1, max_new_tokens=1)
     source = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    layout = DisaggPrefillMultimodalInputs(
+        prompt_token_ids=[99, 99, 99, 99],
+        multimodal_lengths=[1, 3],
+        multimodal_positions=[0, 1],
+        multimodal_embedding_lengths=[1, 3],
+    )
 
-    result.append_mm_embeddings(source, [1, 3])
+    result.append_mm_embeddings(source, [1, 3], multimodal_layout=layout)
 
     handles = result.mm_embedding_handles
     assert handles is not None
     assert [handle["method_key"] for handle in handles] == [2, 2]
     restored = [SharedTensorContainer.from_dict(handle).get_local_view() for handle in handles]
     assert torch.equal(torch.cat(restored, dim=0), source)
+
+    follower = PyResult(prompt_len=1, max_new_tokens=1)
+    follower.apply_diff(result.get_diff())
+    assert follower.multimodal_layout == layout
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

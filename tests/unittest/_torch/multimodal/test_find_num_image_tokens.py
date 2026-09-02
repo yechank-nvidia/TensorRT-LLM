@@ -112,6 +112,17 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
             mm_embedding_handles = disagg_params.multimodal_embedding_handles
             assert mm_embedding_handles is not None
             assert len(mm_embedding_handles) == 1
+            rebuilt_layout = input_processor.build_disagg_prefill_multimodal_inputs(
+                inputs[image_idx], mm_embedding_handles)
+            encoder_layout = disagg_params.multimodal_layout
+            assert encoder_layout is not None
+            # The producer's request metadata is authoritative for cache/run
+            # ownership. The legacy E/P rebuilder additionally assigned a
+            # leading framing token to the MM run, but both paths must agree on
+            # the exact LLM token sequence and encoder-row layout.
+            assert encoder_layout.prompt_token_ids == rebuilt_layout.prompt_token_ids
+            assert (encoder_layout.multimodal_embedding_lengths ==
+                    rebuilt_layout.multimodal_embedding_lengths)
             actual_embedding = SharedTensorContainer.from_dict(
                 mm_embedding_handles[0]).get_local_view()
 

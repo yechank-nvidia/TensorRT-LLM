@@ -51,6 +51,7 @@ from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import add_new_tokens_to_requests
 from tensorrt_llm.executor.result import Logprob
+from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -358,7 +359,42 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
             request = requests[request_index]
             mm_embedding_lengths = state.data.mm_embedding_lengths[result_index]
 
-            request.py_result.append_mm_embeddings(mm_embedding, mm_embedding_lengths)
+            multimodal_layout = None
+            multimodal_positions = getattr(request, "multimodal_positions", None)
+            multimodal_lengths = getattr(request, "multimodal_lengths", None)
+            if multimodal_positions is not None and multimodal_lengths is not None:
+                mm_data = request.py_multimodal_data or {}
+                multimodal_layout = DisaggPrefillMultimodalInputs(
+                    prompt_token_ids=list(request.get_tokens(0)),
+                    multimodal_lengths=list(multimodal_lengths),
+                    multimodal_positions=list(multimodal_positions),
+                    multimodal_embedding_lengths=list(mm_embedding_lengths),
+                    multimodal_item_run_cu_offsets=(
+                        None
+                        if request.multimodal_item_run_cu_offsets is None
+                        else list(request.multimodal_item_run_cu_offsets)
+                    ),
+                    multimodal_run_positions=(
+                        None
+                        if request.multimodal_run_positions is None
+                        else list(request.multimodal_run_positions)
+                    ),
+                    multimodal_run_lengths=(
+                        None
+                        if request.multimodal_run_lengths is None
+                        else list(request.multimodal_run_lengths)
+                    ),
+                    special_token_offsets=mm_data.get("special_token_offsets"),
+                )
+
+            if multimodal_layout is None:
+                request.py_result.append_mm_embeddings(mm_embedding, mm_embedding_lengths)
+            else:
+                request.py_result.append_mm_embeddings(
+                    mm_embedding,
+                    mm_embedding_lengths,
+                    multimodal_layout=multimodal_layout,
+                )
 
             # Store mrope data if available
             if mrope_position_ids is not None and mrope_position_deltas is not None:

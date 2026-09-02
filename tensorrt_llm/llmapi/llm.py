@@ -938,12 +938,13 @@ class BaseLLM:
                     "Multimodal disaggregated inference is not supported for this model"
                 )
             mm_handles = disaggregated_params.multimodal_embedding_handles
-            # TODO(TRTLLM-12869): Pass encoder-side MM layout through
-            # DisaggregatedParams so prefill does not rebuild prompt tokens,
-            # positions, lengths, runs, special offsets, and cumsum here.
-            disagg_mm_inputs = (
-                self.input_processor.build_disagg_prefill_multimodal_inputs(
-                    inputs, mm_handles))
+            disagg_mm_inputs = disaggregated_params.multimodal_layout
+            if disagg_mm_inputs is None:
+                # Compatibility with handoffs produced before encoder-side
+                # prompt and item layout was carried in DisaggregatedParams.
+                disagg_mm_inputs = (
+                    self.input_processor.build_disagg_prefill_multimodal_inputs(
+                        inputs, mm_handles))
             if not isinstance(disagg_mm_inputs, DisaggPrefillMultimodalInputs):
                 raise TypeError(
                     "build_disagg_prefill_multimodal_inputs must return "
