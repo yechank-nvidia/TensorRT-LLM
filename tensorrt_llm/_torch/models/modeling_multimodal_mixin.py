@@ -41,10 +41,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
-from tensorrt_llm.inputs.registry import (
-    MultimodalEncoderItemMetadata,
-    get_multimodal_encoder_item_metadata,
-)
+from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.llmapi.llm_args import MultimodalEncoderSchedulingPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -587,13 +584,6 @@ class MultimodalModelMixin:
         """Delegate selected-item preparation to the encoder contract."""
         return MultimodalEncoderMixin.prepare_multimodal_encoder_inputs(self, selected_items)
 
-    @staticmethod
-    def _runs_by_request_modality(
-        selected_items: Sequence[tuple[MultimodalParams, int]],
-    ) -> Iterator[tuple[MultimodalParams, list[int], str, "MultimodalEncoderItemMetadata"]]:
-        """Delegate run construction to the encoder contract."""
-        yield from MultimodalEncoderMixin._runs_by_request_modality(selected_items)
-
     def forward_multimodal_encoder_items(
         self,
         encoder_inputs: Sequence[tuple[MultimodalParams, list[int], str]],
@@ -1055,18 +1045,6 @@ class MultimodalModelMixin:
         """Delegate raw item slicing to the encoder contract."""
         return MultimodalEncoderMixin.build_multimodal_encoder_input(
             self, param, item_indices, modality
-        )
-
-    @staticmethod
-    def _slice_per_item_sibling_fields(
-        modality_data: Dict[str, Any],
-        n_items: int,
-        item_indices: Sequence[int],
-        already_sliced: Iterable[str],
-    ) -> Dict[str, Any]:
-        """Delegate parallel metadata slicing to the encoder contract."""
-        return MultimodalEncoderMixin._slice_per_item_sibling_fields(
-            modality_data, n_items, item_indices, already_sliced
         )
 
     # A future optional mixin-owned forward can build on the same template method.

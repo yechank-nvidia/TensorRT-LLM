@@ -88,7 +88,7 @@ class MultimodalEncoderMixin:
                 run_indices,
                 modality,
                 item_metadata,
-        ) in self._runs_by_request_modality(selected_items):
+        ) in MultimodalEncoderMixin._runs_by_request_modality(selected_items):
             item_refs = item_metadata.item_refs
             try:
                 residual = self.build_multimodal_encoder_input(
@@ -299,8 +299,8 @@ class MultimodalEncoderMixin:
         sliced = {
             **modality_data,
             **sliced,
-            **self._slice_per_item_sibling_fields(modality_data, n_items, indices,
-                                                  sliced.keys()),
+            **MultimodalEncoderMixin._slice_per_item_sibling_fields(
+                modality_data, n_items, indices, sliced.keys()),
         }
         residual_input = (copy.copy(param.multimodal_input)
                           if param.multimodal_input is not None else None)
