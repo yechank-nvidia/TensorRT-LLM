@@ -1,3 +1,19 @@
+# Copyright 2026 NVIDIA CORPORATION & AFFILIATES
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 from unittest import mock
 
 import pytest
@@ -166,7 +182,8 @@ def test_fuse_input_embeds_with_chunked_multimodal_slice(device):
 
 @pytest.mark.parametrize("device", ["cpu"] +
                          (["cuda"] if torch.cuda.is_available() else []))
-def test_fuse_input_embeds_success_oov_path(device):
+@pytest.mark.parametrize("num_segments", [2, 3])
+def test_fuse_input_embeds_success_oov_path(device, num_segments):
     hidden = 8
     emb = make_embedding(num_embeddings=40, hidden_size=hidden, device=device)
 
@@ -179,18 +196,19 @@ def test_fuse_input_embeds_success_oov_path(device):
     text_idx, mm_idx = filter_mm_token_from_input_ids(
         input_ids, vocab_size=emb.num_embeddings)
     mm_emb = torch.randn(mm_idx.shape[0], hidden, device=device)
+    mm_segments = list(torch.tensor_split(mm_emb, num_segments))
 
     # kwargs path to produce fused embeddings
     out_ids, out_embeds = fuse_input_embeds(emb,
                                             input_ids,
-                                            mm_embeds=[mm_emb],
+                                            mm_embeds=mm_segments,
                                             mm_token_ids=None,
                                             text_token_indices=text_idx,
                                             mm_token_indices=mm_idx)
     # integrated filtering path to produce fused embeddings (not kwargs path)
     out_ids_v2, out_embeds_v2 = fuse_input_embeds(emb,
                                                   input_ids,
-                                                  mm_embeds=[mm_emb],
+                                                  mm_embeds=mm_segments,
                                                   mm_token_ids=None)
 
     assert out_ids is None

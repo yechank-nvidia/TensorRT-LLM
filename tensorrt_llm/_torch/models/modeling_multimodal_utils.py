@@ -595,7 +595,8 @@ def fuse_input_embeds(
             return input_ids, None, extra_embeds
         return input_ids, None
 
-    mm_embed = _join_embeddings(mm_embeds)
+    num_mm_rows = sum(mm_embed.shape[0] for mm_embed in mm_embeds)
+    embedding_dim = mm_embeds[0].shape[-1]
 
     if mm_token_indices is None or (mm_token_ids is None
                                     and text_token_indices is None):
@@ -604,10 +605,10 @@ def fuse_input_embeds(
             input_ids,
             vocab_size=embedding_layer.num_embeddings,
             mm_token_ids=mm_token_ids)
-    if mm_token_indices.shape[0] != mm_embed.shape[0]:
+    if mm_token_indices.shape[0] != num_mm_rows:
         raise ValueError(
             f"Multimodal token count mismatch: found {len(mm_token_indices)} image tokens in input_ids "
-            f"but received {mm_embed.shape[0]} image embeddings.")
+            f"but received {num_mm_rows} image embeddings.")
 
     if mm_token_ids is not None:
         # In-vocab fast path: caller declared mm tokens are real vocabulary
@@ -623,7 +624,7 @@ def fuse_input_embeds(
         # scatter into a fresh buffer.
         text_embed = embedding_layer(input_ids[text_token_indices])
         input_embeds = torch.empty(input_ids.shape[0],
-                                   mm_embed.shape[-1],
+                                   embedding_dim,
                                    device=text_embed.device,
                                    dtype=text_embed.dtype)
         input_embeds.index_copy_(0, text_token_indices, text_embed)
@@ -632,18 +633,35 @@ def fuse_input_embeds(
         for i, extra_feature in enumerate(extra_embeds):
             extra_embed = torch.zeros(
                 input_ids.shape[0],
-                mm_embed.shape[-1],
+                embedding_dim,
                 device=extra_feature.device,
                 dtype=extra_feature.dtype,
             )
             extra_embed.index_copy_(0, mm_token_indices, extra_feature)
             extra_embeds[i] = extra_embed
 
-    input_embeds.index_copy_(
-        0,
-        mm_token_indices,
-        mm_embed.to(dtype=input_embeds.dtype, device=input_embeds.device),
-    )
+    if len(mm_embeds) <= 2:
+        # Two direct scatters use no more GPU launches than one cat followed
+        # by one scatter, while avoiding the packed MM temporary altogether.
+        row_offset = 0
+        for mm_embed in mm_embeds:
+            next_offset = row_offset + mm_embed.shape[0]
+            input_embeds.index_copy_(
+                0,
+                mm_token_indices[row_offset:next_offset],
+                mm_embed.to(dtype=input_embeds.dtype,
+                            device=input_embeds.device),
+            )
+            row_offset = next_offset
+    else:
+        # Packing keeps many small segments to two GPU launches instead of
+        # issuing one scatter per segment.
+        mm_embed = torch.cat(mm_embeds, dim=0)
+        input_embeds.index_copy_(
+            0,
+            mm_token_indices,
+            mm_embed.to(dtype=input_embeds.dtype, device=input_embeds.device),
+        )
     if extra_embeds is not None and len(extra_embeds) > 0:
         return None, cast(torch.FloatTensor, input_embeds), extra_embeds
     return None, cast(torch.FloatTensor, input_embeds)
