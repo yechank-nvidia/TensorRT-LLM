@@ -27,12 +27,6 @@ from tensorrt_llm._utils import (global_mpi_rank, is_trace_enabled,
 from tensorrt_llm.bindings.internal import \
     batch_manager as batch_manager_bindings
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
-from tensorrt_llm.inputs.multimodal import (MultimodalParams,
-                                            MultimodalRuntimeData,
-                                            _has_mm_payload_keys,
-                                            check_mm_embed_cumsum_if_needed,
-                                            strip_mm_data_for_generation,
-                                            strip_mm_encoder_inputs)
 from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
                                           BaseMultimodalInputProcessor,
                                           create_input_processor,
@@ -43,6 +37,11 @@ from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           PrefillCudaGraphBackend,
                                           SeqLenAwareSparseAttentionConfig,
                                           TorchCompileConfig, TorchLlmArgs)
+
+from tensorrt_llm.inputs.multimodal import (  # isort: skip
+    MULTIMODAL_ENCODER_ITEM_MODE_KEY, MultimodalParams, MultimodalRuntimeData,
+    _has_mm_payload_keys, check_mm_embed_cumsum_if_needed,
+    strip_mm_data_for_generation, strip_mm_encoder_inputs)
 
 # isort: split
 from tensorrt_llm.llmapi.llm_args import validate_token_encoder_bucket_config
@@ -7038,9 +7037,11 @@ class PyTorchModelEngine(ModelEngine):
                         request),
                     mm_item_order=getattr(request, "py_mm_item_order", None),
                     input_ids_start_offset=context_start_idx)
-                multimodal_params.to_device("multimodal_data",
-                                            "cuda",
-                                            pin_memory=prefer_pinned())
+                if not multimodal_params.multimodal_data.get(
+                        MULTIMODAL_ENCODER_ITEM_MODE_KEY, False):
+                    multimodal_params.to_device("multimodal_data",
+                                                "cuda",
+                                                pin_memory=prefer_pinned())
                 multimodal_params_list.append(multimodal_params)
 
             request.py_batch_idx = request.py_seq_slot
@@ -8155,44 +8156,100 @@ class PyTorchModelEngine(ModelEngine):
             raise ValueError(
                 "mm_encoder_only expects one multimodal payload per context "
                 "request carrying py_multimodal_data")
-        mm_request_indices_with_payload = []
-        mm_params_with_payload = []
-        mm_embedding_lengths = []
+        full_requests = []
+        item_requests = []
         for (request_idx,
              request), multimodal_param in zip(mm_context_requests,
                                                multimodal_params):
             if not _has_mm_payload_keys(request.py_multimodal_data):
                 # mrope-only warmup request (no actual vision content) -> skip.
                 continue
-            multimodal_embedding_lengths = get_multimodal_embedding_lengths(
-                request)
-            if multimodal_embedding_lengths is None:
+            embedding_lengths = get_multimodal_embedding_lengths(request)
+            if embedding_lengths is None:
                 # Vision payload keys present but no pre-computed embedding
                 # lengths — skip to avoid a downstream sum(None) TypeError.
                 continue
-            mm_request_indices_with_payload.append(request_idx)
-            mm_params_with_payload.append(multimodal_param)
-            mm_embedding_lengths.append(multimodal_embedding_lengths)
-        if not mm_params_with_payload:
+            item_mode = multimodal_param.multimodal_data.get(
+                MULTIMODAL_ENCODER_ITEM_MODE_KEY, False)
+            if not isinstance(item_mode, bool):
+                raise TypeError(
+                    f"{MULTIMODAL_ENCODER_ITEM_MODE_KEY} must be a boolean")
+            request_info = (request_idx, multimodal_param, embedding_lengths)
+            if item_mode:
+                item_metadata = get_multimodal_encoder_item_metadata(
+                    multimodal_param.multimodal_data)
+                if item_metadata is None:
+                    raise ValueError(
+                        "Selected MM encoding requires encoder item metadata")
+                item_requests.append(request_info)
+            else:
+                full_requests.append(request_info)
+        if not full_requests and not item_requests:
             return {
                 'mm_embeddings': [],
                 'mm_embedding_request_indices': [],
                 'mm_embedding_lengths': [],
             }
-        # For mm_encoder_only mode, we only run the vision encoder part
-        # The model should be a vision encoder (e.g., Qwen2VisionModelBase)
-        mm_embeddings = self.model.forward(mm_params_with_payload)
-        assert len(
-            mm_embeddings
-        ) == 1, "mm_embeddings should be a 1-element list, mix modality (video+image) is not supported"
 
-        split_lengths = [sum(lengths) for lengths in mm_embedding_lengths]
-        mm_embeddings = list(torch.split(mm_embeddings[0], split_lengths,
-                                         dim=0))
-        if len(mm_embeddings) != len(mm_embedding_lengths):
-            raise ValueError(
-                "mm_encoder_only produced an embedding batch that does not "
-                "match mm_embedding_lengths")
+        outputs_by_request = {}
+        if full_requests:
+            full_params = [request_info[1] for request_info in full_requests]
+            full_embeddings = self.model.forward(full_params)
+            assert len(full_embeddings) == 1, (
+                "mm_embeddings should be a 1-element list, mix modality "
+                "(video+image) is not supported")
+            full_split_lengths = [
+                sum(request_info[2]) for request_info in full_requests
+            ]
+            split_outputs = list(
+                torch.split(full_embeddings[0], full_split_lengths, dim=0))
+            if len(split_outputs) != len(full_requests):
+                raise ValueError(
+                    "mm_encoder_only produced an embedding batch that does "
+                    "not match mm_embedding_lengths")
+            for request_info, output in zip(full_requests,
+                                            split_outputs,
+                                            strict=True):
+                outputs_by_request[request_info[0]] = (*request_info[1:],
+                                                       output)
+
+        if item_requests:
+            selected_items = []
+            for _, multimodal_param, embedding_lengths in item_requests:
+                selected_items.extend(
+                    (multimodal_param, item_idx)
+                    for item_idx in range(len(embedding_lengths)))
+            item_outputs = self.encode_multimodal_encoder_items(selected_items)
+            output_idx = 0
+            for request_idx, multimodal_param, embedding_lengths in item_requests:
+                request_outputs = item_outputs[output_idx:output_idx +
+                                               len(embedding_lengths)]
+                output_idx += len(embedding_lengths)
+                if len(request_outputs) != len(embedding_lengths):
+                    raise ValueError(
+                        "Selected MM encoder output count must match item count"
+                    )
+                output = (request_outputs[0] if len(request_outputs) == 1 else
+                          torch.cat(request_outputs, dim=0))
+                outputs_by_request[request_idx] = (multimodal_param,
+                                                   embedding_lengths, output)
+            if output_idx != len(item_outputs):
+                raise ValueError(
+                    "Selected MM encoder returned unexpected extra outputs")
+
+        mm_request_indices_with_payload = sorted(outputs_by_request)
+        mm_params_with_payload = [
+            outputs_by_request[request_idx][0]
+            for request_idx in mm_request_indices_with_payload
+        ]
+        mm_embedding_lengths = [
+            outputs_by_request[request_idx][1]
+            for request_idx in mm_request_indices_with_payload
+        ]
+        mm_embeddings = [
+            outputs_by_request[request_idx][2]
+            for request_idx in mm_request_indices_with_payload
+        ]
 
         # Extract mrope position data from multimodal_params if available
         mrope_position_ids_list = []

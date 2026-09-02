@@ -13,6 +13,8 @@ back empty; the row-count check in `forward_multimodal_encoder_items` turns that
 into a hard error, but only after the wasted encoder forward.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -24,11 +26,17 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     encode_multimodal_by_groups,
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_MODE_KEY,
+    MultimodalInput,
+    MultimodalParams,
+)
 from tensorrt_llm.inputs.registry import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalEncoderItemMetadata,
 )
+from tensorrt_llm.llmapi.llm import PreprocessedInputs
+from tensorrt_llm.llmapi.mm_encoder import _select_multimodal_encoder_items
 
 HIDDEN = 4
 # Rows the encoder emits per patch-grid item. Distinct values catch splits that
@@ -232,6 +240,66 @@ def test_model_engine_uses_standalone_encoder_provider(monkeypatch):
 
     assert len(outputs) == 1
     torch.testing.assert_close(outputs[0], _expected_rows(request, 1))
+    assert provider.encoder_calls == [ITEM_ROWS["image"][1]]
+
+
+@pytest.mark.cpu_only
+def test_encoder_only_request_executes_selected_preprocessed_items(monkeypatch):
+    """The llmapi boundary narrows logical metadata while H2D/forward sees
+    only the selected raw item."""
+    original = _make_request(["image", "image"])
+    original.multimodal_input = MultimodalInput.from_components(
+        [[0] * 8, [1] * 8],
+        [1, 10],
+        [2, 3],
+        ["first", "second"],
+        [0, 1, 3],
+        [1, 10, 12],
+        [2, 2, 1],
+    )
+    original.mm_item_order = [
+        {"modality": "image", "index": 0, "placeholder": "image"},
+        {"modality": "image", "index": 1, "placeholder": "image"},
+    ]
+    selected = _select_multimodal_encoder_items(
+        PreprocessedInputs(prompt_token_ids=list(range(16)), multimodal_params=original), [1]
+    )
+    selected_params = selected.multimodal_params
+    assert selected_params is not None
+    selected_metadata = selected_params.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    assert selected_metadata.item_refs == [("image", 1)]
+    assert selected_params.multimodal_data["multimodal_embedding_lengths"] == [3]
+    assert selected_params.multimodal_data[MULTIMODAL_ENCODER_ITEM_MODE_KEY] is True
+    assert selected_params.multimodal_input.multimodal_hashes == [[1] * 8]
+    assert selected_params.multimodal_input.multimodal_positions == [10]
+    assert selected_params.multimodal_input.multimodal_item_run_cu_offsets == [0, 2]
+    assert selected_params.multimodal_input.multimodal_run_positions == [10, 12]
+    assert selected_params.mm_item_order == [original.mm_item_order[1]]
+    assert (
+        selected_params.multimodal_data["image"]["pixel_values"]
+        is original.multimodal_data["image"]["pixel_values"]
+    )
+
+    provider = _GroupedEncoderProvider()
+    encoder_only_model = torch.nn.Module()
+    encoder_only_model.add_module("visual", provider)
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = encoder_only_model
+    monkeypatch.setattr(MultimodalParams, "to_device", lambda *args, **kwargs: None)
+    request = SimpleNamespace(
+        py_multimodal_data=selected_params.multimodal_data,
+        multimodal_lengths=selected_params.multimodal_input.multimodal_lengths,
+    )
+
+    result = engine._forward_step_mm_encoder_only(
+        {"multimodal_params": [selected_params]},
+        SimpleNamespace(context_requests=[request]),
+    )
+
+    assert result["mm_embedding_request_indices"] == [0]
+    assert result["mm_embedding_lengths"] == [[3]]
+    assert len(result["mm_embeddings"]) == 1
+    torch.testing.assert_close(result["mm_embeddings"][0], _expected_rows(original, 1))
     assert provider.encoder_calls == [ITEM_ROWS["image"][1]]
 
 

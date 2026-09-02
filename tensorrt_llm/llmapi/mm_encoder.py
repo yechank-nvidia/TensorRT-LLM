@@ -6,11 +6,113 @@ from tqdm import tqdm
 from tensorrt_llm._utils import nvtx_range_debug
 from tensorrt_llm.inputs import create_input_processor, prompt_inputs
 from tensorrt_llm.inputs.data import PromptInputs
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MULTIMODAL_ENCODER_ITEM_MODE_KEY,
+    MultimodalInput, MultimodalParams)
+from tensorrt_llm.inputs.registry import (MultimodalEncoderItemMetadata,
+                                          get_multimodal_encoder_item_metadata)
 from tensorrt_llm.sampling_params import SamplingParams
 
-from .llm import BaseLLM, RequestOutput, _TorchLLM
+from .llm import BaseLLM, PreprocessedInputs, RequestOutput, _TorchLLM
 from .llm_args import TorchLlmArgs
 from .mpi_session import external_mpi_comm_available
+
+
+def _select_multimodal_encoder_items(
+    inputs: PreprocessedInputs,
+    item_indices: Sequence[int],
+) -> PreprocessedInputs:
+    """Build one encoder-only request for the selected logical items.
+
+    Raw CPU payloads remain shared with the original preprocessed request. The
+    prompt-order metadata is narrowed here so every lower layer sees an
+    ordinary, self-consistent request and only needs a boolean item-mode gate.
+    """
+    params = inputs.multimodal_params
+    if params is None or params.multimodal_input is None:
+        raise ValueError(
+            "Selected MM encoding requires multimodal input metadata")
+    data = params.multimodal_data
+    item_metadata = get_multimodal_encoder_item_metadata(data)
+    if item_metadata is None:
+        raise ValueError("Selected MM encoding requires encoder item metadata")
+
+    indices = list(item_indices)
+    if not indices:
+        raise ValueError("item_indices must not be empty")
+    if not all(isinstance(item_idx, int) for item_idx in indices):
+        raise TypeError("item_indices must contain only integers")
+    if len(indices) != len(set(indices)):
+        raise ValueError("item_indices must not contain duplicates")
+    if any(item_idx < 0 or item_idx >= len(item_metadata.item_refs)
+           for item_idx in indices):
+        raise ValueError("item_indices contains an out-of-range item")
+
+    mm_input = params.multimodal_input
+    run_offsets = mm_input.multimodal_item_run_cu_offsets
+    if run_offsets is None:
+        selected_run_offsets = None
+        selected_run_positions = None
+        selected_run_lengths = None
+    else:
+        assert mm_input.multimodal_run_positions is not None
+        assert mm_input.multimodal_run_lengths is not None
+        selected_run_offsets = [0]
+        selected_run_positions = []
+        selected_run_lengths = []
+        for item_idx in indices:
+            run_begin = run_offsets[item_idx]
+            run_end = run_offsets[item_idx + 1]
+            selected_run_positions.extend(
+                mm_input.multimodal_run_positions[run_begin:run_end])
+            selected_run_lengths.extend(
+                mm_input.multimodal_run_lengths[run_begin:run_end])
+            selected_run_offsets.append(len(selected_run_positions))
+
+    selected_input = MultimodalInput.from_components(
+        [mm_input.multimodal_hashes[item_idx] for item_idx in indices],
+        [mm_input.multimodal_positions[item_idx] for item_idx in indices],
+        [mm_input.multimodal_lengths[item_idx] for item_idx in indices],
+        (None if mm_input.multimodal_uuids is None else
+         [mm_input.multimodal_uuids[item_idx] for item_idx in indices]),
+        selected_run_offsets,
+        selected_run_positions,
+        selected_run_lengths,
+    )
+    selected_metadata = MultimodalEncoderItemMetadata(
+        item_refs=[item_metadata.item_refs[item_idx] for item_idx in indices],
+        encoder_token_lengths=[
+            item_metadata.encoder_token_lengths[item_idx]
+            for item_idx in indices
+        ],
+        output_embedding_lengths=[
+            item_metadata.output_embedding_lengths[item_idx]
+            for item_idx in indices
+        ],
+    )
+    selected_data = dict(data or {})
+    selected_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = selected_metadata
+    selected_data["multimodal_embedding_lengths"] = list(
+        selected_metadata.output_embedding_lengths)
+    selected_data[MULTIMODAL_ENCODER_ITEM_MODE_KEY] = True
+    if "encoder_token_lengths" in selected_data:
+        selected_data["encoder_token_lengths"] = [
+            selected_data["encoder_token_lengths"][item_idx]
+            for item_idx in indices
+        ]
+
+    selected_order = (None if params.mm_item_order is None else
+                      [params.mm_item_order[item_idx] for item_idx in indices])
+    return PreprocessedInputs(
+        prompt_token_ids=list(inputs.prompt_token_ids),
+        multimodal_params=MultimodalParams(
+            multimodal_input=selected_input,
+            multimodal_data=selected_data,
+            mm_item_order=selected_order,
+        ),
+        encoder_input_token_ids=(None if inputs.encoder_input_token_ids is None
+                                 else list(inputs.encoder_input_token_ids)),
+    )
 
 
 class MultimodalEncoder(_TorchLLM):
