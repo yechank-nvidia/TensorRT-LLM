@@ -1527,11 +1527,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine = object.__new__(PyTorchModelEngine)
         engine.model = DummyMultimodalIndexModel()
 
-        text_indices, multimodal_indices = engine._prepare_multimodal_indices(
-            [1, 90, 2, 91, 3])
+        for input_ids in ([1, 90, 2, 91, 3], torch.tensor([1, 90, 2, 91, 3])):
+            text_indices, multimodal_indices = engine._prepare_multimodal_indices(
+                input_ids)
 
-        self.assertIsNone(text_indices)
-        torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
+            self.assertIsNone(text_indices)
+            torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
 
     def test_prepare_multimodal_indices_uses_legacy_token_ids(self) -> None:
         engine = object.__new__(PyTorchModelEngine)

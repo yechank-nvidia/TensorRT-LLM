@@ -4422,8 +4422,14 @@ class PyTorchModelEngine(ModelEngine):
 
         return total_num_tokens, False, attn_all_rank_num_tokens
 
-    def _prepare_multimodal_indices(self, input_ids: list[int]):
-        input_ids = torch.tensor(input_ids, dtype=torch.int, device="cpu")
+    def _prepare_multimodal_indices(self, input_ids: list[int] | torch.Tensor):
+        if isinstance(input_ids, torch.Tensor):
+            if input_ids.device.type != "cpu":
+                raise ValueError(
+                    "multimodal indices must be prepared from CPU input ids")
+            input_ids = input_ids.to(dtype=torch.int)
+        else:
+            input_ids = torch.tensor(input_ids, dtype=torch.int, device="cpu")
         vocab_size = self.model.config.vocab_size
         # `multimodal_token_ids` is the common wrapper-model contract. Keep the legacy name as a
         # fallback for models not yet migrated to `MultimodalModelMixin`.
@@ -5918,17 +5924,9 @@ class PyTorchModelEngine(ModelEngine):
 
         num_ctx_requests = scheduled_requests.num_context_requests
         num_ctx_tokens = len(input_ids)
-        if len(multimodal_params_list) > 0:
-            # input_ids holds only context tokens here; extend/draft tokens are
-            # appended below and are by construction text, so we reuse the
-            # CPU-side text_token_indices and just extend it with the
-            # post-context arange instead of recomputing via a bool mask +
-            # torch.where over the full range.
-            text_token_indices_ctx, mm_token_indices = \
-                self._prepare_multimodal_indices(input_ids)
-        else:
-            text_token_indices_ctx = None
-            mm_token_indices = None
+        prepare_multimodal_indices = len(multimodal_params_list) > 0
+        text_token_indices_ctx = None
+        mm_token_indices = None
 
         # Requests with draft tokens are treated like extend requests. Dummy extend requests should be
         # at the end of extend_requests.
@@ -6394,6 +6392,13 @@ class PyTorchModelEngine(ModelEngine):
             input_ids = torch.tensor(input_ids,
                                      dtype=torch.int,
                                      pin_memory=prefer_pinned())
+            if prepare_multimodal_indices:
+                # Context tokens occupy the prefix; later extend/draft tokens
+                # are text. Reuse the pinned H2D source instead of tensorizing
+                # the Python token list a second time just for MM matching.
+                text_token_indices_ctx, mm_token_indices = \
+                    self._prepare_multimodal_indices(
+                        input_ids[:num_ctx_tokens])
             self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
 
             # Update input_ids_cuda with new tokens from new_tensors_device (draft model only)
@@ -6990,24 +6995,24 @@ class PyTorchModelEngine(ModelEngine):
         num_tokens = len(input_ids)
         assert num_tokens <= self.max_num_tokens, (
             "num_tokens should be less than or equal to max_num_tokens")
-        # Compute MM/text token indices on CPU input_ids so that
-        # fuse_input_embeds can skip its torch.where host sync. Must run before
-        # the input_ids list is rebound to a tensor below. Skipped when
-        # ``self.model`` is a vision encoder (no ``config.vocab_size`` to filter
-        # against, and its forward doesn't consume the indices anyway); this
-        # is a structural check on the model rather than a flag lookup, so it
-        # naturally extends to any future "LLM-less" engine setup.
+        # Compute MM/text token indices on the pinned CPU input tensor so that
+        # fusion skips its torch.where host sync without tensorizing the Python
+        # token list twice. Skip vision-only engines: they have no vocabulary
+        # to filter and do not consume these indices.
         _model_config = getattr(self.model, "config", None)
-        if (len(multimodal_params_list) > 0
-                and getattr(_model_config, "vocab_size", None) is not None):
-            text_token_indices_cpu, mm_token_indices_cpu = \
-                self._prepare_multimodal_indices(input_ids)
-        else:
-            text_token_indices_cpu = None
-            mm_token_indices_cpu = None
+        prepare_multimodal_indices = (len(multimodal_params_list) > 0
+                                      and getattr(_model_config, "vocab_size",
+                                                  None) is not None)
+        text_token_indices_cpu = None
+        mm_token_indices_cpu = None
         input_ids = torch.tensor(input_ids,
                                  dtype=torch.int,
                                  pin_memory=prefer_pinned())
+        if prepare_multimodal_indices:
+            # Match placeholders in the pinned H2D source instead of creating
+            # a second full CPU tensor from the same Python token list.
+            text_token_indices_cpu, mm_token_indices_cpu = \
+                self._prepare_multimodal_indices(input_ids)
         self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
 
         position_ids = self._apply_position_id_offset(position_ids)
