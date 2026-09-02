@@ -895,7 +895,9 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         param = _make_keyed_image_param(item_hashes=[[0] * 8, [1] * 8, [2] * 8])
         source_image = param.multimodal_data["image"]
 
-        residual = _Gemma4EncoderCacheHarness().build_multimodal_encoder_input(param, [2, 0])
+        residual = _Gemma4EncoderCacheHarness().build_multimodal_encoder_input(
+            param, [2, 0], modality="image"
+        )
 
         residual_image = residual.multimodal_data["image"]
         torch.testing.assert_close(
