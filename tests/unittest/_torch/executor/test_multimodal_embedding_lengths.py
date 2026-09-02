@@ -118,21 +118,39 @@ def test_multimodal_embedding_lengths_rejects_invalid_metadata(req, exception, m
 class _FakePyResult:
     def __init__(self):
         self.mm_embeddings = []
+        self.multimodal_layout = None
         self.mrope_position = None
 
-    def append_mm_embeddings(self, mm_embedding, mm_embedding_lengths):
+    def append_mm_embeddings(self, mm_embedding, mm_embedding_lengths, multimodal_layout=None):
         self.mm_embeddings.append((mm_embedding, mm_embedding_lengths))
+        self.multimodal_layout = multimodal_layout
 
     def set_mrope_position(self, position_ids, position_deltas):
         self.mrope_position = (position_ids, position_deltas)
 
 
 class _FakeRequest:
-    def __init__(self, multimodal_lengths=None):
+    def __init__(
+        self,
+        multimodal_lengths=None,
+        multimodal_positions=None,
+        py_multimodal_data=None,
+        tokens=None,
+    ):
         self.multimodal_lengths = multimodal_lengths
+        self.multimodal_positions = multimodal_positions
+        self.multimodal_item_run_cu_offsets = None
+        self.multimodal_run_positions = None
+        self.multimodal_run_lengths = None
+        self.py_multimodal_data = py_multimodal_data
+        self._tokens = tokens or []
         self.py_result = _FakePyResult()
         self.state = None
         self.finished_reason = None
+
+    def get_tokens(self, beam):
+        assert beam == 0
+        return self._tokens
 
     def set_finished_reason(self, reason, beam):
         self.finished_reason = (reason, beam)
@@ -184,7 +202,7 @@ def test_disagg_prefill_reuses_encoder_side_multimodal_layout():
             raise AssertionError("encoder-provided layout should be reused")
 
         def get_vocab_size(self):
-            return 128
+            raise AssertionError("encoder cumsum should be reused")
 
         def get_mm_token_ids(self):
             return torch.tensor([99])
@@ -192,6 +210,7 @@ def test_disagg_prefill_reuses_encoder_side_multimodal_layout():
         def get_mm_special_token_ids(self):
             return None
 
+    cumsum = torch.tensor([0, 1, 2, 2], dtype=torch.int64)
     layout = DisaggPrefillMultimodalInputs(
         prompt_token_ids=[7, 99, 99, 8],
         multimodal_lengths=[2],
@@ -200,6 +219,7 @@ def test_disagg_prefill_reuses_encoder_side_multimodal_layout():
         multimodal_item_run_cu_offsets=[0, 1],
         multimodal_run_positions=[1],
         multimodal_run_lengths=[2],
+        multimodal_embed_mask_cumsum=cumsum,
     )
     disaggregated_params = DisaggregatedParams(
         multimodal_embedding_handles=[{"tensor_size": [2, 4]}],
@@ -220,6 +240,35 @@ def test_disagg_prefill_reuses_encoder_side_multimodal_layout():
     assert multimodal_params.multimodal_input.multimodal_positions == [1]
     assert multimodal_params.multimodal_input.multimodal_lengths == [2]
     assert multimodal_params.multimodal_data["multimodal_embedding_lengths"] == [2]
+    assert multimodal_params.multimodal_data["multimodal_embed_mask_cumsum"] is cumsum
+
+
+@pytest.mark.cpu_only
+def test_mm_encoder_sampler_carries_embed_cumsum_in_layout():
+    """Encoder results carry existing prompt metadata to the prefill worker."""
+    cumsum = torch.tensor([0, 1, 2, 2], dtype=torch.int64)
+    request = _FakeRequest(
+        multimodal_lengths=[2],
+        multimodal_positions=[1],
+        py_multimodal_data={"multimodal_embed_mask_cumsum": cumsum},
+        tokens=[7, 99, 99, 8],
+    )
+    sampler = EarlyStopWithMMResult()
+    state = sampler.SampleState(
+        requests=[request],
+        data=MultimodalResult(
+            mm_embeddings=[torch.ones(2, 4)],
+            mm_embedding_request_indices=[0],
+            mm_embedding_lengths=[[2]],
+            num_context_requests=1,
+            extra_data={},
+        ),
+    )
+
+    sampler.update_requests(state)
+
+    assert request.py_result.multimodal_layout is not None
+    assert request.py_result.multimodal_layout.multimodal_embed_mask_cumsum is cumsum
 
 
 @pytest.mark.cpu_only
@@ -232,6 +281,7 @@ def test_py_result_mm_embedding_handles_use_shared_tensor_handles():
         multimodal_lengths=[1, 3],
         multimodal_positions=[0, 1],
         multimodal_embedding_lengths=[1, 3],
+        multimodal_embed_mask_cumsum=torch.arange(1, 5, dtype=torch.int64),
     )
 
     result.append_mm_embeddings(source, [1, 3], multimodal_layout=layout)
@@ -245,6 +295,7 @@ def test_py_result_mm_embedding_handles_use_shared_tensor_handles():
     follower = PyResult(prompt_len=1, max_new_tokens=1)
     follower.apply_diff(result.get_diff())
     assert follower.multimodal_layout == layout
+    assert follower.multimodal_layout.multimodal_embed_mask_cumsum is not None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

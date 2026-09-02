@@ -976,6 +976,9 @@ class BaseLLM:
                     multimodal_data["layout_metadata"] = {
                         "item_types": disagg_mm_inputs.item_types
                     }
+                if disagg_mm_inputs.multimodal_embed_mask_cumsum is not None:
+                    multimodal_data["multimodal_embed_mask_cumsum"] = (
+                        disagg_mm_inputs.multimodal_embed_mask_cumsum)
                 if disaggregated_params.mrope_position_ids_handle is not None:
                     # NOTE: `PyTorchModelEngine` assumes both are present when using mrope.
                     assert disaggregated_params.mrope_position_deltas_handle is not None

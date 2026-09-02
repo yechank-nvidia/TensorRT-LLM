@@ -476,6 +476,7 @@ def test_find_mm_token_lengths_rejects_undecoded_video_string():
 
 def test_disagg_prefill_multimodal_inputs_builds_typed_handoff():
     """Typed EPD handoff converts back to legacy MultimodalInput fields."""
+    cumsum = torch.tensor([0, 1, 2, 2, 3, 3], dtype=torch.int64)
     handoff = DisaggPrefillMultimodalInputs(
         prompt_token_ids=[10, 1001, 1002, 2000, 1003, 20],
         multimodal_lengths=[4],
@@ -486,6 +487,7 @@ def test_disagg_prefill_multimodal_inputs_builds_typed_handoff():
         multimodal_run_lengths=[4],
         special_token_offsets=[2],
         item_types=[0],
+        multimodal_embed_mask_cumsum=cumsum,
     )
 
     multimodal_input = handoff.to_multimodal_input([[1, 2, 3, 4]])
@@ -498,6 +500,7 @@ def test_disagg_prefill_multimodal_inputs_builds_typed_handoff():
     assert handoff.multimodal_embedding_lengths == [3]
     assert handoff.special_token_offsets == [2]
     assert handoff.item_types == [0]
+    assert handoff.multimodal_embed_mask_cumsum is cumsum
 
 
 def test_multimodal_input_rejects_invalid_prompt_spans():

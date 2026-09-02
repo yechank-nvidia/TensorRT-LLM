@@ -350,6 +350,7 @@ class DisaggPrefillMultimodalInputs:
     multimodal_run_lengths: Optional[List[int]] = None
     special_token_offsets: Optional[List[int]] = None
     item_types: Optional[List[int]] = None
+    multimodal_embed_mask_cumsum: Optional[torch.Tensor] = None
 
     def __post_init__(self) -> None:
         _validate_int_list(self.prompt_token_ids, "prompt_token_ids")
@@ -374,6 +375,18 @@ class DisaggPrefillMultimodalInputs:
             "multimodal_lengths",
         )
         self._validate_optional_metadata()
+
+        cumsum = self.multimodal_embed_mask_cumsum
+        if cumsum is not None:
+            if not isinstance(cumsum, torch.Tensor):
+                raise TypeError("multimodal_embed_mask_cumsum must be a tensor")
+            if cumsum.device.type != "cpu" or cumsum.dtype != torch.int64:
+                raise ValueError(
+                    "multimodal_embed_mask_cumsum must be a CPU int64 tensor")
+            if cumsum.ndim != 1 or cumsum.numel() != len(self.prompt_token_ids):
+                raise ValueError(
+                    "multimodal_embed_mask_cumsum must match prompt_token_ids length"
+                )
 
     def _validate_optional_metadata(self) -> None:
         if self.special_token_offsets is not None:

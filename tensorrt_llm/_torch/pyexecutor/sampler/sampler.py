@@ -385,6 +385,7 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
                         else list(request.multimodal_run_lengths)
                     ),
                     special_token_offsets=mm_data.get("special_token_offsets"),
+                    multimodal_embed_mask_cumsum=mm_data.get("multimodal_embed_mask_cumsum"),
                 )
 
             if multimodal_layout is None:
