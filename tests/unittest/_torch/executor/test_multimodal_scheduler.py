@@ -1664,6 +1664,41 @@ def test_single_scheduled_segment_is_used_without_a_copy():
     assert embeddings[0] is segment
 
 
+def test_scheduled_and_whole_request_embeddings_share_one_batch():
+    class _Model(MultimodalModelMixin):
+        @property
+        def text_embedding_layer(self):
+            return SimpleNamespace(weight=torch.empty(0, 1))
+
+        @property
+        def embedding_dim(self):
+            return 1
+
+    scheduled = torch.tensor([[10.0], [11.0]])
+    whole = torch.tensor([[20.0], [21.0], [22.0], [23.0]])
+    scheduled_param = MultimodalParams(
+        multimodal_data={"multimodal_embedding": (scheduled,)},
+        multimodal_runtime=MultimodalRuntimeData(
+            past_seen_token_num=0,
+            chunk_end_pos=2,
+            embed_mask_cumsum=torch.tensor([1, 2], dtype=torch.int64),
+        ),
+    )
+    whole_param = MultimodalParams(
+        multimodal_data={"multimodal_embedding": whole},
+        multimodal_runtime=MultimodalRuntimeData(
+            past_seen_token_num=1,
+            chunk_end_pos=3,
+            embed_mask_cumsum=torch.tensor([1, 2, 3, 4], dtype=torch.int64),
+        ),
+    )
+
+    embeddings = _Model()._get_or_encode_multimodal_embeddings([scheduled_param, whole_param])
+
+    assert embeddings[0] is scheduled
+    torch.testing.assert_close(embeddings[1], whole[1:3])
+
+
 def test_scheduled_segments_with_packed_auxiliary_streams_stay_joined():
     class _Model(MultimodalModelMixin):
         @property

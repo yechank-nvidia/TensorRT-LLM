@@ -1154,35 +1154,44 @@ class MultimodalModelMixin:
         main-stream consumer waits on the request-level `encoder_event` for ordering.
         """
         # The immutable tuple distinguishes current-window cache segments from
-        # legacy lists used while accumulating encoder outputs.
-        embedding_segments: list[torch.Tensor] = []
-        has_scheduled_segments = False
-        for param in multimodal_params:
-            embedding = param.multimodal_data.get("multimodal_embedding")
-            if isinstance(embedding, tuple):
-                has_scheduled_segments = True
-                segments = embedding
-            elif isinstance(embedding, torch.Tensor):
-                segments = (embedding,)
-            elif isinstance(embedding, list):
-                segments = tuple(embedding)
-            else:
-                embedding_segments = []
-                break
-            if not all(isinstance(segment, torch.Tensor) for segment in segments):
-                raise TypeError("multimodal_embedding segments must be tensors")
-            embedding_segments.extend(segments)
+        # legacy lists used while accumulating encoder outputs. Interpret that
+        # marker per request: one batch may contain both scheduled segments and
+        # a whole-request handoff that still needs current-chunk slicing.
+        has_scheduled_segments = any(
+            isinstance(param.multimodal_data.get("multimodal_embedding"), tuple)
+            for param in multimodal_params
+        )
         if has_scheduled_segments:
-            if not embedding_segments:
+            embeddings: list[torch.Tensor] = []
+            for param in multimodal_params:
+                embedding = param.multimodal_data.get("multimodal_embedding")
+                if isinstance(embedding, tuple):
+                    segments = list(embedding)
+                elif isinstance(embedding, torch.Tensor):
+                    segments = find_input_mm_embeds([embedding], [param])
+                elif isinstance(embedding, list):
+                    if not all(isinstance(segment, torch.Tensor) for segment in embedding):
+                        raise TypeError("multimodal_embedding segments must be tensors")
+                    full_embedding = (
+                        embedding[0] if len(embedding) == 1 else torch.cat(embedding, dim=0)
+                    )
+                    segments = find_input_mm_embeds([full_embedding], [param])
+                else:
+                    embeddings = []
+                    break
+
+                if not all(isinstance(segment, torch.Tensor) for segment in segments):
+                    raise TypeError("multimodal_embedding segments must be tensors")
+                if not segments:
+                    continue
+                if all(segment.shape[-1] == self.embedding_dim for segment in segments):
+                    embeddings.extend(segments)
+                else:
+                    embeddings.append(
+                        segments[0] if len(segments) == 1 else torch.cat(segments, dim=0)
+                    )
+            if not embeddings:
                 embeddings = [self.text_embedding_layer.weight.new_empty((0, self.embedding_dim))]
-            elif all(segment.shape[-1] == self.embedding_dim for segment in embedding_segments):
-                embeddings = embedding_segments
-            else:
-                embeddings = [
-                    embedding_segments[0]
-                    if len(embedding_segments) == 1
-                    else torch.cat(embedding_segments, dim=0)
-                ]
             self._validate_embeddings(embeddings, multimodal_params, current_chunk_only=True)
             return embeddings
 
