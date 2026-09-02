@@ -885,6 +885,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         )
 
         self.assertEqual(model.encoder_calls, 2)
+        embeddings = torch.cat(embeddings)
         torch.testing.assert_close(embeddings[:2], torch.ones(2, model.embedding_dim))
         torch.testing.assert_close(embeddings[2:], torch.full((2, model.embedding_dim), 2.0))
         self.assertEqual(len(model._multimodal_encoder_cache), 2)
@@ -936,6 +937,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         )
 
         self.assertEqual(model.encoder_calls, 2)
+        embeddings = torch.cat(embeddings)
         torch.testing.assert_close(embeddings[:2], torch.ones(2, model.embedding_dim))
         torch.testing.assert_close(embeddings[2:], torch.full((2, model.embedding_dim), 2.0))
         self.assertEqual(len(model._multimodal_encoder_cache), 2)
@@ -991,8 +993,10 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         warning_once.assert_called_once()
         self.assertEqual(model.encoder_calls, 2)
         torch.testing.assert_close(full_hit, first)
-        torch.testing.assert_close(first, torch.ones(2, model.embedding_dim))
-        torch.testing.assert_close(partial_hit, torch.full((4, model.embedding_dim), 2.0))
+        torch.testing.assert_close(torch.cat(first), torch.ones(2, model.embedding_dim))
+        torch.testing.assert_close(
+            torch.cat(partial_hit), torch.full((4, model.embedding_dim), 2.0)
+        )
         torch.testing.assert_close(repeated, partial_hit)
         self.assertEqual(len(model._multimodal_encoder_cache), 2)
 
