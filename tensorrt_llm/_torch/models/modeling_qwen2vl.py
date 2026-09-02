@@ -7,6 +7,7 @@ import re
 import threading
 from collections import OrderedDict
 from concurrent.futures import Future
+from contextlib import nullcontext
 from functools import lru_cache
 from typing import Any, Dict, Hashable, List, Mapping, Optional, Tuple, Union
 
@@ -14,6 +15,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.overrides import TorchFunctionMode
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel)
 from transformers.modeling_outputs import BaseModelOutputWithPooling
@@ -87,6 +89,24 @@ from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
                              register_vision_encoder)
 
 PAD_INDEX = -100  # NOTE: refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py#L269
+
+
+class _SkipSingleTensorCat(TorchFunctionMode):
+    """Avoid HF's full pixel copy for ``torch.cat([single_tensor])``.
+
+    This mode is thread-local and is used only around ordinary single-image
+    Qwen processor calls. Multi-item and processor-cache paths keep the stock
+    behavior because they either need the concatenation or have no copy to
+    remove.
+    """
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        tensors = args[0] if args else kwargs.get("tensors")
+        if (func is torch.cat and tensors is not None and len(tensors) == 1
+                and kwargs.get("out") is None):
+            return tensors[0]
+        return func(*args, **kwargs)
 
 
 class _QwenVLVisionProcessorSingleFlight:
@@ -1368,13 +1388,17 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                     processor.video_processor,
                     video_artifact_key,
                 )
-        return processor(text=[text],
-                         images=images,
-                         videos=videos,
-                         padding=True,
-                         do_rescale=do_rescale,
-                         return_tensors='pt',
-                         **mm_processor_kwargs)
+        cat_context = (_SkipSingleTensorCat()
+                       if not processor_artifact_keys and images is not None
+                       and len(images) == 1 and not videos else nullcontext())
+        with cat_context:
+            return processor(text=[text],
+                             images=images,
+                             videos=videos,
+                             padding=True,
+                             do_rescale=do_rescale,
+                             return_tensors='pt',
+                             **mm_processor_kwargs)
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
         # Keep image / vision / video placeholders in-vocab; the model engine

@@ -34,6 +34,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2_5VLInputProcessorBase
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VLInputProcessorBase,
     _decide_do_sample_frames,
@@ -57,6 +58,30 @@ def _call_preprocess(mm_data, mm_processor_kwargs):
         mm_processor_kwargs,
     )
     return fake_processor
+
+
+@pytest.mark.parametrize("processor_type", [Qwen2_5VLInputProcessorBase, Qwen3VLInputProcessorBase])
+@pytest.mark.parametrize("num_images", [1, 2])
+def test_preprocess_avoids_only_single_image_cat(processor_type, num_images):
+    source = torch.arange(6).reshape(2, 3)
+
+    class CatProcessor:
+        def __call__(self, *, images, **kwargs):
+            return {"pixel_values": torch.cat(images, dim=0)}
+
+    fake_self = SimpleNamespace(processor=CatProcessor())
+    output = processor_type._preprocess(
+        fake_self,
+        "the prompt",
+        {"image": [source] * num_images},
+        {},
+    )["pixel_values"]
+
+    assert torch.equal(output, torch.cat([source] * num_images, dim=0))
+    if num_images == 1:
+        assert output.data_ptr() == source.data_ptr()
+    else:
+        assert output.data_ptr() != source.data_ptr()
 
 
 class _ControlledImageProcessor:

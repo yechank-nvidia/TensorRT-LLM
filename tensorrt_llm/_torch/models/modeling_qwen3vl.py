@@ -4,6 +4,7 @@
 import copy
 import math
 import re
+from contextlib import nullcontext
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Sequence, Tuple, Union
 from typing import Mapping as TypingMapping
@@ -65,6 +66,7 @@ from .modeling_qwen2vl import (
     _prepare_qwen_vl_mrope_config,
     _prepare_qwen_vl_vision_attn_metadata,
     _QwenVLVisionProcessorSingleFlight,
+    _SkipSingleTensorCat,
 )
 from .modeling_utils import (
     ModelConfig,
@@ -444,16 +446,25 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                     video_artifact_key,
                 )
 
-        return processor(
-            text=[text],
-            images=images,
-            videos=videos,
-            padding=True,
-            do_rescale=do_rescale,
-            return_tensors="pt",
-            video_metadata=video_metadata,
-            **proc_kwargs,
+        cat_context = (
+            _SkipSingleTensorCat()
+            if not processor_artifact_keys
+            and images is not None
+            and len(images) == 1
+            and not videos
+            else nullcontext()
         )
+        with cat_context:
+            return processor(
+                text=[text],
+                images=images,
+                videos=videos,
+                padding=True,
+                do_rescale=do_rescale,
+                return_tensors="pt",
+                video_metadata=video_metadata,
+                **proc_kwargs,
+            )
 
     def get_num_tokens_per_video(
         self,
