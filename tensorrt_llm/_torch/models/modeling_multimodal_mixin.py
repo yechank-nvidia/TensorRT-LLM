@@ -173,8 +173,13 @@ def _reorder_embeds_by_manifest(
     per_modality_lengths: Dict[str, List[int]],
 ) -> torch.Tensor:
     """Slice per-modality tensors item-by-item and concat in prompt order."""
-    if len(per_modality_embeds) == 1:
-        modality, embedding = next(iter(per_modality_embeds.items()))
+    populated_modalities = [
+        (modality, embedding)
+        for modality, embedding in per_modality_embeds.items()
+        if per_modality_lengths.get(modality)
+    ]
+    if len(populated_modalities) == 1:
+        modality, embedding = populated_modalities[0]
         prompt_order_matches_encoder = True
         for mp in multimodal_params:
             manifest = mp.mm_item_order or _synthesize_single_modality_manifest(
@@ -185,9 +190,9 @@ def _reorder_embeds_by_manifest(
                 prompt_order_matches_encoder = False
                 break
         if prompt_order_matches_encoder:
-            # A single-modality encoder already emits request and item rows in
-            # prompt order. Keep its output instead of slicing it into item
-            # views and concatenating those views back into the same layout.
+            # A group with one populated modality already emits request and
+            # item rows in prompt order. Empty peer modalities (for example,
+            # video in an image-only Qwen batch) do not require a reorder.
             return embedding
 
     per_modality_row_starts: Dict[str, List[int]] = {

@@ -157,15 +157,17 @@ class TestReorderEmbedsByManifest:
         expected = torch.tensor([1.0] * 2 + [2.0] * 3 + [3.0] * 1)
         assert torch.equal(out[:, 0], expected)
 
-    def test_single_modality_falls_back_to_synthesized_manifest(self):
+    def test_one_populated_modality_ignores_empty_group_peer(self):
         # Two image items, no explicit manifest — reorder still works by
-        # synthesizing a trivial per-modality manifest from the request's
-        # multimodal_embedding_lengths. The encoder output is already in that
-        # order, so the framework must not copy it through torch.cat.
+        # synthesizing a trivial manifest. Qwen's shared image/video group also
+        # contributes an empty video view; it must not force an image copy.
         mp = _mp(embedding_lengths=[2, 3], buckets={"image": {}})
         image_embeddings = torch.cat([self._marker_tensor(7, 2), self._marker_tensor(9, 3)], dim=0)
-        per_modality_embeds = {"image": image_embeddings}
-        per_modality_lengths = {"image": [2, 3]}
+        per_modality_embeds = {
+            "image": image_embeddings,
+            "video": image_embeddings.new_empty((0, image_embeddings.shape[1])),
+        }
+        per_modality_lengths = {"image": [2, 3], "video": []}
         out = _reorder_embeds_by_manifest([mp], per_modality_embeds, per_modality_lengths)
         expected = torch.tensor([7.0] * 2 + [9.0] * 3)
         assert torch.equal(out[:, 0], expected)
