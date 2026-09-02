@@ -63,9 +63,9 @@ from ..distributed.communicator import init_pp_comm
 from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
-from ..models.modeling_multimodal_encoder import MultimodalEncoderMixin
-from ..models.modeling_multimodal_mixin import (MultimodalEncoderContractError,
-                                                MultimodalModelMixin,
+from ..models.modeling_multimodal_encoder import (
+    MultimodalEncoderContractError, MultimodalEncoderMixin)
+from ..models.modeling_multimodal_mixin import (MultimodalModelMixin,
                                                 _build_request_multimodal_input)
 from ..models.modeling_multimodal_utils import (_is_mm_disagg,
                                                 filter_mm_token_from_input_ids)
@@ -3525,6 +3525,46 @@ class PyTorchModelEngine(ModelEngine):
             )
 
     @torch.inference_mode()
+    def encode_multimodal_encoder_items(
+        self,
+        selected_items: Sequence[Tuple[MultimodalParams, int]],
+    ) -> List[torch.Tensor]:
+        """Encode selected items without assigning cache ownership.
+
+        Integrated models provide the contract directly. Encoder-only models
+        expose it through their one registered ``MultimodalEncoderMixin``
+        provider, so this dispatch never depends on a model name.
+        """
+        model = self.model
+        if isinstance(model, MultimodalModelMixin):
+            provider = model
+        else:
+            providers = [
+                module for module in model.modules()
+                if isinstance(module, MultimodalEncoderMixin)
+                and type(module).encode_multimodal_inputs
+                is not MultimodalEncoderMixin.encode_multimodal_inputs
+            ]
+            if len(providers) != 1:
+                raise MultimodalEncoderContractError(
+                    "Selected-item encoding requires exactly one capable "
+                    "multimodal encoder provider")
+            provider = providers[0]
+
+        encoder_inputs = provider.prepare_multimodal_encoder_inputs(
+            selected_items)
+        for encoder_input, _, _ in encoder_inputs:
+            encoder_input.to_device(
+                "multimodal_data",
+                "cuda",
+                pin_memory=prefer_pinned(),
+                target_keywords=getattr(
+                    model, "multimodal_data_device_paths",
+                    getattr(provider, "multimodal_data_device_paths", None)),
+            )
+        return provider.forward_multimodal_encoder_items(encoder_inputs)
+
+    @torch.inference_mode()
     def forward_multimodal_encoder_items(
         self,
         requests: List[LlmRequest],
@@ -3613,26 +3653,7 @@ class PyTorchModelEngine(ModelEngine):
 
         if encoder_items:
             try:
-                encoder_inputs = self.model.prepare_multimodal_encoder_inputs(
-                    encoder_items)
-            except MultimodalEncoderContractError as error:
-                raise MultimodalEncoderRequestError(
-                    str(error),
-                    request_ids=requests_using_cache_keys(scheduled_cache_keys),
-                ) from error
-            for encoder_input, _, _ in encoder_inputs:
-                encoder_input.to_device(
-                    "multimodal_data",
-                    "cuda",
-                    pin_memory=prefer_pinned(),
-                    target_keywords=getattr(self.model,
-                                            "multimodal_data_device_paths",
-                                            None),
-                )
-
-            try:
-                outputs = self.model.forward_multimodal_encoder_items(
-                    encoder_inputs)
+                outputs = self.encode_multimodal_encoder_items(encoder_items)
             except MultimodalEncoderContractError as error:
                 raise MultimodalEncoderRequestError(
                     str(error),

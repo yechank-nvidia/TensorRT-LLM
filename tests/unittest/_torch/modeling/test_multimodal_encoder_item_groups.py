@@ -16,12 +16,14 @@ into a hard error, but only after the wasted encoder forward.
 import pytest
 import torch
 
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     EncoderGroup,
     MultimodalEncoderContractError,
     MultimodalModelMixin,
     encode_multimodal_by_groups,
 )
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.registry import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -75,6 +77,28 @@ class _GroupedEncoderModel(MultimodalModelMixin):
         self.encoder_calls.append(pixel_values.shape[0])
         # One output row per input patch row, carrying the input value so the
         # test can assert *which* rows came back, not just how many.
+        return pixel_values.clone()
+
+    def encode_multimodal_inputs(self, multimodal_params) -> torch.Tensor:
+        return encode_multimodal_by_groups(self.mm_encoder_groups, list(multimodal_params))
+
+
+class _GroupedEncoderProvider(torch.nn.Module, MultimodalEncoderMixin):
+    """Standalone encoder provider using the same selected-item contract."""
+
+    def __init__(self):
+        super().__init__()
+        self.encoder_calls: list[int] = []
+        self.mm_encoder_groups = (
+            EncoderGroup(
+                modalities=("image", "video"),
+                encoder_fn=self._encode,
+                build_batched_input=_GroupedEncoderModel._build_batched_input,
+            ),
+        )
+
+    def _encode(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        self.encoder_calls.append(pixel_values.shape[0])
         return pixel_values.clone()
 
     def encode_multimodal_inputs(self, multimodal_params) -> torch.Tensor:
@@ -192,6 +216,23 @@ def test_partial_selection_only_encodes_selected_items():
     assert len(outputs) == 1
     torch.testing.assert_close(outputs[0], _expected_rows(request, 1))
     assert model.encoder_calls == [ITEM_ROWS["image"][1]]
+
+
+def test_model_engine_uses_standalone_encoder_provider(monkeypatch):
+    """Encoder-only models resolve a capable provider without model dispatch."""
+    provider = _GroupedEncoderProvider()
+    encoder_only_model = torch.nn.Module()
+    encoder_only_model.add_module("visual", provider)
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = encoder_only_model
+    request = _make_request(["image", "image"])
+    monkeypatch.setattr(MultimodalParams, "to_device", lambda *args, **kwargs: None)
+
+    outputs = engine.encode_multimodal_encoder_items([(request, 1)])
+
+    assert len(outputs) == 1
+    torch.testing.assert_close(outputs[0], _expected_rows(request, 1))
+    assert provider.encoder_calls == [ITEM_ROWS["image"][1]]
 
 
 def test_wrong_encoder_output_rows_are_request_contract_error():

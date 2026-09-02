@@ -977,6 +977,34 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         """
         return {"attention": max(1, max_num_tokens // self.spatial_merge_unit)}
 
+    @torch.inference_mode()
+    def encode_batched(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one image/video batch and fold deepstack streams into rows."""
+        model_dtype = self.model_config.pretrained_config.text_config.dtype
+        embeds, deepstack = self(pixel_values.to(model_dtype), grid_thw=grid_thw)
+        return torch.cat([embeds] + deepstack, dim=1)
+
+    @property
+    def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
+        """Describe the one Qwen3-VL encoder shared by images and videos."""
+        return (
+            EncoderGroup(
+                modalities=("image", "video"),
+                encoder_fn=self.encode_batched,
+                build_batched_input=_qwen3vl_build_batched_input,
+            ),
+        )
+
+    def encode_multimodal_inputs(
+        self, multimodal_params: Sequence[MultimodalParams]
+    ) -> torch.Tensor:
+        """Encode request/item slices in request and prompt order."""
+        return encode_multimodal_by_groups(self.mm_encoder_groups, list(multimodal_params))
+
     @staticmethod
     @lru_cache(maxsize=1024)
     def rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
@@ -1409,10 +1437,7 @@ class Qwen3VisionModelBase(nn.Module):
         the hidden dim. Modality-agnostic — image and video items are
         distinguished only by ``grid_thw`` rows (image ``t=1``, video ``t>1``).
         """
-        pixel_values = pixel_values.to(self.model_dtype)
-        embeds, deepstack = self.visual(pixel_values, grid_thw=grid_thw)
-        # Shape: [seq_len, hidden_dim * (num_deepstack_layers + 1)]
-        return torch.cat([embeds] + deepstack, dim=1)
+        return self.visual.encode_batched(pixel_values, grid_thw)
 
     @property
     def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
@@ -1423,13 +1448,7 @@ class Qwen3VisionModelBase(nn.Module):
         Both the aggregated path (via `Qwen3VLModelBase.mm_encoder_groups`,
         which delegates here) and the mm-encoder-only `forward` consume this.
         """
-        return (
-            EncoderGroup(
-                modalities=("image", "video"),
-                encoder_fn=self.encode_batched,
-                build_batched_input=_qwen3vl_build_batched_input,
-            ),
-        )
+        return self.visual.mm_encoder_groups
 
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         """Standalone mm-encoder-only executor entry.
@@ -1441,7 +1460,7 @@ class Qwen3VisionModelBase(nn.Module):
         modality-batched ViT the aggregated path uses and applies the
         per-request `mm_item_order` reorder before returning.
         """
-        return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
+        return [self.visual.encode_multimodal_inputs(multimodal_params)]
 
 
 def _validate_deepstack_pp_partition(
