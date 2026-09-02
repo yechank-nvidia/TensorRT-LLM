@@ -1025,6 +1025,10 @@ def test_build_multimodal_encoder_input_stacked_crops_padding_to_miss_max_size()
     residual_image = residual.multimodal_data["image"]
     assert residual_image["image_sizes"] == [[3, 4]]
     assert residual_image["pixel_values"].shape == (1, 3, 3, 4)
+    assert (
+        residual_image["pixel_values"].untyped_storage().data_ptr()
+        == pixels.untyped_storage().data_ptr()
+    )
     # Cropped tensor preserves item 0's top-left (H=0..3, W=0..4) window.
     torch.testing.assert_close(residual_image["pixel_values"], pixels[0:1, :, :3, :4])
 
@@ -1059,6 +1063,10 @@ def test_build_multimodal_encoder_input_slices_audio_input_features():
     torch.testing.assert_close(residual_audio["input_features"], features[[1, 0]])
     # Per-item mask is caught by the generic sibling-slice pass.
     torch.testing.assert_close(residual_audio["input_features_mask"], mask[[1, 0]])
+
+    contiguous = model.build_multimodal_encoder_input(param, [0, 1])
+    contiguous_features = contiguous.multimodal_data["audio"]["input_features"]
+    assert contiguous_features.untyped_storage().data_ptr() == features.untyped_storage().data_ptr()
 
 
 @pytest.mark.parametrize(

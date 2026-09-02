@@ -221,6 +221,8 @@ class MultimodalEncoderMixin:
         indices = list(item_indices)
         if not indices:
             raise ValueError("item_indices must not be empty")
+        contiguous = indices == list(
+            range(indices[0], indices[0] + len(indices)))
         grid_key = {
             "image": "image_grid_thw",
             "video": "video_grid_thw"
@@ -234,11 +236,14 @@ class MultimodalEncoderMixin:
                 and pixel_key in modality_data):
             grids = modality_data[grid_key]
             n_items = grids.shape[0]
+            item_selector: Sequence[int] | slice = indices
+            if contiguous and indices[0] >= 0 and indices[-1] < n_items:
+                item_selector = slice(indices[0], indices[-1] + 1)
             patch_counts = [
                 int(count) for count in torch.prod(grids, dim=1).tolist()
             ]
             row_starts = list(itertools.accumulate(patch_counts, initial=0))
-            if indices == list(range(indices[0], indices[0] + len(indices))):
+            if isinstance(item_selector, slice):
                 pixel_slice = modality_data[pixel_key][
                     row_starts[indices[0]]:row_starts[indices[-1] + 1]]
             else:
@@ -248,7 +253,7 @@ class MultimodalEncoderMixin:
                 pixel_slice = torch.cat([per_item[i] for i in indices], dim=0)
             sliced = {
                 pixel_key: pixel_slice,
-                grid_key: grids[indices],
+                grid_key: grids[item_selector],
             }
         elif (
                 modality in ("image", "video")
@@ -259,7 +264,10 @@ class MultimodalEncoderMixin:
              or modality_data["pixel_values"].shape[0] == len(
                  param.multimodal_data["multimodal_embedding_lengths"]))):
             n_items = modality_data["pixel_values"].shape[0]
-            miss_pixel = modality_data["pixel_values"][indices]
+            item_selector = indices
+            if contiguous and indices[0] >= 0 and indices[-1] < n_items:
+                item_selector = slice(indices[0], indices[-1] + 1)
+            miss_pixel = modality_data["pixel_values"][item_selector]
             image_sizes = modality_data.get("image_sizes")
             if image_sizes is not None:
                 miss_sizes = [image_sizes[i] for i in indices]
@@ -278,7 +286,10 @@ class MultimodalEncoderMixin:
             feature_key = ("input_features" if "input_features" in modality_data
                            else "audio_features")
             n_items = modality_data[feature_key].shape[0]
-            sliced = {feature_key: modality_data[feature_key][indices]}
+            item_selector = indices
+            if contiguous and indices[0] >= 0 and indices[-1] < n_items:
+                item_selector = slice(indices[0], indices[-1] + 1)
+            sliced = {feature_key: modality_data[feature_key][item_selector]}
         else:
             raise NotImplementedError(
                 "Default `build_multimodal_encoder_input` cannot slice "
