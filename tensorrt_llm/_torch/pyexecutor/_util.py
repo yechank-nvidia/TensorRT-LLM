@@ -3214,7 +3214,7 @@ def create_py_executor_instance(
         scheduler = MultimodalScheduler(
             scheduler,
             max_batch_size=model_engine.encoder_batch_size,
-            max_num_tokens=model_engine.encoder_max_num_tokens,
+            max_num_tokens=model_engine.encoder_scheduling_token_budget,
             encoder_cache=encoder_cache,
             get_item_cache_keys=model_engine.get_mm_encoder_item_cache_keys,
             bytes_per_encoder_embedding=(

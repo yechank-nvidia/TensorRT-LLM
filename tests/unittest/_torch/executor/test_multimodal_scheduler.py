@@ -317,6 +317,7 @@ def test_external_encoder_demand_and_completion_use_existing_reservation():
     executor._mm_encoder_is_local = False
     executor._mm_encoder_item_scheduling_enabled = True
     executor._external_mm_encoder_demands = Queue()
+    executor._external_mm_encoder_demand_queue = None
     executor._external_mm_encoder_completions = Queue()
     executor.enable_iter_perf_stats = False
     executor.enable_attention_dp = False
@@ -514,6 +515,44 @@ def test_external_encoder_demand_waits_for_cache_completion():
 
     assert ready_output.scheduled_mm_encoder_items is None
     assert ready_output.context_requests == [request]
+
+
+def test_external_encoder_demand_does_not_schedule_future_items_while_pending():
+    scheduler = _scheduler(
+        max_batch_size=2,
+        max_num_tokens=2,
+        base_scheduler=SimpleScheduler(
+            _CapacityScheduler(), _MicroBatchScheduler(chunk_size=3, chunk_unit_size=1)
+        ),
+        scheduling_policy=MultimodalEncoderSchedulingPolicy.EAGER,
+        encoder_outputs_ready_immediately=False,
+    )
+    request = _request(1, [1, 2, 1])
+
+    first_output = scheduler.schedule_request([request], set())
+    first_cache_key = request.py_mm_encoder_state.item_cache_keys[0]
+    assert scheduler.encoder_cache.stats().producer_misses == 1
+    request.context_current_position = 1
+    waiting_output = scheduler.schedule_request([request], set())
+
+    assert first_output.scheduled_mm_encoder_items == {1: [0]}
+    assert waiting_output.scheduled_mm_encoder_items is None
+    assert waiting_output.context_requests == []
+    assert waiting_output.mm_encoder_blocked_request_ids == [1]
+    assert request.py_mm_encoder_state.item_cache_keys == [
+        first_cache_key,
+        None,
+        None,
+    ]
+    assert scheduler.encoder_cache.stats().producer_misses == 1
+
+    scheduler.encoder_cache.commit(first_cache_key, torch.ones(1))
+    next_output = scheduler.schedule_request([request], set())
+
+    assert next_output.scheduled_mm_encoder_items == {1: [1]}
+    assert next_output.context_requests == [request]
+    assert request.context_chunk_size == 2
+    assert scheduler.encoder_cache.stats().producer_misses == 2
 
 
 def test_external_encoder_demand_blocks_whole_request_without_llm_chunking():
@@ -739,6 +778,22 @@ def test_eager_policy_uses_leftover_budget_for_future_items():
 
     assert default_output.scheduled_mm_encoder_items == {1: [0]}
     assert eager_output.scheduled_mm_encoder_items == {2: [0, 1]}
+
+
+def test_atomic_item_larger_than_token_budget_runs_alone():
+    scheduler = _scheduler(
+        max_batch_size=2,
+        max_num_tokens=5,
+        base_scheduler=_BaseScheduler(chunk_unit_size=1),
+        scheduling_policy=MultimodalEncoderSchedulingPolicy.EAGER,
+    )
+    request = _request(1, [7, 1])
+
+    output = scheduler.schedule_request([request], set())
+
+    assert output.scheduled_mm_encoder_items == {1: [0]}
+    assert output.context_requests == [request]
+    assert request.context_chunk_size == 3
 
 
 def test_ready_cache_hit_does_not_consume_encoder_compute_budget():
@@ -1312,18 +1367,16 @@ def test_strip_mm_encoder_inputs_preserves_embedding_and_runtime_metadata():
     assert "multimodal_embed_mask_cumsum" in mm_data
 
 
-@pytest.mark.parametrize(
-    "pp_size, expected_pending_removals", [(1, []), (2, [("mm_transient", 1, 0)])]
-)
-def test_terminate_request_releases_multimodal_cache_refs_idempotently(
-    pp_size, expected_pending_removals
-):
+@pytest.mark.parametrize("output_ready", [False, True])
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_terminate_request_releases_multimodal_cache_refs_idempotently(pp_size, output_ready):
     request = _request(1, [4, 4])
     state = request.py_mm_encoder_state
     cache = TensorLRUCache(16)
     cache_key = ("mm_transient", request.request_id, 0)
     cache.acquire(cache_key, 4, retain_after_release=False)
-    cache.commit(cache_key, torch.ones(1))
+    if output_ready:
+        cache.commit(cache_key, torch.ones(1))
     state.set_item_cache_key(0, cache_key)
     freed = []
 
@@ -1347,7 +1400,12 @@ def test_terminate_request_releases_multimodal_cache_refs_idempotently(
     assert freed == [request]
     assert request.py_mm_encoder_state is None
     assert request.py_multimodal_data == {}
-    assert executor._pending_mm_encoder_cache_removals == expected_pending_removals
+    expected_removals = [cache_key] if output_ready and pp_size == 2 else []
+    assert executor._pending_mm_encoder_cache_removals == expected_removals
+    cache_stats = cache.stats()
+    assert cache_stats.current_bytes == 0
+    assert cache_stats.reserved_bytes == 0
+    assert cache_stats.in_use_bytes == 0
     assert executor._prefetched_request_ids == set()
     assert executor._disagg_timed_out_ctx_cancelled_ids == set()
     assert executor._disagg_timed_out_gen_cancelled_ids == set()

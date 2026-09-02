@@ -105,6 +105,8 @@ from .scheduler.adp_router import ADPRouter
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
+    from tensorrt_llm.executor.ipc import IpcQueue
+
 _UNBOUNDED_STATS_MAX_LEN = -1
 
 
@@ -453,6 +455,7 @@ class PyExecutor:
         self._pending_mm_encoder_cache_removals: List[Hashable] = []
         self._external_mm_encoder_demands: Queue[Tuple[int,
                                                        List[int]]] = Queue()
+        self._external_mm_encoder_demand_queue: Optional["IpcQueue"] = None
         self._external_mm_encoder_completions: Queue[Tuple[
             int, List[int], List[Dict[str, Any]], Optional[str]]] = Queue()
         self.scheduler = scheduler
@@ -6360,6 +6363,11 @@ class PyExecutor:
 
     @nvtx_range("_schedule")
     def _schedule(self):
+        if not getattr(self, "_mm_encoder_is_local", True):
+            # Make outputs that arrived between iterations visible to the
+            # scheduler now, so their LLM chunk does not wait for an otherwise
+            # empty forward step just to commit the completion.
+            self._commit_external_mm_encoder_completions()
         if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
@@ -6502,6 +6510,10 @@ class PyExecutor:
                 gpu_end.record()
         return None
 
+    def set_multimodal_encoder_demand_queue(self, queue: "IpcQueue") -> None:
+        """Publish external encoder work independently of model forward RPCs."""
+        self._external_mm_encoder_demand_queue = queue
+
     def take_multimodal_encoder_demands(self) -> List[Tuple[int, List[int]]]:
         """Drain item demands as ``(client_id, item_indices)`` pairs."""
         demands = []
@@ -6532,8 +6544,11 @@ class PyExecutor:
             request = request_by_id.get(request_id)
             if request is None:
                 continue
-            self._external_mm_encoder_demands.put(
-                (request.py_client_id, list(item_indices)))
+            demand = (request.py_client_id, list(item_indices))
+            if self._external_mm_encoder_demand_queue is None:
+                self._external_mm_encoder_demands.put(demand)
+            else:
+                self._external_mm_encoder_demand_queue.put(demand)
 
     def _commit_external_mm_encoder_completions(self) -> None:
         """Commit completed producer handles into their existing reservations."""

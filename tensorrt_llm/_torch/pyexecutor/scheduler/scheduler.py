@@ -649,6 +649,18 @@ class MultimodalScheduler(RequestScheduler):
     def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
         return self.scheduler.scheduling_state_range
 
+    def _can_schedule_item(
+        self, token_cost: int, remaining_batch_slots: int, remaining_tokens: int
+    ) -> bool:
+        """Allow an indivisible item over the token budget only when it runs alone."""
+        return remaining_batch_slots > 0 and (
+            token_cost <= remaining_tokens
+            or (
+                remaining_batch_slots == self.max_batch_size
+                and remaining_tokens == self.max_num_tokens
+            )
+        )
+
     def _get_request_item_cache_keys(self, request: LlmRequest) -> tuple[list[Hashable], bool]:
         """Return every item key and whether released entries stay reusable."""
         state = request.py_mm_encoder_state
@@ -850,6 +862,16 @@ class MultimodalScheduler(RequestScheduler):
             remaining_items = self._get_unconsumed_items(request)
             if not remaining_items:
                 continue
+            if not self.encoder_outputs_ready_immediately and any(
+                state.item_cache_keys[item_idx] is not None
+                and not self._is_item_ready(request, item_idx)
+                for item_idx in remaining_items
+            ):
+                # A remote producer is still working on an earlier item. Keep
+                # following prompt demand until it completes; otherwise the
+                # next pass can mistake the remaining unbound items for a
+                # whole-request batch and publish future work too early.
+                return True
             # Every key kept from an earlier iteration already has an output.
             # In that case, keep the earlier whole-request choice instead of
             # checking the request again for every context chunk.
@@ -1001,7 +1023,7 @@ class MultimodalScheduler(RequestScheduler):
                     continue
                 assert acquire_result is CacheAcquireResult.NEW_RESERVATION
                 cost = state.encoder_token_lengths[item_idx]
-                if remaining_batch_slots == 0 or cost > remaining_tokens:
+                if not self._can_schedule_item(cost, remaining_batch_slots, remaining_tokens):
                     break
                 request_items.append(item_idx)
                 selected_cache_keys.add(cache_key)
@@ -1009,7 +1031,7 @@ class MultimodalScheduler(RequestScheduler):
                     state.embedding_lengths[item_idx] * self.bytes_per_encoder_embedding
                 )
                 remaining_batch_slots -= 1
-                remaining_tokens -= cost
+                remaining_tokens = max(0, remaining_tokens - cost)
 
             if request_items:
                 selected[request.request_id] = request_items
@@ -1067,6 +1089,26 @@ class MultimodalScheduler(RequestScheduler):
         selected_cache_keys: set[Hashable] = set()
         items_to_encode: set[tuple[int, int]] = set()
         removals = self._release_paused_request_entries(active_requests, paused_request_ids)
+        if not self.encoder_outputs_ready_immediately:
+            # External encoder work may span several scheduler iterations.
+            # Keep those producers charged until their outputs arrive instead
+            # of treating every new iteration as an empty encoder batch.
+            pending_tokens_by_key: dict[Hashable, int] = {}
+            for request in active_requests:
+                state = request.py_mm_encoder_state
+                if state is None:
+                    continue
+                for item_idx, cache_key in enumerate(state.item_cache_keys):
+                    if cache_key is None or self._is_item_ready(request, item_idx):
+                        continue
+                    token_cost = state.encoder_token_lengths[item_idx]
+                    previous_cost = pending_tokens_by_key.setdefault(cache_key, token_cost)
+                    if previous_cost != token_cost:
+                        raise ValueError(
+                            "duplicate MM encoder cache keys must have matching token costs"
+                        )
+            remaining_batch_slots = max(0, remaining_batch_slots - len(pending_tokens_by_key))
+            remaining_tokens = max(0, remaining_tokens - sum(pending_tokens_by_key.values()))
         ready_context_requests: RequestList = []
         blocked_request_ids: list[int] = []
         chunk_sizes: dict[int, int] = {}
@@ -1120,7 +1162,7 @@ class MultimodalScheduler(RequestScheduler):
                 if acquire_result is not CacheAcquireResult.NEW_RESERVATION:
                     continue
                 cost = state.encoder_token_lengths[item_idx]
-                if remaining_batch_slots == 0 or cost > remaining_tokens:
+                if not self._can_schedule_item(cost, remaining_batch_slots, remaining_tokens):
                     state.clear_item_cache_key(item_idx)
                     self.encoder_cache.release(cache_key)
                     unavailable_item = item_idx
@@ -1129,7 +1171,7 @@ class MultimodalScheduler(RequestScheduler):
                 selected_cache_keys.add(cache_key)
                 items_to_encode.add((request.request_id, item_idx))
                 remaining_batch_slots -= 1
-                remaining_tokens -= cost
+                remaining_tokens = max(0, remaining_tokens - cost)
                 if not self.encoder_outputs_ready_immediately:
                     # The reservation is the demand sent to the external
                     # encoder. Unlike a local forward, its output is not
@@ -1179,6 +1221,8 @@ class MultimodalScheduler(RequestScheduler):
 
         if self.scheduling_policy is MultimodalEncoderSchedulingPolicy.EAGER:
             for request in active_requests:
+                if remaining_batch_slots == 0:
+                    break
                 if request.request_id in paused_request_ids:
                     continue
                 state = request.py_mm_encoder_state
@@ -1187,6 +1231,13 @@ class MultimodalScheduler(RequestScheduler):
                 for item_idx in self._get_unconsumed_items(request):
                     if state.item_cache_keys[item_idx] is not None:
                         continue
+                    cost = state.encoder_token_lengths[item_idx]
+                    # This phase only fills otherwise idle encoder capacity;
+                    # current-window cache hits and followers were already
+                    # handled above. Avoid acquire/release churn when the next
+                    # optional item cannot fit this iteration.
+                    if not self._can_schedule_item(cost, remaining_batch_slots, remaining_tokens):
+                        break
                     cache_key, acquire_result = self._acquire_item_cache_entry(
                         request, item_idx, selected_cache_keys
                     )
@@ -1194,16 +1245,11 @@ class MultimodalScheduler(RequestScheduler):
                         break
                     if acquire_result is not CacheAcquireResult.NEW_RESERVATION:
                         continue
-                    cost = state.encoder_token_lengths[item_idx]
-                    if remaining_batch_slots == 0 or cost > remaining_tokens:
-                        state.clear_item_cache_key(item_idx)
-                        self.encoder_cache.release(cache_key)
-                        break
                     selected.setdefault(request.request_id, []).append(item_idx)
                     selected_cache_keys.add(cache_key)
                     items_to_encode.add((request.request_id, item_idx))
                     remaining_batch_slots -= 1
-                    remaining_tokens -= cost
+                    remaining_tokens = max(0, remaining_tokens - cost)
 
         request_by_id = {request.request_id: request for request in active_requests}
         selected_output_bytes = 0

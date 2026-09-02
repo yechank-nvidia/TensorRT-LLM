@@ -163,6 +163,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.garbage_collection_gen0_threshold = _llm_args.garbage_collection_gen0_threshold if _llm_args is not None else None
         _backend = None if _llm_args is None else _llm_args.backend
         self._is_pytorch_backend = _backend in ["pytorch", "_autodeploy"]
+        self._enable_mm_encoder_demand_queue = bool(
+            _backend == "pytorch" and _llm_args is not None
+            and _llm_args.disable_mm_encoder)
         self._enable_resource_governor = bool(
             getattr(_llm_args, "enable_resource_governor", False))
 
@@ -470,6 +473,11 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._resource_governor_queue = IpcQueue(
             is_server=True, name="proxy_resource_governor_queue"
         ) if self._enable_resource_governor else None
+        self._mm_encoder_demand_queue = IpcQueue(
+            is_server=True,
+            socket_type=zmq.PULL,
+            name="proxy_mm_encoder_demand_queue",
+        ) if self._enable_mm_encoder_demand_queue else None
         # Stats and KV events are now fetched via RPC, not IPC queues.
         return WorkerCommIpcAddrs(
             # A connect-mode queue has no bound .address; use the preset one.
@@ -480,7 +488,25 @@ class GenerationExecutorProxy(GenerationExecutor):
             resource_governor_queue_addr=self._resource_governor_queue.address
             if self._resource_governor_queue is not None else None,
             frontend_result_queue_addrs=frontend_result_addrs,
+            mm_encoder_demand_queue_addr=(self._mm_encoder_demand_queue.address
+                                          if self._mm_encoder_demand_queue
+                                          is not None else None),
         )
+
+    def take_multimodal_encoder_demands(
+            self,
+            timeout: Optional[float] = None) -> list[tuple[int, list[int]]]:
+        """Return item demands without waiting for a worker RPC round trip."""
+        queue = getattr(self, "_mm_encoder_demand_queue", None)
+        if queue is None:
+            return []
+        demands = []
+        if timeout is not None:
+            if not queue.poll(timeout):
+                return demands
+            demands.append(queue.get())
+        demands.extend(queue.drain())
+        return demands
 
     def multi_frontend_attach_info(self) -> Optional[dict]:
         """The attach payload consumed by attached serving frontends.
@@ -908,6 +934,10 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.result_queue.close()
         if self._resource_governor_queue is not None:
             self._resource_governor_queue.close()
+        mm_encoder_demand_queue = getattr(self, "_mm_encoder_demand_queue",
+                                          None)
+        if mm_encoder_demand_queue is not None:
+            mm_encoder_demand_queue.close()
         self._cleanup_multi_frontend_ipc_dir()
 
         self.workers_started = False

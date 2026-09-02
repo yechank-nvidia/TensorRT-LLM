@@ -287,6 +287,7 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
         request_queue_addr=("request", b"key"),
         worker_init_status_queue_addr=("status", b"key"),
         resource_governor_queue_addr=None,
+        mm_encoder_demand_queue_addr=None,
         result_queue_addr=("result", b"key"),
     )
     worker_module.worker_main(

@@ -224,6 +224,7 @@ def worker_main(
     result_queue: Optional[IpcQueue] = None
     result_queues: Optional[List[IpcQueue]] = None
     resource_governor_queue: Optional[IpcQueue] = None
+    mm_encoder_demand_queue: Optional[IpcQueue] = None
 
     postproc_worker_config = postproc_worker_config or PostprocWorkerConfig()
 
@@ -264,6 +265,15 @@ def worker_main(
             is_server=False,
             name="worker_resource_governor_queue"
         ) if worker_queues.resource_governor_queue_addr else None
+        mm_encoder_demand_queue_addr = getattr(worker_queues,
+                                               "mm_encoder_demand_queue_addr",
+                                               None)
+        mm_encoder_demand_queue = IpcQueue(
+            mm_encoder_demand_queue_addr,
+            is_server=False,
+            socket_type=zmq.PUSH,
+            name="worker_mm_encoder_demand_queue",
+        ) if mm_encoder_demand_queue_addr else None
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
@@ -410,6 +420,9 @@ def worker_main(
                     # ranks.
                     worker.engine.set_resource_governor_queue(
                         resource_governor_queue)
+                if mm_encoder_demand_queue is not None:
+                    worker.engine.set_multimodal_encoder_demand_queue(
+                        mm_encoder_demand_queue)
 
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):

@@ -234,6 +234,7 @@ class WorkerCommIpcAddrs(NamedTuple):
     # these lanes; result_queue_addr then aliases lane 0 (the launcher).
     frontend_result_queue_addrs: Optional[list[tuple[str,
                                                      Optional[bytes]]]] = None
+    mm_encoder_demand_queue_addr: Optional[tuple[str, Optional[bytes]]] = None
 
 
 # Multi-frontend client_id namespacing: a FRONTEND_ID_BITS-wide frontend id

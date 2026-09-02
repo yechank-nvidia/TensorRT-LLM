@@ -159,10 +159,10 @@ def _make_single_token_context_graph_batch(
     return graph_batch, promoted_context_request_ids
 
 
-def _resolve_mm_encoder_token_budget(base_budget: int,
-                                     model_max_atomic_item_tokens: int) -> int:
-    """Keep the model's largest indivisible MM item schedulable."""
-    return max(base_budget, model_max_atomic_item_tokens)
+def _resolve_mm_encoder_runtime_token_capacity(
+        scheduling_budget: int, model_max_atomic_item_tokens: int) -> int:
+    """Size runtime buffers for the model's largest indivisible MM item."""
+    return max(scheduling_budget, model_max_atomic_item_tokens)
 
 
 def _validate_mm_encoder_scheduling_compatibility(
@@ -435,11 +435,12 @@ class PyTorchModelEngine(ModelEngine):
                                    if llm_args.encoder_max_batch_size
                                    is not None else self.batch_size)
         # The multimodal encoder token budget falls back to the LLM-side value
-        # when unset. It may be raised after model load because atomic MM items
-        # cannot be split.
+        # when unset. Runtime buffers may be larger because atomic MM items
+        # cannot be split, but scheduling still honors this original budget.
         self.encoder_max_num_tokens = (llm_args.encoder_max_num_tokens
                                        if llm_args.encoder_max_num_tokens
                                        is not None else self.max_num_tokens)
+        self.encoder_scheduling_token_budget = self.encoder_max_num_tokens
 
         if checkpoint_loader is None:
             checkpoint_loader = _construct_checkpoint_loader(
@@ -581,17 +582,19 @@ class PyTorchModelEngine(ModelEngine):
         self.mm_encoder_attention_metadata_capacity: Optional[Dict[str,
                                                                    int]] = None
         self.mm_encoder_output_budget_bytes: Optional[int] = None
-        # Item scheduling limits four MM encoder resources:
+        # Item scheduling limits MM encoder resources independently:
         #   (A) `encoder_batch_size`: number of MM items per iteration.
-        #   (B) `encoder_max_num_tokens`: encoder input tokens per iteration.
-        #       It is raised when needed to fit the model's largest single item.
-        #   (C) `mm_encoder_output_budget_bytes`: output-cache bytes needed for
+        #   (B) `encoder_scheduling_token_budget`: configured encoder input
+        #       tokens per iteration. An item over this budget runs alone.
+        #   (C) `encoder_max_num_tokens`: runtime token capacity. It is raised
+        #       when needed to execute the model's largest single item.
+        #   (D) `mm_encoder_output_budget_bytes`: output-cache bytes needed for
         #       one legal encoder iteration. KV-capacity estimation reserves any
         #       part of this memory that warmup did not allocate.
-        #   (D) `encoder_cache_max_bytes`: optional extra cache space for reuse.
+        #   (E) `encoder_cache_max_bytes`: optional extra cache space for reuse.
         #       This makes the same cache larger; it does not create another one.
         # Prefill only needs items in its current prompt window and releases an
-        # item after consuming it, so only the largest single output must fit (C).
+        # item after consuming it, so only the largest single output must fit (D).
         if self.mm_encoder_item_scheduling_enabled:
             if self.encoder_max_num_tokens is None:
                 raise ValueError(
@@ -608,19 +611,21 @@ class PyTorchModelEngine(ModelEngine):
                     "get_mm_max_tokens_per_item() must return positive token "
                     "counts")
             model_max_atomic_item_tokens = max(max_tokens_per_item.values())
-            encoder_token_budget_base = self.encoder_max_num_tokens
-            effective_encoder_token_budget = _resolve_mm_encoder_token_budget(
-                encoder_token_budget_base, model_max_atomic_item_tokens)
-            if effective_encoder_token_budget > self.encoder_max_num_tokens:
+            encoder_runtime_token_capacity = (
+                _resolve_mm_encoder_runtime_token_capacity(
+                    self.encoder_scheduling_token_budget,
+                    model_max_atomic_item_tokens))
+            if encoder_runtime_token_capacity > self.encoder_max_num_tokens:
                 logger.warning_once(
                     f"encoder_max_num_tokens={self.encoder_max_num_tokens} "
                     "is smaller than the model's largest profiled atomic "
                     f"multimodal item ({model_max_atomic_item_tokens}); "
                     f"using {model_max_atomic_item_tokens} as the "
-                    "effective encoder runtime budget.",
+                    "encoder runtime capacity. The configured scheduling "
+                    "budget is unchanged.",
                     key="raise_encoder_max_num_tokens_for_atomic_item",
                 )
-                self.encoder_max_num_tokens = effective_encoder_token_budget
+                self.encoder_max_num_tokens = encoder_runtime_token_capacity
             attention_metadata_capacity = (
                 self.input_processor.get_mm_encoder_attention_metadata_capacity(
                     self.encoder_max_num_tokens))
@@ -633,13 +638,14 @@ class PyTorchModelEngine(ModelEngine):
                         "return nonempty positive capacities or None")
                 self.mm_encoder_attention_metadata_capacity = (
                     attention_metadata_capacity)
-            logger.info("Multimodal encoder token budget: "
-                        f"configured={llm_args.encoder_max_num_tokens}, "
-                        f"base={encoder_token_budget_base}, "
-                        f"effective={self.encoder_max_num_tokens}, "
-                        f"model_atomic_max={model_max_atomic_item_tokens}, "
-                        "attention_capacity="
-                        f"{self.mm_encoder_attention_metadata_capacity}.")
+            logger.info(
+                "Multimodal encoder token limits: "
+                f"configured={llm_args.encoder_max_num_tokens}, "
+                f"scheduling_budget={self.encoder_scheduling_token_budget}, "
+                f"runtime_capacity={self.encoder_max_num_tokens}, "
+                f"model_atomic_max={model_max_atomic_item_tokens}, "
+                "attention_capacity="
+                f"{self.mm_encoder_attention_metadata_capacity}.")
             self.mm_encoder_output_budget_bytes = (
                 self._compute_mm_encoder_output_budget_bytes())
         if (isinstance(self.model, MultimodalModelMixin)
@@ -3778,10 +3784,11 @@ class PyTorchModelEngine(ModelEngine):
     def _compute_mm_encoder_output_budget_bytes(self) -> int:
         """Compute the minimum MM encoder output-cache size.
 
-        `encoder_max_num_tokens` limits encoder input tokens in one iteration.
-        The input processor converts that limit to the largest possible number
-        of output rows, and this method multiplies the rows by their byte size.
-        The LLM token limit is unrelated and is not used here.
+        `encoder_max_num_tokens` is the runtime capacity needed for the largest
+        indivisible item. The input processor converts that capacity to the
+        largest possible number of output rows, and this method multiplies the
+        rows by their byte size. The smaller scheduling budget does not reduce
+        this safety floor.
 
         The model's one encoder cache must be at least this large. Persistent
         reuse may make the same cache larger. Only the largest single item must

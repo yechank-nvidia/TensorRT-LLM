@@ -5432,9 +5432,9 @@ class TorchLlmArgs(BaseLlmArgs):
             "limits encoder CUDA graph total-token buckets. For multimodal "
             "models, it limits encoder attention tokens scheduled in one "
             "iteration and is shared across all encoded modalities. It falls "
-            "back to `max_num_tokens` when unset. Because an atomic multimodal "
-            "item cannot be split, the effective budget is raised to the "
-            "model's largest atomic item when necessary."),
+            "back to `max_num_tokens` when unset. An atomic multimodal item "
+            "larger than this budget runs alone; internal runtime capacity is "
+            "still large enough to execute that item."),
         status="prototype")
 
     @field_validator("encoder_max_batch_size", "encoder_max_num_tokens")
