@@ -561,7 +561,8 @@ def test_encoder_cache_first_request_writes_per_item_entries():
     embeddings = model._get_or_encode_multimodal_embeddings([param])
 
     assert model.encode_calls == 1
-    assert embeddings.shape == (3, 4)
+    assert len(embeddings) == 1
+    assert embeddings[0].shape == (3, 4)
     assert len(model._multimodal_encoder_cache) == 2
 
 
@@ -710,9 +711,9 @@ def test_encoder_cache_mixed_attached_and_uncached_requests():
     # Since we set `local_embedding` to be `99.0` above, if we had actually called
     # `model.encode_multimodal_inputs` on it, we would have had `1.0` as the value instead for the
     # first request's embeddings.
-    torch.testing.assert_close(embeddings[:2], local_embedding)
+    torch.testing.assert_close(embeddings[0], local_embedding)
     # For the 2nd request, it should be equal to the `model.encode_calls` above.
-    torch.testing.assert_close(embeddings[2:], torch.ones((2, 4)))
+    torch.testing.assert_close(embeddings[1], torch.ones((2, 4)))
     cache = model._multimodal_encoder_cache
     assert cache is not None
     assert len(cache) == 1
@@ -741,8 +742,8 @@ def test_encoder_cache_partial_hit_encodes_miss_and_interleaves():
     # only the second request's novel item. Assembled tensor puts the cached hit before
     # the freshly encoded miss in item-index order.
     assert model.encode_calls == 2
-    torch.testing.assert_close(embeddings[:2], torch.full((2, 4), 1.0))
-    torch.testing.assert_close(embeddings[2:], torch.full((2, 4), 2.0))
+    torch.testing.assert_close(embeddings[0][:2], torch.full((2, 4), 1.0))
+    torch.testing.assert_close(embeddings[0][2:], torch.full((2, 4), 2.0))
     assert len(model._multimodal_encoder_cache) == 2
     messages = [" ".join(map(str, call.args)) for call in debug.call_args_list]
     assert any(
@@ -809,7 +810,7 @@ def test_encoder_cache_mm_processor_kwargs_do_not_collide():
     second_embeddings = model._get_or_encode_multimodal_embeddings([second])
 
     assert model.encode_calls == 2
-    assert not torch.equal(first_embeddings, second_embeddings)
+    assert not torch.equal(first_embeddings[0], second_embeddings[0])
 
 
 def test_encoder_cache_versions_do_not_collide():
@@ -896,7 +897,7 @@ def test_request_local_multimodal_embedding_wins_over_encoder_cache():
         embeddings = model._get_or_encode_multimodal_embeddings([chunk_param])
 
     assert model.encode_calls == 1
-    torch.testing.assert_close(embeddings, local_embedding)
+    torch.testing.assert_close(embeddings[0], local_embedding)
     put.assert_not_called()
     assert cache.stats().replacements == 0
 

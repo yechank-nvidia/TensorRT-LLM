@@ -1142,14 +1142,14 @@ class MultimodalModelMixin:
         *,
         input_ids: torch.Tensor,
         multimodal_params: Sequence[MultimodalParams],
-        embeddings: torch.Tensor,
+        embeddings: list[torch.Tensor],
         **forward_kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Optional hook before active chunk rows are selected.
 
-        Runs after cache lookup or encoder execution has produced full
-        per-request multimodal embeddings, but before the mixin selects rows
-        active in the current forward chunk.
+        Runs after cache lookup or encoder execution has produced the full
+        per-request multimodal embedding tensors, but before the mixin selects
+        rows active in the current forward chunk.
         """
         return input_ids, embeddings
 
@@ -1390,7 +1390,7 @@ class MultimodalModelMixin:
             **forward_kwargs,
         )
 
-        active_embeddings = find_input_mm_embeds([full_embeddings], list(context_params))
+        active_embeddings = find_input_mm_embeds(full_embeddings, list(context_params))
         active_embeddings, extra_embeds = self.after_active_multimodal_embeddings(
             active_embeddings=active_embeddings,
             multimodal_params=context_params,
@@ -1421,13 +1421,13 @@ class MultimodalModelMixin:
     def _get_or_encode_multimodal_embeddings(
         self,
         multimodal_params: Sequence[MultimodalParams],
-    ) -> torch.Tensor:
-        """Return cached multimodal embeddings or run the encoder for misses.
+    ) -> list[torch.Tensor]:
+        """Return per-request cached embeddings or run the encoder for misses.
 
         Item scheduling marks its current-window cache segments with a tuple.
-        This layer joins those segments so the model-facing path keeps the
-        existing single-tensor contract. Other callers retain the normal cache
-        lookup and encoder behavior.
+        This layer joins those already-active segments once. The normal path
+        retains request boundaries so chunk selection happens before final
+        batch materialization.
 
         During side-stream prefetch, this runs with the auxiliary stream current, so the H2D copies,
         the encoder, and every persistent-cache `put()` are issued on that stream. `TensorLRUCache`
@@ -1463,7 +1463,7 @@ class MultimodalModelMixin:
             else:
                 embedding = self.text_embedding_layer.weight.new_empty((0, self.embedding_dim))
             self._validate_embeddings([embedding], multimodal_params, current_chunk_only=True)
-            return embedding
+            return [embedding]
 
         encoder_cache = self._multimodal_encoder_cache
         cache_misses: list[MultimodalParams] = []
@@ -1504,7 +1504,7 @@ class MultimodalModelMixin:
         # Validate post-gather so cached-only paths (KV reuse, all-cached chunked prefill) are also
         # checked, not just paths that ran the encoder.
         self._validate_embeddings(embeddings, multimodal_params)
-        return embeddings[0]
+        return embeddings
 
     def _initialize_multimodal_encoder_cache(self, max_bytes: int) -> Optional[TensorLRUCache]:
         """Initialize the model-owned multimodal encoder-output cache once.
@@ -2011,13 +2011,12 @@ class MultimodalModelMixin:
         validate against only the current chunk's rows because the cache
         segments are already sliced to the active prompt window.
         """
-        if len(embeddings) != 1:
+        if len(embeddings) not in (1, len(multimodal_params)):
             raise ValueError(
-                f"MultimodalModelMixin requires a single embedding tensor, got {len(embeddings)} "
-                "tensors."
+                "MultimodalModelMixin requires either one packed embedding "
+                "tensor or one tensor per multimodal param, got "
+                f"{len(embeddings)} tensors for {len(multimodal_params)} params."
             )
-
-        embeddings_tensor = embeddings[0]
         expected_rows = 0
         has_runtime_metadata = []
         for param in multimodal_params:
@@ -2042,7 +2041,7 @@ class MultimodalModelMixin:
             )
             return
 
-        actual_rows = embeddings_tensor.shape[0]
+        actual_rows = sum(embedding.shape[0] for embedding in embeddings)
         if actual_rows != expected_rows:
             raise ValueError(
                 f"Multimodal embedding row count mismatch: expected {expected_rows}, got {actual_rows}."

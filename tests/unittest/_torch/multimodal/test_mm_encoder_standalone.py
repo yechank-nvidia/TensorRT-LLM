@@ -1272,8 +1272,8 @@ def test_chunked_prefill_multimodal_smoke(
     contexts to be split across multiple forward calls.  This exercises the
     code path in Qwen3VL's `_get_requests_with_mm_data` where
     `multimodal_embedding` is checked on the *second* chunk after
-    `get_multimodal_embeddings` has already concatenated the list of tensors
-    into a single tensor.
+    `get_multimodal_embeddings` has attached the encoder output to the
+    request.
 
     We intentionally do NOT assert that the generated text matches a reference
     because chunked prefill can introduce subtle non-determinism in the output

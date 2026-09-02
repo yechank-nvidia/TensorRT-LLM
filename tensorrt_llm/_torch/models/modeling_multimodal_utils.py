@@ -278,7 +278,10 @@ def get_multimodal_embeddings(
         multimodal_params: All multimodal parameters in the batch.
         encoder_kwargs: Optional kwargs to pass to encoder_forward_fn.
     Returns:
-        List of multimodal embeddings for all multimodal params in the batch.
+        One multimodal embedding tensor per param when request layout metadata
+        is complete. Keeping request boundaries lets chunked prefill select
+        active rows before fusion joins the batch. Encoder outputs are returned
+        unchanged when the layout cannot be represented per request.
     """
     if not multimodal_params:
         return []
@@ -337,9 +340,12 @@ def get_multimodal_embeddings(
         _store_chunked_prefill_embeddings(uncached_multimodal_params,
                                           encoder_embeddings)
 
-    # Step 4: Gather all embeddings for the batch
+    # Step 4: Keep one embedding tensor per request.  The downstream slicer
+    # already accepts this layout, so it can select the current prefill rows
+    # before fusion materializes the active batch.  Concatenating here would
+    # make a full-batch temporary that chunked prefill immediately slices.
     for param in multimodal_params:
-        # concatenate if embeds is a list of tensors
+        # Join chunks belonging to one request, but not unrelated requests.
         embeds = param.multimodal_data.get("multimodal_embedding")
         if isinstance(embeds, list):
             param.multimodal_data["multimodal_embedding"] = _join_embeddings(
@@ -349,10 +355,19 @@ def get_multimodal_embeddings(
         param for param in multimodal_params
         if param.multimodal_data.get("multimodal_embedding", None) is not None
     ]
-    all_embeddings = _join_embeddings([
+    all_embeddings = [
         param.multimodal_data["multimodal_embedding"] for param in valid_params
-    ])
-    return [all_embeddings]
+    ]
+    has_request_layout = len(valid_params) == len(multimodal_params) and all(
+        param.multimodal_runtime is not None
+        and param.multimodal_runtime.total_embeds_in_request is not None
+        for param in multimodal_params)
+    if has_request_layout:
+        return all_embeddings
+
+    # Preserve the pre-concatenated fallback for incomplete runtime metadata,
+    # where there is no 1:1 request layout for the downstream slicer.
+    return [_join_embeddings(all_embeddings)]
 
 
 def get_attached_multimodal_embeddings(
@@ -360,7 +375,8 @@ def get_attached_multimodal_embeddings(
     """Gather embeddings already stored on MultimodalParams.
 
     Use this on E/P prefill workers and cached-only paths. The encoder already ran somewhere else.
-    This only makes the tensor list that `find_input_mm_embeds` slices.
+    This only makes the per-request tensor list that `find_input_mm_embeds`
+    slices before final fusion.
 
     Side-stream-prefetched requests must use `get_multimodal_embeddings`, which waits on
     `encoder_event` and registers attached tensors with the consuming stream before gathering them.
@@ -381,7 +397,16 @@ def get_attached_multimodal_embeddings(
 
     if not attached_embeddings:
         return []
-    # Match get_multimodal_embeddings output: one concatenated tensor.
+    has_request_layout = len(attached_embeddings) == len(
+        multimodal_params) and all(
+            param.multimodal_runtime is not None
+            and param.multimodal_runtime.total_embeds_in_request is not None
+            for param in multimodal_params)
+    if has_request_layout:
+        return attached_embeddings
+
+    # Without one tensor per input param, retain the pre-concatenated layout
+    # understood by ``find_input_mm_embeds``.
     return [_join_embeddings(attached_embeddings)]
 
 

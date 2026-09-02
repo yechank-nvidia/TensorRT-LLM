@@ -979,8 +979,10 @@ class TestChunkedPrefillCaching:
             encoder_forward_fn=encoder_fn,
             multimodal_params=[param_a, param_b],
         )
-        assert len(result) == 1
-        assert result[0].shape == (8, self.HIDDEN)
+        assert [embedding.shape for embedding in result] == [
+            (5, self.HIDDEN),
+            (3, self.HIDDEN),
+        ]
         assert model.vision_encoder.call_count == 1, (
             "image params should be encoded in a single batched vision_encoder call"
         )
@@ -994,4 +996,6 @@ class TestChunkedPrefillCaching:
         assert model.vision_encoder.call_count == 1, (
             "`vision_encoder` was called again on the second chunk. Caching is broken."
         )
-        assert torch.equal(result2[0], result[0])
+        assert len(result2) == len(result)
+        for cached, original in zip(result2, result, strict=True):
+            assert torch.equal(cached, original)

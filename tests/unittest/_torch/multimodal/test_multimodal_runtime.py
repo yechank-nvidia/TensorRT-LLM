@@ -64,9 +64,9 @@ class TestFindInputMmEmbed:
         mm_embeds = get_attached_multimodal_embeddings(multimodal_params)
         result = find_input_mm_embeds(mm_embeds, multimodal_params)
 
-        assert len(result) == 1
-        torch.testing.assert_close(
-            result[0], torch.cat([cached_emb1[1:5], cached_emb2[2:4]], dim=0))
+        assert len(result) == 2
+        torch.testing.assert_close(result[0], cached_emb1[1:5])
+        torch.testing.assert_close(result[1], cached_emb2[2:4])
 
     def test_empty_mm_embeds_rejected_for_active_tokens(self):
         multimodal_params = [_make_multimodal_params(0, 3, [3])]
@@ -392,9 +392,12 @@ class TestGetMultimodalEmbeddings:
         # Encoder should be called once
         assert encoder_call_count == 1
 
-        # Should return concatenated embeddings
-        assert len(result) == 1
-        assert result[0].shape == (20, _EMBED_DIM)  # 5 + 8 + 7 = 20 tokens
+        # Keep request boundaries until the active rows are selected.
+        assert [embedding.shape for embedding in result] == [
+            (5, _EMBED_DIM),
+            (8, _EMBED_DIM),
+            (7, _EMBED_DIM),
+        ]
 
         # All params should now have cached embeddings
         for param in multimodal_params:
@@ -432,13 +435,12 @@ class TestGetMultimodalEmbeddings:
         # Encoder should not be called
         assert encoder_call_count == 0
 
-        # Should return concatenated cached embeddings
-        assert len(result) == 1
-        assert result[0].shape == (20, _EMBED_DIM)  # 5 + 8 + 7 = 20 tokens
-
-        # Verify the embeddings are correct
-        expected = torch.cat([cached_emb1, cached_emb2, cached_emb3], dim=0)
-        torch.testing.assert_close(result[0], expected)
+        # Cached request tensors stay separate until active-row selection.
+        assert len(result) == 3
+        for actual, expected in zip(result,
+                                    [cached_emb1, cached_emb2, cached_emb3],
+                                    strict=True):
+            torch.testing.assert_close(actual, expected)
 
     def test_mixed_cached_and_uncached(self):
         """Test mix of cached and uncached params."""
@@ -475,9 +477,11 @@ class TestGetMultimodalEmbeddings:
         assert len(processed_params) == 1  # Only the middle param
         assert processed_params[0] == multimodal_params[1]
 
-        # Should return concatenated embeddings
-        assert len(result) == 1
-        assert result[0].shape == (20, _EMBED_DIM)  # 5 + 8 + 7 = 20 tokens
+        assert [embedding.shape for embedding in result] == [
+            (5, _EMBED_DIM),
+            (8, _EMBED_DIM),
+            (7, _EMBED_DIM),
+        ]
 
         # Uncached param should now have cached embedding
         assert "multimodal_embedding" in multimodal_params[1].multimodal_data
@@ -584,15 +588,15 @@ class TestGetMultimodalEmbeddings:
         assert multimodal_params[2].multimodal_data[
             "multimodal_embedding"].shape == (7, _EMBED_DIM)
 
-        # Verify the result is correct concatenation
-        assert result[0].shape == (20, _EMBED_DIM)
-        expected = torch.cat([
+        # The returned tensors are the per-request split views themselves.
+        expected = [
             multimodal_params[0].multimodal_data["multimodal_embedding"],
             multimodal_params[1].multimodal_data["multimodal_embedding"],
-            multimodal_params[2].multimodal_data["multimodal_embedding"]
-        ],
-                             dim=0)
-        torch.testing.assert_close(result[0], expected)
+            multimodal_params[2].multimodal_data["multimodal_embedding"],
+        ]
+        assert len(result) == len(expected)
+        for actual, expected_embedding in zip(result, expected, strict=True):
+            torch.testing.assert_close(actual, expected_embedding)
 
     def test_special_tokens_basic_caching(self):
         """Test caching behavior with special tokens present."""
@@ -619,9 +623,11 @@ class TestGetMultimodalEmbeddings:
 
         result = get_multimodal_embeddings(mock_encoder, multimodal_params)
 
-        # Should return concatenated embeddings
-        assert len(result) == 1
-        assert result[0].shape == (18, _EMBED_DIM)  # 8 + 7 + 3 = 18 tokens
+        assert [embedding.shape for embedding in result] == [
+            (8, _EMBED_DIM),
+            (7, _EMBED_DIM),
+            (3, _EMBED_DIM),
+        ]
 
         # Check that embeddings were split correctly based on non-special token counts
         assert multimodal_params[0].multimodal_data[
@@ -651,9 +657,11 @@ class TestGetMultimodalEmbeddings:
 
         result = get_multimodal_embeddings(mock_encoder, multimodal_params)
 
-        # Should return empty embeddings
-        assert len(result) == 1
-        assert result[0].shape == (0, _EMBED_DIM)
+        # Preserve one empty embedding per request.
+        assert [embedding.shape for embedding in result] == [
+            (0, _EMBED_DIM),
+            (0, _EMBED_DIM),
+        ]
 
         # Cached embeddings should also be empty
         assert multimodal_params[0].multimodal_data[
@@ -689,9 +697,10 @@ class TestGetMultimodalEmbeddings:
         # Encoder should be called once for uncached param
         assert encoder_call_count == 1
 
-        # Should return concatenated embeddings: 4 + 9 = 13 tokens
-        assert len(result) == 1
-        assert result[0].shape == (13, _EMBED_DIM)
+        assert [embedding.shape for embedding in result] == [
+            (4, _EMBED_DIM),
+            (9, _EMBED_DIM),
+        ]
 
         # Verify cached embedding is preserved and uncached is now cached
         torch.testing.assert_close(

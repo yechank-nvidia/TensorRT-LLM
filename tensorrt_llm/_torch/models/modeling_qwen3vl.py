@@ -1774,12 +1774,20 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         if not self.use_deepstack:
             return active_embeddings, []
 
-        deepstack_embeds = []
+        deepstack_segments = [[] for _ in range(self.deepstack_num_level)]
         for index, mm_embed in enumerate(active_embeddings):
             active_embeddings[index], deepstack_embed = self.split_mm_embeds(
                 mm_embed, self.deepstack_num_level
             )
-            deepstack_embeds.extend(deepstack_embed)
+            for level, segment in enumerate(deepstack_embed):
+                deepstack_segments[level].append(segment)
+        # The common runtime keeps active primary embeddings split by request
+        # until generic fusion. Qwen's deepstack consumer instead needs one
+        # dense tensor per level, so materialize only those active rows here.
+        deepstack_embeds = [
+            segments[0] if len(segments) == 1 else torch.cat(segments, dim=0)
+            for segments in deepstack_segments
+        ]
         return active_embeddings, deepstack_embeds
 
     def _fuse_multimodal_embeddings(

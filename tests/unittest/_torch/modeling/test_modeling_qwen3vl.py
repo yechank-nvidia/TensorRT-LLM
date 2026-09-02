@@ -474,6 +474,34 @@ def test_qwen3vl_deepstack_fusion_reuses_registered_buffer():
     )
 
 
+def test_qwen3vl_deepstack_joins_active_rows_by_level():
+    model = object.__new__(modeling_qwen3vl.Qwen3VLModelBase)
+    torch.nn.Module.__init__(model)
+    model.use_deepstack = True
+    model.deepstack_num_level = 2
+
+    request_a = torch.arange(2 * 12, dtype=torch.float32).reshape(2, 12)
+    request_b = torch.arange(3 * 12, dtype=torch.float32).reshape(3, 12) + 100
+
+    primary, deepstack = model.after_active_multimodal_embeddings(
+        active_embeddings=[request_a, request_b],
+        multimodal_params=[],
+    )
+
+    assert len(primary) == 2
+    torch.testing.assert_close(primary[0], request_a[:, :4])
+    torch.testing.assert_close(primary[1], request_b[:, :4])
+    assert len(deepstack) == 2
+    torch.testing.assert_close(
+        deepstack[0],
+        torch.cat((request_a[:, 4:8], request_b[:, 4:8]), dim=0),
+    )
+    torch.testing.assert_close(
+        deepstack[1],
+        torch.cat((request_a[:, 8:12], request_b[:, 8:12]), dim=0),
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen3vl_init_preserves_caller_quant_config():
     """Building Qwen3VLModel must not mutate the caller's quant_config."""

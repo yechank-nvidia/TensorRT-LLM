@@ -1089,7 +1089,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
             embeddings = get_multimodal_embeddings(model.encode_multimodal_inputs, params)
 
         expected = torch.tensor([[2.0], [1.0], [3.0]])
-        torch.testing.assert_close(embeddings[0], expected)
+        torch.testing.assert_close(torch.cat(embeddings), expected)
         for param, expected_embedding in zip(params, expected, strict=True):
             torch.testing.assert_close(
                 param.multimodal_data["multimodal_embedding"], expected_embedding.unsqueeze(0)
