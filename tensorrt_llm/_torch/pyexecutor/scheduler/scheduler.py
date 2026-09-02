@@ -717,22 +717,7 @@ class MultimodalScheduler(RequestScheduler):
         if state is None:
             return []
         begin = self._get_context_chunk_start(request)
-        mm_data = request.py_multimodal_data
-        cumsum = mm_data.get("multimodal_embed_mask_cumsum") if isinstance(mm_data, dict) else None
-        if cumsum is not None:
-            consumed_rows = int(cumsum[begin - 1]) if begin > 0 else 0
-            return state.items_overlapping_embedding_rows(
-                consumed_rows, state.embedding_row_offsets[-1]
-            )
-        positions = request.multimodal_positions
-        lengths = request.multimodal_lengths
-        if positions is not None and lengths is not None:
-            return [
-                item_idx
-                for item_idx, (position, length) in enumerate(zip(positions, lengths, strict=True))
-                if int(position) + int(length) > begin
-            ]
-        return list(range(state.num_items))
+        return get_mm_items_for_chunk(request, begin, request.prompt_len)
 
     def _get_partially_consumed_items(self, request: LlmRequest) -> set[int]:
         """Return items that cross the start of the next prefill chunk."""
