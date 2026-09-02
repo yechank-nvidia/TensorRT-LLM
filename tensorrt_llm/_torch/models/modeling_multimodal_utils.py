@@ -502,7 +502,8 @@ def filter_mm_token_from_input_ids(
         mm_token_mask = input_ids >= vocab_size
     else:
         mm_token_ids = mm_token_ids.to(input_ids.device, dtype=input_ids.dtype)
-        mm_token_mask = torch.isin(input_ids, mm_token_ids)
+        mm_token_mask = (input_ids == mm_token_ids[0] if mm_token_ids.numel()
+                         == 1 else torch.isin(input_ids, mm_token_ids))
     # NOTE: torch.where() enforces a host sync
     text_token_indices = torch.where(~mm_token_mask)[0]
     mm_token_indices = torch.where(mm_token_mask)[0]

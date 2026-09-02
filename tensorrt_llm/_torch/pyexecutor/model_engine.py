@@ -4437,7 +4437,9 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 mm_token_ids = mm_token_ids.to(device="cpu",
                                                dtype=input_ids.dtype)
-            mm_token_mask = torch.isin(input_ids, mm_token_ids)
+            mm_token_mask = (input_ids == mm_token_ids[0]
+                             if mm_token_ids.numel() == 1 else torch.isin(
+                                 input_ids, mm_token_ids))
             return None, torch.where(mm_token_mask)[0]
 
         text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
