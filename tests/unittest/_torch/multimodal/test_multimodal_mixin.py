@@ -1066,7 +1066,9 @@ def test_build_multimodal_encoder_input_slices_audio_input_features():
 
     contiguous = model.build_multimodal_encoder_input(param, [0, 1])
     contiguous_features = contiguous.multimodal_data["audio"]["input_features"]
+    contiguous_mask = contiguous.multimodal_data["audio"]["input_features_mask"]
     assert contiguous_features.untyped_storage().data_ptr() == features.untyped_storage().data_ptr()
+    assert contiguous_mask.untyped_storage().data_ptr() == mask.untyped_storage().data_ptr()
 
 
 @pytest.mark.parametrize(

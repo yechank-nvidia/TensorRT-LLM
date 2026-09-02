@@ -322,13 +322,19 @@ class MultimodalEncoderMixin:
     ) -> Dict[str, Any]:
         """Slice modality fields whose leading axis matches item count."""
         skip = set(already_sliced)
+        tensor_selector: Sequence[int] | slice = item_indices
+        if (item_indices and item_indices[0] >= 0 and item_indices[-1] < n_items
+                and list(item_indices) == list(
+                    range(item_indices[0],
+                          item_indices[0] + len(item_indices)))):
+            tensor_selector = slice(item_indices[0], item_indices[-1] + 1)
         sliced: Dict[str, Any] = {}
         for key, value in modality_data.items():
             if key in skip:
                 continue
             if (isinstance(value, torch.Tensor) and value.dim() > 0
                     and value.shape[0] == n_items):
-                sliced[key] = value[item_indices]
+                sliced[key] = value[tensor_selector]
             elif isinstance(value, list) and len(value) == n_items:
                 sliced[key] = [value[i] for i in item_indices]
         return sliced
