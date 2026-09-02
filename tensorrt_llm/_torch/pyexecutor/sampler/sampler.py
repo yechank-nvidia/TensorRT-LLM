@@ -56,7 +56,12 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ...utils import torch_multi_arange
-from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from ..llm_request import (
+    LlmRequest,
+    LlmRequestState,
+    get_draft_token_length,
+    get_multimodal_encoder_token_lengths,
+)
 from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
 from .beam_search import BeamHistoryBuilder, BeamSearchHandler, finalize_beam, prepare_beam_search
@@ -348,12 +353,16 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
             # Snapshot the handoff metadata before the executor releases the
             # completed encoder request's raw multimodal resources.
             mm_data = request.py_multimodal_data or {}
+            encoder_token_lengths = get_multimodal_encoder_token_lengths(request)
             multimodal_layouts.append(
                 DisaggPrefillMultimodalInputs(
                     prompt_token_ids=list(request.get_tokens(0)),
                     multimodal_lengths=list(multimodal_lengths),
                     multimodal_positions=list(multimodal_positions),
                     multimodal_embedding_lengths=list(mm_embedding_lengths),
+                    encoder_token_lengths=(
+                        None if encoder_token_lengths is None else list(encoder_token_lengths)
+                    ),
                     multimodal_item_run_cu_offsets=(
                         None
                         if request.multimodal_item_run_cu_offsets is None

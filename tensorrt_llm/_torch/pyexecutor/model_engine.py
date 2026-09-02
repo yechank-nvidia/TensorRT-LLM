@@ -67,7 +67,8 @@ from ..models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from ..models.modeling_multimodal_mixin import (MultimodalEncoderContractError,
                                                 MultimodalModelMixin,
                                                 _build_request_multimodal_input)
-from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
+from ..models.modeling_multimodal_utils import (_is_mm_disagg,
+                                                filter_mm_token_from_input_ids)
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
 from ..moe.expert_statistic import ExpertStatistic
@@ -562,14 +563,16 @@ class PyTorchModelEngine(ModelEngine):
         # `MultimodalModelMixin` ClassVar). The engine stores only the
         # actionable flag: whether the item-scheduling wiring is engaged this
         # run (setup below, scheduler wrap, executor encoder step).
-        # `disable_mm_encoder` and a `DISABLED` policy both keep the capability
-        # but run only the base LLM scheduler.
+        # A DISABLED policy runs only the base LLM scheduler. A worker with no
+        # local encoder does the same unless it explicitly runs as the MM
+        # disaggregated consumer, where externally produced items still need
+        # scheduling and cache ownership.
         _mm_config = getattr(self.llm_args, "multimodal_config", None)
         _mm_scheduling_policy = (_mm_config.encoder_scheduling_policy
                                  if _mm_config is not None else
                                  MultimodalEncoderSchedulingPolicy.DEFAULT)
         self.mm_encoder_item_scheduling_enabled = (
-            not self.llm_args.disable_mm_encoder
+            (not self.llm_args.disable_mm_encoder or _is_mm_disagg())
             and isinstance(self.model, MultimodalModelMixin)
             and self.model.supports_mm_encoder_item_scheduling and
             _mm_scheduling_policy != MultimodalEncoderSchedulingPolicy.DISABLED)
@@ -3538,6 +3541,7 @@ class PyTorchModelEngine(ModelEngine):
         request_by_id = {request.request_id: request for request in requests}
         encoder_items = []
         output_targets: List[Tuple[int, Hashable, int]] = []
+        ready_outputs: List[Tuple[torch.Tensor, Tuple[int, Hashable, int]]] = []
         scheduled_cache_keys: set[Hashable] = set()
 
         def requests_using_cache_keys(
@@ -3564,6 +3568,22 @@ class PyTorchModelEngine(ModelEngine):
                     request_ids={request_id})
             multimodal_param = MultimodalParams(
                 multimodal_data=request.py_multimodal_data)
+            external_outputs = multimodal_param.multimodal_data.get(
+                "multimodal_embedding")
+            if external_outputs is not None:
+                # E/P prefill already owns producer views. Feed selected views
+                # through the same cache commit below instead of invoking a
+                # local encoder that may not exist on this worker.
+                if not isinstance(external_outputs, (list, tuple)):
+                    raise MultimodalEncoderRequestError(
+                        "External MM encoder outputs must be an item-aligned list",
+                        request_ids={request_id},
+                    )
+                if len(external_outputs) != state.num_items:
+                    raise MultimodalEncoderRequestError(
+                        "External MM encoder outputs must match request item count",
+                        request_ids={request_id},
+                    )
             for item_idx in item_indices:
                 cache_key = state.item_cache_keys[item_idx]
                 if cache_key is None:
@@ -3576,44 +3596,55 @@ class PyTorchModelEngine(ModelEngine):
                         request_ids=requests_using_cache_keys({cache_key}),
                     )
                 scheduled_cache_keys.add(cache_key)
-                encoder_items.append((multimodal_param, item_idx))
-                output_targets.append(
-                    (item_idx, cache_key, state.embedding_lengths[item_idx]))
+                output_target = (item_idx, cache_key,
+                                 state.embedding_lengths[item_idx])
+                if external_outputs is None:
+                    encoder_items.append((multimodal_param, item_idx))
+                    output_targets.append(output_target)
+                else:
+                    output = external_outputs[item_idx]
+                    if not isinstance(output, torch.Tensor):
+                        raise MultimodalEncoderRequestError(
+                            f"External MM encoder item {item_idx} is not a tensor",
+                            request_ids={request_id},
+                        )
+                    ready_outputs.append((output, output_target))
 
-        try:
-            encoder_inputs = self.model.prepare_multimodal_encoder_inputs(
-                encoder_items)
-        except MultimodalEncoderContractError as error:
-            raise MultimodalEncoderRequestError(
-                str(error),
-                request_ids=requests_using_cache_keys(scheduled_cache_keys),
-            ) from error
-        for encoder_input, _, _ in encoder_inputs:
-            encoder_input.to_device(
-                "multimodal_data",
-                "cuda",
-                pin_memory=prefer_pinned(),
-                target_keywords=getattr(self.model,
-                                        "multimodal_data_device_paths", None),
-            )
+        if encoder_items:
+            try:
+                encoder_inputs = self.model.prepare_multimodal_encoder_inputs(
+                    encoder_items)
+            except MultimodalEncoderContractError as error:
+                raise MultimodalEncoderRequestError(
+                    str(error),
+                    request_ids=requests_using_cache_keys(scheduled_cache_keys),
+                ) from error
+            for encoder_input, _, _ in encoder_inputs:
+                encoder_input.to_device(
+                    "multimodal_data",
+                    "cuda",
+                    pin_memory=prefer_pinned(),
+                    target_keywords=getattr(self.model,
+                                            "multimodal_data_device_paths",
+                                            None),
+                )
 
-        try:
-            outputs = self.model.forward_multimodal_encoder_items(
-                encoder_inputs)
-        except MultimodalEncoderContractError as error:
-            raise MultimodalEncoderRequestError(
-                str(error),
-                request_ids=requests_using_cache_keys(scheduled_cache_keys),
-            ) from error
-        if len(outputs) != len(output_targets):
-            raise MultimodalEncoderRequestError(
-                "MM item encoder must return one output per item",
-                request_ids=requests_using_cache_keys(scheduled_cache_keys),
-            )
+            try:
+                outputs = self.model.forward_multimodal_encoder_items(
+                    encoder_inputs)
+            except MultimodalEncoderContractError as error:
+                raise MultimodalEncoderRequestError(
+                    str(error),
+                    request_ids=requests_using_cache_keys(scheduled_cache_keys),
+                ) from error
+            if len(outputs) != len(output_targets):
+                raise MultimodalEncoderRequestError(
+                    "MM item encoder must return one output per item",
+                    request_ids=requests_using_cache_keys(scheduled_cache_keys),
+                )
+            ready_outputs.extend(zip(outputs, output_targets, strict=True))
 
-        for output, (item_idx, cache_key, expected_rows) in zip(outputs,
-                                                                output_targets,
-                                                                strict=True):
+        for output, (item_idx, cache_key, expected_rows) in ready_outputs:
             if output.shape[0] != expected_rows:
                 raise MultimodalEncoderRequestError(
                     f"MM item {item_idx} produced {output.shape[0]} embeddings; "

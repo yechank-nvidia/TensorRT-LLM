@@ -482,6 +482,7 @@ def test_disagg_prefill_multimodal_inputs_builds_typed_handoff():
         multimodal_lengths=[4],
         multimodal_positions=[1],
         multimodal_embedding_lengths=[3],
+        encoder_token_lengths=[12],
         multimodal_item_run_cu_offsets=[0, 1],
         multimodal_run_positions=[1],
         multimodal_run_lengths=[4],
@@ -498,9 +499,21 @@ def test_disagg_prefill_multimodal_inputs_builds_typed_handoff():
     assert multimodal_input.multimodal_run_positions == [1]
     assert multimodal_input.multimodal_run_lengths == [4]
     assert handoff.multimodal_embedding_lengths == [3]
+    assert handoff.encoder_token_lengths == [12]
     assert handoff.special_token_offsets == [2]
     assert handoff.item_types == [0]
     assert handoff.multimodal_embed_mask_cumsum is cumsum
+
+
+def test_disagg_prefill_multimodal_inputs_rejects_misaligned_encoder_costs():
+    with pytest.raises(ValueError, match="encoder_token_lengths must match"):
+        DisaggPrefillMultimodalInputs(
+            prompt_token_ids=[10, 1001, 20],
+            multimodal_lengths=[1],
+            multimodal_positions=[1],
+            multimodal_embedding_lengths=[1],
+            encoder_token_lengths=[4, 8],
+        )
 
 
 def test_multimodal_input_rejects_invalid_prompt_spans():

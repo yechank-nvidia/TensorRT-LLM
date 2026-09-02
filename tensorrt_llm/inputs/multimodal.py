@@ -339,12 +339,18 @@ class MultimodalInput:
 
 @dataclass
 class DisaggPrefillMultimodalInputs:
-    """Typed multimodal metadata returned by E/P disagg prefill processors."""
+    """Typed multimodal metadata carried from encoder to prefill.
+
+    ``encoder_token_lengths`` is the producer-known cost of encoding each
+    item. Prefill uses it only when the handoff follows item scheduling; older
+    whole-request handoffs may omit it.
+    """
 
     prompt_token_ids: List[int]
     multimodal_lengths: List[int]
     multimodal_positions: List[int]
     multimodal_embedding_lengths: List[int]
+    encoder_token_lengths: Optional[List[int]] = None
     multimodal_item_run_cu_offsets: Optional[List[int]] = None
     multimodal_run_positions: Optional[List[int]] = None
     multimodal_run_lengths: Optional[List[int]] = None
@@ -365,6 +371,15 @@ class DisaggPrefillMultimodalInputs:
 
         if any(length <= 0 for length in self.multimodal_embedding_lengths):
             raise ValueError("multimodal_embedding_lengths must be positive")
+        if self.encoder_token_lengths is not None:
+            _validate_int_list(self.encoder_token_lengths,
+                               "encoder_token_lengths")
+            if len(self.encoder_token_lengths) != len(
+                    self.multimodal_embedding_lengths):
+                raise ValueError("encoder_token_lengths must match "
+                                 "multimodal_embedding_lengths")
+            if any(length <= 0 for length in self.encoder_token_lengths):
+                raise ValueError("encoder_token_lengths must be positive")
 
         _validate_multimodal_runs(
             len(self.multimodal_lengths),
@@ -472,6 +487,7 @@ class MultimodalRuntimeData:
 # and must never be moved to GPU by `MultimodalParams.to_device`.
 # Extend only after auditing each key's consumers.
 _CPU_ONLY_MULTIMODAL_DATA_KEYS = frozenset({
+    "encoder_token_lengths",
     "multimodal_embed_mask_cumsum",
     "multimodal_embedding_lengths",
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -1126,6 +1142,7 @@ def find_mm_token_lengths(
 # payload (e.g. mrope-only warmup on an mrope-enabled model) and the
 # check_mm_embed_cumsum_if_needed gate short-circuits.
 _MM_METADATA_ONLY_KEYS = frozenset({
+    "encoder_token_lengths",
     "mrope_config",
     "multimodal_embed_mask_cumsum",
     "multimodal_embedding_lengths",

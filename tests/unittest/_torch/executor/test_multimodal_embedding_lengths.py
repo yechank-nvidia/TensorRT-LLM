@@ -216,6 +216,7 @@ def test_disagg_prefill_reuses_encoder_side_multimodal_layout():
         multimodal_lengths=[2],
         multimodal_positions=[1],
         multimodal_embedding_lengths=[2],
+        encoder_token_lengths=[8],
         multimodal_item_run_cu_offsets=[0, 1],
         multimodal_run_positions=[1],
         multimodal_run_lengths=[2],
@@ -240,6 +241,7 @@ def test_disagg_prefill_reuses_encoder_side_multimodal_layout():
     assert multimodal_params.multimodal_input.multimodal_positions == [1]
     assert multimodal_params.multimodal_input.multimodal_lengths == [2]
     assert multimodal_params.multimodal_data["multimodal_embedding_lengths"] == [2]
+    assert multimodal_params.multimodal_data["encoder_token_lengths"] == [8]
     assert multimodal_params.multimodal_data["multimodal_embed_mask_cumsum"] is cumsum
 
 
@@ -250,7 +252,11 @@ def test_mm_encoder_sampler_carries_embed_cumsum_in_layout():
     request = _FakeRequest(
         multimodal_lengths=[2],
         multimodal_positions=[1],
-        py_multimodal_data={"multimodal_embed_mask_cumsum": cumsum},
+        py_multimodal_data={
+            "encoder_token_lengths": [8],
+            "multimodal_embedding_lengths": [2],
+            "multimodal_embed_mask_cumsum": cumsum,
+        },
         tokens=[7, 99, 99, 8],
     )
     sampler = EarlyStopWithMMResult()
@@ -271,6 +277,7 @@ def test_mm_encoder_sampler_carries_embed_cumsum_in_layout():
     sampler.update_requests(state)
 
     assert request.py_result.multimodal_layout is not None
+    assert request.py_result.multimodal_layout.encoder_token_lengths == [8]
     assert request.py_result.multimodal_layout.multimodal_embed_mask_cumsum is cumsum
 
 

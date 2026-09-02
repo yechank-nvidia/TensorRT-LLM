@@ -1364,18 +1364,29 @@ def get_multimodal_encoder_token_lengths(
         request: LlmRequest) -> Optional[List[int]]:
     """Return per-item physical encoder attention-token costs.
 
-    Field-level validation happens inside
-    `get_multimodal_encoder_item_metadata`; only the request-level
-    cross-check against `multimodal_embedding_lengths` lives here.
+    Local encoder requests carry the costs in item metadata. E/P prefill
+    requests carry only the flat cost list because they do not need the
+    producer's raw-input item references.
     """
-    item_metadata = get_multimodal_encoder_item_metadata(
-        request.py_multimodal_data)
-    if item_metadata is None:
+    mm_data = request.py_multimodal_data
+    explicit_lengths = _validate_optional_int_list(
+        mm_data.get("encoder_token_lengths")
+        if isinstance(mm_data, dict) else None, "encoder_token_lengths")
+    item_metadata = get_multimodal_encoder_item_metadata(mm_data)
+    if explicit_lengths is None and item_metadata is None:
         return None
     embedding_lengths = get_multimodal_embedding_lengths(request)
     if embedding_lengths is None:
         raise ValueError("Multimodal encoder item scheduling requires "
                          "multimodal_embedding_lengths")
+    if explicit_lengths is not None:
+        if len(explicit_lengths) != len(embedding_lengths):
+            raise ValueError("encoder_token_lengths must match "
+                             "multimodal_embedding_lengths")
+        if any(length <= 0 for length in explicit_lengths):
+            raise ValueError("encoder_token_lengths must be positive")
+        return explicit_lengths
+    assert item_metadata is not None
     if item_metadata.output_embedding_lengths != embedding_lengths:
         raise ValueError("Multimodal encoder item output lengths must match "
                          "multimodal_embedding_lengths")
@@ -1421,15 +1432,22 @@ def initialize_multimodal_encoder_request(
     has_full_embedding = (isinstance(mm_data, dict)
                           and mm_data.get("multimodal_embedding") is not None)
     needs_item_encoding = has_raw_payload and not has_full_embedding
+    awaits_external_item_outputs = (not has_raw_payload
+                                    and not has_full_embedding
+                                    and isinstance(mm_data, dict)
+                                    and mm_data.get("encoder_token_lengths")
+                                    is not None)
+    needs_item_scheduling = (needs_item_encoding
+                             or awaits_external_item_outputs)
     token_lengths = (get_multimodal_encoder_token_lengths(request)
-                     if needs_item_encoding else None)
+                     if needs_item_scheduling else None)
     if needs_item_encoding and token_lengths is None:
         raise ValueError(
             "Raw multimodal payload requires multimodal_encoder_item_metadata "
             "when item-level encoder scheduling is enabled")
-    if needs_item_encoding and not token_lengths:
+    if needs_item_scheduling and not token_lengths:
         raise ValueError(
-            "Raw multimodal payload must declare at least one encoder item "
+            "Multimodal payload must declare at least one encoder item "
             "when item-level encoder scheduling is enabled")
     if token_lengths is not None:
         largest = max(token_lengths, default=0)

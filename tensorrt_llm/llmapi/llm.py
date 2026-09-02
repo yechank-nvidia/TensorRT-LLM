@@ -969,6 +969,9 @@ class BaseLLM:
                     "multimodal_embedding_lengths":
                     (disagg_mm_inputs.multimodal_embedding_lengths),
                 }
+                if disagg_mm_inputs.encoder_token_lengths is not None:
+                    multimodal_data["encoder_token_lengths"] = (
+                        disagg_mm_inputs.encoder_token_lengths)
                 if disagg_mm_inputs.special_token_offsets is not None:
                     multimodal_data["special_token_offsets"] = (
                         disagg_mm_inputs.special_token_offsets)
