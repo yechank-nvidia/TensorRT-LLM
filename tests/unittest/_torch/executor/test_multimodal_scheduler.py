@@ -1325,7 +1325,8 @@ def test_llm_data_keeps_only_the_item_slices_used_by_this_chunk():
     gathered = engine.model._get_or_encode_multimodal_embeddings(
         [MultimodalParams(multimodal_data=mm_data, multimodal_runtime=runtime)]
     )
-    torch.testing.assert_close(gathered, torch.cat(segments))
+    assert gathered[0] is segments[0]
+    assert gathered[1] is segments[1]
 
 
 def test_llm_data_accepts_a_chunk_without_multimodal_rows():
@@ -1348,8 +1349,9 @@ def test_llm_data_accepts_a_chunk_without_multimodal_rows():
         multimodal_runtime=runtime,
     )
 
-    embedding = _Model()._get_or_encode_multimodal_embeddings([params])
-    assert embedding.shape == (0, 1)
+    embeddings = _Model()._get_or_encode_multimodal_embeddings([params])
+    assert len(embeddings) == 1
+    assert embeddings[0].shape == (0, 1)
 
 
 def test_single_scheduled_segment_is_used_without_a_copy():
@@ -1365,9 +1367,30 @@ def test_single_scheduled_segment_is_used_without_a_copy():
     segment = torch.arange(3, dtype=torch.float32).unsqueeze(1)
     params = MultimodalParams(multimodal_data={"multimodal_embedding": (segment,)})
 
-    embedding = _Model()._get_or_encode_multimodal_embeddings([params])
+    embeddings = _Model()._get_or_encode_multimodal_embeddings([params])
 
-    assert embedding is segment
+    assert len(embeddings) == 1
+    assert embeddings[0] is segment
+
+
+def test_scheduled_segments_with_packed_auxiliary_streams_stay_joined():
+    class _Model(MultimodalModelMixin):
+        @property
+        def text_embedding_layer(self):
+            return SimpleNamespace(weight=torch.empty(0, 1))
+
+        @property
+        def embedding_dim(self):
+            return 1
+
+    first = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    second = torch.arange(4, 8, dtype=torch.float32).reshape(2, 2)
+    params = MultimodalParams(multimodal_data={"multimodal_embedding": (first, second)})
+
+    embeddings = _Model()._get_or_encode_multimodal_embeddings([params])
+
+    assert len(embeddings) == 1
+    torch.testing.assert_close(embeddings[0], torch.cat((first, second)))
 
 
 # ---------------------------------------------------------------------------

@@ -1381,6 +1381,10 @@ class MultimodalModelMixin:
         if not context_params:
             return PreparedLlmInputs(input_ids=input_ids, inputs_embeds=None)
 
+        has_active_item_segments = any(
+            isinstance(param.multimodal_data.get("multimodal_embedding"), tuple)
+            for param in context_params
+        )
         full_embeddings = self._get_or_encode_multimodal_embeddings(context_params)
 
         input_ids, full_embeddings = self.after_full_multimodal_embeddings(
@@ -1390,7 +1394,11 @@ class MultimodalModelMixin:
             **forward_kwargs,
         )
 
-        active_embeddings = find_input_mm_embeds(full_embeddings, list(context_params))
+        active_embeddings = (
+            full_embeddings
+            if has_active_item_segments
+            else find_input_mm_embeds(full_embeddings, list(context_params))
+        )
         active_embeddings, extra_embeds = self.after_active_multimodal_embeddings(
             active_embeddings=active_embeddings,
             multimodal_params=context_params,
@@ -1425,9 +1433,12 @@ class MultimodalModelMixin:
         """Return per-request cached embeddings or run the encoder for misses.
 
         Item scheduling marks its current-window cache segments with a tuple.
-        This layer joins those already-active segments once. The normal path
-        retains request boundaries so chunk selection happens before final
-        batch materialization.
+        Standard LLM-width segments stay separate until final fusion, which
+        can scatter one or two directly and packs larger segment counts once.
+        Outputs carrying packed auxiliary streams retain the existing join so
+        model hooks can split one dense layout without multiplying launches.
+        The normal path retains request boundaries so chunk selection happens
+        before final batch materialization.
 
         During side-stream prefetch, this runs with the auxiliary stream current, so the H2D copies,
         the encoder, and every persistent-cache `put()` are issued on that stream. `TensorLRUCache`
@@ -1454,16 +1465,18 @@ class MultimodalModelMixin:
                 raise TypeError("multimodal_embedding segments must be tensors")
             embedding_segments.extend(segments)
         if has_scheduled_segments:
-            if embedding_segments:
-                embedding = (
+            if not embedding_segments:
+                embeddings = [self.text_embedding_layer.weight.new_empty((0, self.embedding_dim))]
+            elif all(segment.shape[-1] == self.embedding_dim for segment in embedding_segments):
+                embeddings = embedding_segments
+            else:
+                embeddings = [
                     embedding_segments[0]
                     if len(embedding_segments) == 1
                     else torch.cat(embedding_segments, dim=0)
-                )
-            else:
-                embedding = self.text_embedding_layer.weight.new_empty((0, self.embedding_dim))
-            self._validate_embeddings([embedding], multimodal_params, current_chunk_only=True)
-            return [embedding]
+                ]
+            self._validate_embeddings(embeddings, multimodal_params, current_chunk_only=True)
+            return embeddings
 
         encoder_cache = self._multimodal_encoder_cache
         cache_misses: list[MultimodalParams] = []
@@ -2011,7 +2024,7 @@ class MultimodalModelMixin:
         validate against only the current chunk's rows because the cache
         segments are already sliced to the active prompt window.
         """
-        if len(embeddings) not in (1, len(multimodal_params)):
+        if not current_chunk_only and len(embeddings) not in (1, len(multimodal_params)):
             raise ValueError(
                 "MultimodalModelMixin requires either one packed embedding "
                 "tensor or one tensor per multimodal param, got "
