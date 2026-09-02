@@ -332,39 +332,24 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
         data = MultimodalResult.from_model_outputs(
             model_outputs, scheduled_requests.num_context_requests
         )
-        return self.SampleState(requests=scheduled_requests.context_requests, data=data)
-
-    @override
-    def update_requests(
-        self,
-        state: SampleState,
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> None:
-        # resource_manager will not be used in this function, just for interface consistency.
-        assert isinstance(state, SampleState)
-        requests = state.requests
-        mm_embeddings = state.data.mm_embeddings
-        extra_data = state.data.extra_data or {}
-        mrope_position_ids = extra_data.get("mrope_position_ids", None)
-        mrope_position_deltas = extra_data.get("mrope_position_deltas", None)
-        for request in requests:
-            request.state = LlmRequestState.GENERATION_COMPLETE
-            # NOTE: This is a hack: set finish reason manually and set the beam 0
-            request.set_finished_reason(FinishReason.LENGTH, 0)
-
-        request_indices = state.data.mm_embedding_request_indices
-        for result_index, (request_index, mm_embedding) in enumerate(
-            zip(request_indices, mm_embeddings, strict=True)
+        multimodal_layouts: List[Optional[DisaggPrefillMultimodalInputs]] = []
+        for request_index, mm_embedding_lengths in zip(
+            data.mm_embedding_request_indices,
+            data.mm_embedding_lengths,
+            strict=True,
         ):
-            request = requests[request_index]
-            mm_embedding_lengths = state.data.mm_embedding_lengths[result_index]
-
-            multimodal_layout = None
+            request = scheduled_requests.context_requests[request_index]
             multimodal_positions = getattr(request, "multimodal_positions", None)
             multimodal_lengths = getattr(request, "multimodal_lengths", None)
-            if multimodal_positions is not None and multimodal_lengths is not None:
-                mm_data = request.py_multimodal_data or {}
-                multimodal_layout = DisaggPrefillMultimodalInputs(
+            if multimodal_positions is None or multimodal_lengths is None:
+                multimodal_layouts.append(None)
+                continue
+
+            # Snapshot the handoff metadata before the executor releases the
+            # completed encoder request's raw multimodal resources.
+            mm_data = request.py_multimodal_data or {}
+            multimodal_layouts.append(
+                DisaggPrefillMultimodalInputs(
                     prompt_token_ids=list(request.get_tokens(0)),
                     multimodal_lengths=list(multimodal_lengths),
                     multimodal_positions=list(multimodal_positions),
@@ -387,6 +372,38 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
                     special_token_offsets=mm_data.get("special_token_offsets"),
                     multimodal_embed_mask_cumsum=mm_data.get("multimodal_embed_mask_cumsum"),
                 )
+            )
+        if any(layout is not None for layout in multimodal_layouts):
+            assert data.extra_data is not None
+            data.extra_data["multimodal_layouts"] = multimodal_layouts
+        return self.SampleState(requests=scheduled_requests.context_requests, data=data)
+
+    @override
+    def update_requests(
+        self,
+        state: SampleState,
+        resource_manager: Optional[ResourceManager] = None,
+    ) -> None:
+        # resource_manager will not be used in this function, just for interface consistency.
+        assert isinstance(state, SampleState)
+        requests = state.requests
+        mm_embeddings = state.data.mm_embeddings
+        extra_data = state.data.extra_data or {}
+        mrope_position_ids = extra_data.get("mrope_position_ids", None)
+        mrope_position_deltas = extra_data.get("mrope_position_deltas", None)
+        multimodal_layouts = extra_data.get("multimodal_layouts", [])
+        for request in requests:
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            # NOTE: This is a hack: set finish reason manually and set the beam 0
+            request.set_finished_reason(FinishReason.LENGTH, 0)
+
+        request_indices = state.data.mm_embedding_request_indices
+        for result_index, (request_index, mm_embedding) in enumerate(
+            zip(request_indices, mm_embeddings, strict=True)
+        ):
+            request = requests[request_index]
+            mm_embedding_lengths = state.data.mm_embedding_lengths[result_index]
+            multimodal_layout = multimodal_layouts[result_index] if multimodal_layouts else None
 
             if multimodal_layout is None:
                 request.py_result.append_mm_embeddings(mm_embedding, mm_embedding_lengths)

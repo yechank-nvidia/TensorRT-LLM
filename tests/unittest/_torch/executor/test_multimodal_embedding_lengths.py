@@ -245,7 +245,7 @@ def test_disagg_prefill_reuses_encoder_side_multimodal_layout():
 
 @pytest.mark.cpu_only
 def test_mm_encoder_sampler_carries_embed_cumsum_in_layout():
-    """Encoder results carry existing prompt metadata to the prefill worker."""
+    """Encoder results snapshot prompt metadata before request cleanup."""
     cumsum = torch.tensor([0, 1, 2, 2], dtype=torch.int64)
     request = _FakeRequest(
         multimodal_lengths=[2],
@@ -254,17 +254,20 @@ def test_mm_encoder_sampler_carries_embed_cumsum_in_layout():
         tokens=[7, 99, 99, 8],
     )
     sampler = EarlyStopWithMMResult()
-    state = sampler.SampleState(
-        requests=[request],
-        data=MultimodalResult(
-            mm_embeddings=[torch.ones(2, 4)],
-            mm_embedding_request_indices=[0],
-            mm_embedding_lengths=[[2]],
-            num_context_requests=1,
-            extra_data={},
-        ),
+    scheduled_requests = SimpleNamespace(
+        generation_requests=[], context_requests=[request], num_context_requests=1
+    )
+    state = sampler.sample_async(
+        scheduled_requests,
+        {
+            "mm_embeddings": [torch.ones(2, 4)],
+            "mm_embedding_request_indices": [0],
+            "mm_embedding_lengths": [[2]],
+        },
+        [],
     )
 
+    request.py_multimodal_data.clear()
     sampler.update_requests(state)
 
     assert request.py_result.multimodal_layout is not None

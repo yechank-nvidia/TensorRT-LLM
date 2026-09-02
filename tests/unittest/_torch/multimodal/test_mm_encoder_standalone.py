@@ -830,6 +830,11 @@ def test_single_request_chat_multiple_images(
     ep_disaggregated_params = encoder_outputs[0].disaggregated_params
 
     assert ep_disaggregated_params is not None, "Encoder output disaggregated params is None"
+    multimodal_layout = ep_disaggregated_params.multimodal_layout
+    assert multimodal_layout is not None
+    assert multimodal_layout.multimodal_embed_mask_cumsum is not None
+    assert multimodal_layout.multimodal_embed_mask_cumsum.numel() == len(
+        multimodal_layout.prompt_token_ids)
     ep_disaggregated_params.request_type = "context_and_generation" if not pd_disagg else "context_only"
 
     outputs = llm.generate(inputs,
