@@ -535,12 +535,16 @@ def fuse_input_embeds(
         - If (1) JIT test run, (2) non-multimodal run, i.e. all text-only requests, either context or generation phase (3) multimodal run, all requests in generation phase --> there is no multimodal data, return only the input_ids
         - If (4) multimodal run, mixed batch of context and generation requests, each context request has a multimodal feature --> return only the fused input_embeds of shape [total length, hidden_dim]. For text tokens, LLM embedding layer has already run.
     Note:
-        - Precedence: If kwargs provide indices (text_token_indices and mm_token_indices), those are used. If any one of them is not provided, fallback to filtering method. Sentinel-/OOV-based filtering (e.g., tokens >= vocab_size) is used only when neither index tensor and mm_token_ids is provided.
+        - Precedence: ``mm_token_indices`` is sufficient for in-vocabulary MM
+          placeholders because that path embeds every input token. OOV
+          placeholders also require ``text_token_indices``. Missing required
+          indices fall back to filtering ``input_ids``.
         - Example: len(torch.cat(mm_embeds)) must match len(mm_token_indices);
           for chunked prefill, pass only the current chunk's mm_embeds or
           explicit indices for the active MM token positions.
-        - Sync-free contract: passing both ``text_token_indices`` and
-          ``mm_token_indices`` skips the GPU ``torch.where`` host sync. The
+        - Sync-free contract: passing ``mm_token_indices`` for in-vocabulary
+          placeholders, or both index tensors for OOV placeholders, skips the
+          GPU ``torch.where`` host sync. The
           executor (``model_engine._prepare_inputs`` /
           ``_prepare_tp_inputs_no_cache``) precomputes them on a CPU
           ``input_ids`` copy via ``_prepare_multimodal_indices`` (which uses
@@ -567,8 +571,8 @@ def fuse_input_embeds(
 
     mm_embed = _join_embeddings(mm_embeds)
 
-    # TODO: support the case where only one index tensor is provided, the other is derived as the complement (try to avoid implicit host-device synchronization)
-    if text_token_indices is None or mm_token_indices is None:
+    if mm_token_indices is None or (mm_token_ids is None
+                                    and text_token_indices is None):
         # NOTE: This function involves host-device synchronization due to torch.where() used in filter_mm_token_from_input_ids.
         text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
             input_ids,

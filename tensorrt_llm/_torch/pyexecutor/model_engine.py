@@ -4431,6 +4431,15 @@ class PyTorchModelEngine(ModelEngine):
         if mm_token_ids is None:
             mm_token_ids = getattr(self.model, "mm_token_ids", None)
 
+        if mm_token_ids is not None:
+            if not isinstance(mm_token_ids, torch.Tensor):
+                mm_token_ids = torch.tensor(mm_token_ids, dtype=input_ids.dtype)
+            else:
+                mm_token_ids = mm_token_ids.to(device="cpu",
+                                               dtype=input_ids.dtype)
+            mm_token_mask = torch.isin(input_ids, mm_token_ids)
+            return None, torch.where(mm_token_mask)[0]
+
         text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
             input_ids, vocab_size=vocab_size, mm_token_ids=mm_token_ids)
         return text_token_indices, mm_token_indices
@@ -4684,19 +4693,22 @@ class PyTorchModelEngine(ModelEngine):
         inputs: dict,
         *,
         mm_token_indices_cpu: torch.Tensor,
-        text_token_indices_cpu: torch.Tensor,
+        text_token_indices_cpu: Optional[torch.Tensor],
         num_ctx_tokens: int,
         total_num_tokens: int,
     ) -> None:
-        """Pin and async-copy executor-precomputed MM/text token indices into
-        ``inputs`` so ``fuse_input_embeds`` can skip its ``torch.where`` host
-        sync. If ``total_num_tokens > num_ctx_tokens`` (KV-cache path with
-        extend/draft tokens appended after the indices were computed), the
-        post-context positions are appended as text. Current speculative decode
-        paths do not append multimodal placeholders after the context tokens."""
+        """Pin and async-copy executor-precomputed MM/text token indices.
+
+        In-vocabulary MM placeholders embed every input token before replacing
+        MM rows, so they do not need text indices. OOV placeholders still ship
+        both tensors. If ``total_num_tokens > num_ctx_tokens`` (KV-cache path
+        with extend/draft tokens), those appended tokens are text.
+        """
         mm_token_indices_cpu = maybe_pin_memory(mm_token_indices_cpu)
         inputs['mm_token_indices'] = mm_token_indices_cpu.to("cuda",
                                                              non_blocking=True)
+        if text_token_indices_cpu is None:
+            return
         if total_num_tokens > num_ctx_tokens:
             extra_text = torch.arange(num_ctx_tokens,
                                       total_num_tokens,

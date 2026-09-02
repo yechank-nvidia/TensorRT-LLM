@@ -282,6 +282,35 @@ def test_fuse_input_embeds_skips_filter_when_indices_provided(device):
 
 @pytest.mark.parametrize("device", ["cpu"] +
                          (["cuda"] if torch.cuda.is_available() else []))
+def test_fuse_input_embeds_in_vocab_does_not_require_text_indices(device):
+    hidden = 8
+    vocab_size = 40
+    emb = make_embedding(num_embeddings=vocab_size,
+                         hidden_size=hidden,
+                         device=device)
+    input_ids = torch.tensor([0, 39, 1], dtype=torch.long, device=device)
+    mm_idx = torch.tensor([1], dtype=torch.long, device=device)
+    mm_emb = torch.randn(1, hidden, device=device)
+
+    with mock.patch.object(
+            multimodal_utils,
+            "filter_mm_token_from_input_ids",
+            wraps=multimodal_utils.filter_mm_token_from_input_ids) as spy:
+        _, out_embeds = fuse_input_embeds(
+            emb,
+            input_ids,
+            mm_embeds=[mm_emb],
+            mm_token_ids=torch.tensor([39], device=device),
+            text_token_indices=None,
+            mm_token_indices=mm_idx,
+        )
+
+    spy.assert_not_called()
+    torch.testing.assert_close(out_embeds[mm_idx], mm_emb)
+
+
+@pytest.mark.parametrize("device", ["cpu"] +
+                         (["cuda"] if torch.cuda.is_available() else []))
 def test_fuse_input_embeds_calls_filter_when_indices_missing(device):
     """
     Negative half of the sync-free contract: when indices are absent the

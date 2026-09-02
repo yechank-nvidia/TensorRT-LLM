@@ -1530,7 +1530,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         text_indices, multimodal_indices = engine._prepare_multimodal_indices(
             [1, 90, 2, 91, 3])
 
-        torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
+        self.assertIsNone(text_indices)
         torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
 
     def test_prepare_multimodal_indices_uses_legacy_token_ids(self) -> None:
@@ -1539,6 +1539,17 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         text_indices, multimodal_indices = engine._prepare_multimodal_indices(
             [1, 90, 2, 91, 3])
+
+        self.assertIsNone(text_indices)
+        torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
+
+    def test_prepare_multimodal_indices_keeps_text_indices_for_oov_tokens(
+            self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.model = SimpleNamespace(config=SimpleNamespace(vocab_size=100))
+
+        text_indices, multimodal_indices = engine._prepare_multimodal_indices(
+            [1, 100, 2, 101, 3])
 
         torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
         torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
