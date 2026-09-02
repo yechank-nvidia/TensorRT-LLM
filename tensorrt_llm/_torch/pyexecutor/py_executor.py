@@ -13,9 +13,9 @@ import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from enum import IntEnum
-from queue import Queue
-from typing import (TYPE_CHECKING, Dict, Hashable, Iterable, Iterator, List,
-                    Optional, Tuple, Union)
+from queue import Empty, Queue
+from typing import (TYPE_CHECKING, Any, Dict, Hashable, Iterable, Iterator,
+                    List, Optional, Tuple, Union)
 
 import torch
 from strenum import StrEnum
@@ -62,6 +62,7 @@ from ..models.modeling_multimodal_mixin import \
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..moe.expert_statistic import ExpertStatistic
+from ..shared_tensor import SharedTensorContainer
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
@@ -447,7 +448,13 @@ class PyExecutor:
         # stage; local encoder/cache operations also check the PP rank.
         self._mm_encoder_item_scheduling_enabled = getattr(
             model_engine, "mm_encoder_item_scheduling_enabled", False)
+        self._mm_encoder_is_local = getattr(model_engine, "mm_encoder_is_local",
+                                            True)
         self._pending_mm_encoder_cache_removals: List[Hashable] = []
+        self._external_mm_encoder_demands: Queue[Tuple[int,
+                                                       List[int]]] = Queue()
+        self._external_mm_encoder_completions: Queue[Tuple[
+            int, List[int], List[Dict[str, Any]], Optional[str]]] = Queue()
         self.scheduler = scheduler
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
@@ -6443,10 +6450,15 @@ class PyExecutor:
     ) -> Optional[Tuple[str, List[int]]]:
         """Update the MM cache and encode selected items before LLM prefill."""
         scheduled_items = scheduled_requests.scheduled_mm_encoder_items or {}
+        mm_encoder_is_local = getattr(self, "_mm_encoder_is_local", True)
+        has_external_request = (not mm_encoder_is_local
+                                and any(request.py_mm_encoder_state is not None
+                                        for request in self.active_requests))
         if (not scheduled_items
-                and not scheduled_requests.mm_encoder_cache_removals and
-                not any(request.py_mm_encoder_state is not None
-                        for request in scheduled_requests.context_requests)):
+                and not scheduled_requests.mm_encoder_cache_removals
+                and not any(request.py_mm_encoder_state is not None
+                            for request in scheduled_requests.context_requests)
+                and not has_external_request):
             return None
         gpu_start = gpu_end = None
         if self.enable_iter_perf_stats and scheduled_items:
@@ -6456,11 +6468,26 @@ class PyExecutor:
             scheduled_requests.mm_encoder_gpu_end_event = gpu_end
             gpu_start.record()
         try:
-            self.model_engine.run_multimodal_encoder_schedule(
-                self.active_requests,
-                scheduled_requests,
-                owns_cache_references=self._owns_mm_encoder_cache_references(),
-            )
+            if not mm_encoder_is_local:
+                self._commit_external_mm_encoder_completions()
+                self._publish_external_mm_encoder_demands(scheduled_items)
+
+            # External selections are demands, not local forward work. Keep
+            # them on ScheduledRequests for PP propagation and observability,
+            # but hide them only while the model engine applies cache removals
+            # and validates the text-only chunk that can run now.
+            run_items = scheduled_requests.scheduled_mm_encoder_items
+            if not mm_encoder_is_local:
+                scheduled_requests.scheduled_mm_encoder_items = None
+            try:
+                self.model_engine.run_multimodal_encoder_schedule(
+                    self.active_requests,
+                    scheduled_requests,
+                    owns_cache_references=self.
+                    _owns_mm_encoder_cache_references(),
+                )
+            finally:
+                scheduled_requests.scheduled_mm_encoder_items = run_items
         except MultimodalEncoderRequestError as e:
             error_msg = str(e)
             logger.error(f"Encountered an error in multimodal encoder forward: "
@@ -6474,6 +6501,123 @@ class PyExecutor:
             if gpu_end is not None:
                 gpu_end.record()
         return None
+
+    def take_multimodal_encoder_demands(self) -> List[Tuple[int, List[int]]]:
+        """Drain item demands as ``(client_id, item_indices)`` pairs."""
+        demands = []
+        while True:
+            try:
+                demands.append(self._external_mm_encoder_demands.get_nowait())
+            except Empty:
+                return demands
+
+    def enqueue_multimodal_encoder_outputs(
+        self,
+        client_id: int,
+        item_indices: List[int],
+        output_handles: List[Dict[str, Any]],
+        error: Optional[str] = None,
+    ) -> None:
+        """Queue externally produced item outputs for the next iteration."""
+        self._external_mm_encoder_completions.put(
+            (client_id, list(item_indices), list(output_handles), error))
+
+    def _publish_external_mm_encoder_demands(
+            self, scheduled_items: Dict[int, List[int]]) -> None:
+        request_by_id = {
+            request.request_id: request
+            for request in self.active_requests
+        }
+        for request_id, item_indices in scheduled_items.items():
+            request = request_by_id.get(request_id)
+            if request is None:
+                continue
+            self._external_mm_encoder_demands.put(
+                (request.py_client_id, list(item_indices)))
+
+    def _commit_external_mm_encoder_completions(self) -> None:
+        """Commit completed producer handles into their existing reservations."""
+        request_by_client_id = {
+            request.py_client_id: request
+            for request in self.active_requests
+        }
+        encoder_cache = self.model_engine.mm_encoder_cache
+        if encoder_cache is None:
+            raise RuntimeError(
+                "External MM encoder completions require an encoder cache")
+        while True:
+            try:
+                (client_id, item_indices, output_handles,
+                 error) = self._external_mm_encoder_completions.get_nowait()
+            except Empty:
+                return
+
+            request = request_by_client_id.get(client_id)
+            if request is None or request.py_mm_encoder_state is None:
+                # A canceled or preempted request no longer owns the
+                # reservation. Dropping the handles releases the stale result.
+                continue
+            if error is not None:
+                raise MultimodalEncoderRequestError(
+                    f"External MM encoder failed: {error}",
+                    request_ids={request.request_id},
+                )
+            if len(item_indices) != len(output_handles):
+                raise MultimodalEncoderRequestError(
+                    "External MM encoder output count must match item indices",
+                    request_ids={request.request_id},
+                )
+
+            state = request.py_mm_encoder_state
+            pending_indices = []
+            pending_outputs = []
+            for item_idx, output_handle in zip(item_indices,
+                                               output_handles,
+                                               strict=True):
+                if item_idx < 0 or item_idx >= state.num_items:
+                    raise MultimodalEncoderRequestError(
+                        f"External MM encoder item {item_idx} is out of range",
+                        request_ids={request.request_id},
+                    )
+                cache_key = state.item_cache_keys[item_idx]
+                if (cache_key is None or encoder_cache.get(
+                        cache_key, record_stats=False) is not None):
+                    continue
+                try:
+                    output = SharedTensorContainer.from_dict(
+                        output_handle).get_local_view()
+                except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+                    raise MultimodalEncoderRequestError(
+                        f"Invalid external MM encoder output: {exc}",
+                        request_ids={request.request_id},
+                    ) from exc
+                pending_indices.append(item_idx)
+                pending_outputs.append(output)
+
+            if not pending_indices:
+                continue
+            mm_data = request.py_multimodal_data
+            if not isinstance(mm_data, dict):
+                raise MultimodalEncoderRequestError(
+                    "External MM encoder request has no multimodal data",
+                    request_ids={request.request_id},
+                )
+            item_outputs: List[Optional[torch.Tensor]] = [None
+                                                          ] * state.num_items
+            for item_idx, output in zip(pending_indices,
+                                        pending_outputs,
+                                        strict=True):
+                item_outputs[item_idx] = output
+            previous_outputs = mm_data.get("multimodal_embedding")
+            mm_data["multimodal_embedding"] = item_outputs
+            try:
+                self.model_engine.forward_multimodal_encoder_items(
+                    [request], {request.request_id: pending_indices})
+            finally:
+                if previous_outputs is None:
+                    mm_data.pop("multimodal_embedding", None)
+                else:
+                    mm_data["multimodal_embedding"] = previous_outputs
 
     def _handle_multimodal_encoder_request_error(
             self, scheduled_requests: ScheduledRequests, error_msg: str,

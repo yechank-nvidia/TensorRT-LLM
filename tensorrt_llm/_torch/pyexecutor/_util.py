@@ -3221,6 +3221,8 @@ def create_py_executor_instance(
                 model_engine.bytes_per_mm_encoder_embedding),
             retain_cache_entries=model_engine.model.encoder_cache_active,
             scheduling_policy=(multimodal_config.encoder_scheduling_policy),
+            encoder_outputs_ready_immediately=(
+                model_engine.mm_encoder_is_local),
         )
 
     config = model_engine.model.model_config.pretrained_config

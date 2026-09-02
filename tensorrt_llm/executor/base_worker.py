@@ -297,6 +297,23 @@ class BaseWorker(GenerationExecutor):
                 return
             self.engine.cancel_request(request_id)
 
+    def take_multimodal_encoder_demands(self):
+        """Return pending external encoder work from the PyTorch runtime."""
+        if self.engine is None:
+            return []
+        return self.engine.take_multimodal_encoder_demands()
+
+    def enqueue_multimodal_encoder_outputs(self,
+                                           client_id,
+                                           item_indices,
+                                           output_handles,
+                                           error=None):
+        """Deliver external encoder results at an executor iteration boundary."""
+        if self.engine is None:
+            raise RuntimeError("Engine is not initialized")
+        self.engine.enqueue_multimodal_encoder_outputs(client_id, item_indices,
+                                                       output_handles, error)
+
     def _engine_response_callback(self, response: tllm.Response):
         return response
 

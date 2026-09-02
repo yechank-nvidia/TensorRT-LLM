@@ -631,6 +631,7 @@ class MultimodalScheduler(RequestScheduler):
         bytes_per_encoder_embedding: int,
         retain_cache_entries: bool,
         scheduling_policy: MultimodalEncoderSchedulingPolicy,
+        encoder_outputs_ready_immediately: bool = True,
     ) -> None:
         self.scheduler = scheduler
         self.max_batch_size = max_batch_size
@@ -640,6 +641,7 @@ class MultimodalScheduler(RequestScheduler):
         self.bytes_per_encoder_embedding = bytes_per_encoder_embedding
         self.retain_cache_entries = retain_cache_entries
         self.scheduling_policy = scheduling_policy
+        self.encoder_outputs_ready_immediately = encoder_outputs_ready_immediately
         if bytes_per_encoder_embedding <= 0:
             raise ValueError("bytes_per_encoder_embedding must be positive")
 
@@ -671,6 +673,16 @@ class MultimodalScheduler(RequestScheduler):
         if request.is_first_context_chunk:
             begin = max(begin, request.estimated_reusable_tokens)
         return begin
+
+    def _is_item_ready(self, request: LlmRequest, item_idx: int) -> bool:
+        """Return whether a bound item already has a cache value."""
+        state = request.py_mm_encoder_state
+        assert state is not None
+        cache_key = state.item_cache_keys[item_idx]
+        return (
+            cache_key is not None
+            and self.encoder_cache.get(cache_key, record_stats=False) is not None
+        )
 
     def _get_item_prompt_start(self, request: LlmRequest, item_idx: int) -> int:
         """Return the prompt position where one MM item starts."""
@@ -787,6 +799,7 @@ class MultimodalScheduler(RequestScheduler):
                 cache_key = state.item_cache_keys[item_idx]
                 if (
                     cache_key is None
+                    or not self._is_item_ready(request, item_idx)
                     or (request.request_id, item_idx) in protected_items
                     or item_idx in partial_items
                     or cache_key in selected_cache_keys
@@ -840,7 +853,7 @@ class MultimodalScheduler(RequestScheduler):
             # Every key kept from an earlier iteration already has an output.
             # In that case, keep the earlier whole-request choice instead of
             # checking the request again for every context chunk.
-            if all(state.item_cache_keys[item_idx] is not None for item_idx in remaining_items):
+            if all(self._is_item_ready(request, item_idx) for item_idx in remaining_items):
                 return False
             item_cache_keys, _ = self._get_request_item_cache_keys(request)
             expected_bytes_by_key: dict[Hashable, int] = {}
@@ -925,7 +938,7 @@ class MultimodalScheduler(RequestScheduler):
                 ready_for_llm.append(request)
                 continue
             remaining_items = self._get_unconsumed_items(request)
-            if all(state.item_cache_keys[item_idx] is not None for item_idx in remaining_items):
+            if all(self._is_item_ready(request, item_idx) for item_idx in remaining_items):
                 continue
             item_cache_keys, retain_after_release = self._get_request_item_cache_keys(request)
             expected_bytes_by_key: dict[Hashable, int] = {}
@@ -1001,9 +1014,9 @@ class MultimodalScheduler(RequestScheduler):
             if request_items:
                 selected[request.request_id] = request_items
 
-            # Keep cache hits and keys that will be encoded now. Give back new
-            # reservations that did not receive encoder budget. Thus, every key
-            # kept for the next iteration already has an output.
+            # Keep cache hits and keys assigned producer work now. Give back
+            # new reservations that did not receive encoder budget. An
+            # external producer may complete a kept reservation later.
             for item_idx in reversed(acquired_items):
                 acquire_result = acquisition_results[item_idx]
                 cache_key = state.item_cache_keys[item_idx]
@@ -1025,7 +1038,11 @@ class MultimodalScheduler(RequestScheduler):
             if state is None:
                 continue
             projected_ready = all(
-                state.item_cache_keys[item_idx] is not None
+                self._is_item_ready(request, item_idx)
+                or (
+                    self.encoder_outputs_ready_immediately
+                    and state.item_cache_keys[item_idx] in selected_cache_keys
+                )
                 for item_idx in self._get_unconsumed_items(request)
             )
             if projected_ready:
@@ -1094,6 +1111,12 @@ class MultimodalScheduler(RequestScheduler):
                 if acquire_result is None and state.item_cache_keys[item_idx] is None:
                     unavailable_item = item_idx
                     break
+                if acquire_result is None and not self._is_item_ready(request, item_idx):
+                    # An external producer owns this existing reservation.
+                    # Keep it intact and stop before the item until completion
+                    # publishes the cache value.
+                    unavailable_item = item_idx
+                    break
                 if acquire_result is not CacheAcquireResult.NEW_RESERVATION:
                     continue
                 cost = state.encoder_token_lengths[item_idx]
@@ -1107,6 +1130,12 @@ class MultimodalScheduler(RequestScheduler):
                 items_to_encode.add((request.request_id, item_idx))
                 remaining_batch_slots -= 1
                 remaining_tokens -= cost
+                if not self.encoder_outputs_ready_immediately:
+                    # The reservation is the demand sent to the external
+                    # encoder. Unlike a local forward, its output is not
+                    # available to this iteration's LLM batch.
+                    unavailable_item = item_idx
+                    break
 
             if unavailable_item is not None:
                 request.context_chunk_size = self._get_chunk_size_before_item(
@@ -1120,6 +1149,13 @@ class MultimodalScheduler(RequestScheduler):
                     if item_idx in final_items:
                         continue
                     if state.item_cache_keys[item_idx] is None:
+                        continue
+                    if not self.encoder_outputs_ready_immediately and not self._is_item_ready(
+                        request, item_idx
+                    ):
+                        # The producer may already be working on this demand.
+                        # Cancellation/preemption owns reservation rollback;
+                        # merely shrinking the LLM window must not do so.
                         continue
                     cache_key = state.clear_item_cache_key(item_idx)
                     removed_cache_key = self.encoder_cache.release(cache_key)

@@ -914,9 +914,10 @@ class BaseLLM:
         # and BaseMultimodalInputProcessor.attach_multimodal_embeddings, gated
         # on the `supports_token_id_mm_expansion` class flag.
 
-        is_mm_disagg = (disaggregated_params is not None
-                        and disaggregated_params.multimodal_embedding_handles
-                        is not None)
+        is_mm_disagg = (
+            disaggregated_params is not None
+            and (disaggregated_params.multimodal_embedding_handles is not None
+                 or disaggregated_params.multimodal_layout is not None))
         is_gen_only = (disaggregated_params is not None and
                        disaggregated_params.request_type == "generation_only")
 
@@ -964,11 +965,11 @@ class BaseLLM:
                 # restores local tensor views before PyTorch forward. Until then this
                 # key holds handles, not tensors.
                 multimodal_data = {
-                    "multimodal_embedding":
-                    mm_handles,
                     "multimodal_embedding_lengths":
                     (disagg_mm_inputs.multimodal_embedding_lengths),
                 }
+                if mm_handles is not None:
+                    multimodal_data["multimodal_embedding"] = mm_handles
                 if disagg_mm_inputs.encoder_token_lengths is not None:
                     multimodal_data["encoder_token_lengths"] = (
                         disagg_mm_inputs.encoder_token_lengths)

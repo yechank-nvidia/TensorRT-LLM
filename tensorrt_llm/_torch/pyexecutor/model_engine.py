@@ -576,6 +576,7 @@ class PyTorchModelEngine(ModelEngine):
             and isinstance(self.model, MultimodalModelMixin)
             and self.model.supports_mm_encoder_item_scheduling and
             _mm_scheduling_policy != MultimodalEncoderSchedulingPolicy.DISABLED)
+        self.mm_encoder_is_local = not self.llm_args.disable_mm_encoder
         _validate_mm_encoder_scheduling_compatibility(
             self.llm_args, self.mm_encoder_item_scheduling_enabled)
         self.mm_encoder_attention_metadata_capacity: Optional[Dict[str,

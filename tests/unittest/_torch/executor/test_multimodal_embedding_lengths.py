@@ -246,6 +246,50 @@ def test_disagg_prefill_reuses_encoder_side_multimodal_layout():
 
 
 @pytest.mark.cpu_only
+def test_disagg_prefill_can_admit_layout_before_encoder_outputs():
+    class _InputProcessor:
+        support_mm_disagg = True
+        mm_bidirectional_blocks = False
+
+        def get_vocab_size(self):
+            return 100
+
+        def get_mm_token_ids(self):
+            return torch.tensor([99])
+
+        def get_mm_special_token_ids(self):
+            return None
+
+    layout = DisaggPrefillMultimodalInputs(
+        prompt_token_ids=[7, 99, 99, 8],
+        multimodal_lengths=[2],
+        multimodal_positions=[1],
+        multimodal_embedding_lengths=[2],
+        encoder_token_lengths=[8],
+    )
+    disaggregated_params = DisaggregatedParams(
+        multimodal_embedding_handles=None,
+        multimodal_hashes=[[0] * 8],
+        multimodal_layout=layout,
+    )
+    llm = object.__new__(BaseLLM)
+    llm.args = SimpleNamespace(backend="pytorch")
+    llm._hf_model_config = SimpleNamespace(is_encoder_decoder=False)
+    llm.input_processor = _InputProcessor()
+
+    prompt_token_ids, _, multimodal_params, _ = llm._preprocess(
+        {"prompt": "unused by the encoder-provided layout"},
+        SamplingParams(),
+        disaggregated_params,
+    )
+
+    assert prompt_token_ids == layout.prompt_token_ids
+    assert "multimodal_embedding" not in multimodal_params.multimodal_data
+    assert multimodal_params.multimodal_data["multimodal_embedding_lengths"] == [2]
+    assert multimodal_params.multimodal_data["encoder_token_lengths"] == [8]
+
+
+@pytest.mark.cpu_only
 def test_mm_encoder_sampler_carries_embed_cumsum_in_layout():
     """Encoder results snapshot prompt metadata before request cleanup."""
     cumsum = torch.tensor([0, 1, 2, 2], dtype=torch.int64)

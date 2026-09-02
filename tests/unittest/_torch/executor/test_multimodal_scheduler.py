@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from queue import Queue
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +30,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     SchedulerOutput,
     SimpleScheduler,
 )
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.multimodal import (
@@ -104,6 +106,7 @@ def _scheduler(
     base_scheduler=None,
     scheduling_policy=MultimodalEncoderSchedulingPolicy.DEFAULT,
     retain_cache_entries=False,
+    encoder_outputs_ready_immediately=True,
 ):
     return MultimodalScheduler(
         base_scheduler or _BaseScheduler(),
@@ -114,6 +117,7 @@ def _scheduler(
         bytes_per_encoder_embedding=4,
         retain_cache_entries=retain_cache_entries,
         scheduling_policy=scheduling_policy,
+        encoder_outputs_ready_immediately=encoder_outputs_ready_immediately,
     )
 
 
@@ -278,6 +282,62 @@ def test_external_encoder_outputs_commit_without_local_encoder():
     assert cached.data_ptr() != outputs[0].data_ptr()
 
 
+def test_external_encoder_demand_and_completion_use_existing_reservation():
+    cache = TensorLRUCache(1 << 20, name="test")
+
+    class _Model(MultimodalModelMixin):
+        pass
+
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = _Model()
+    engine.model._multimodal_encoder_cache = cache
+    engine.mm_encoder_item_scheduling_enabled = True
+    engine.mapping = SimpleNamespace(is_first_pp_rank=lambda: True)
+    request = _llm_request(
+        1,
+        multimodal_data={
+            "multimodal_embedding_lengths": [2],
+            "encoder_token_lengths": [8],
+        },
+        multimodal_positions=[1],
+        multimodal_lengths=[2],
+    )
+    request.py_client_id = 17
+    initialize_multimodal_encoder_request(request, max_num_tokens=16)
+    state = request.py_mm_encoder_state
+    assert state is not None
+    output = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    cache_key = ("mm_transient", request.request_id, 0)
+    cache.acquire(cache_key, output.nbytes, retain_after_release=False)
+    state.set_item_cache_key(0, cache_key)
+
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = [request]
+    executor.model_engine = engine
+    executor._mm_encoder_is_local = False
+    executor._mm_encoder_item_scheduling_enabled = True
+    executor._external_mm_encoder_demands = Queue()
+    executor._external_mm_encoder_completions = Queue()
+    executor.enable_iter_perf_stats = False
+    executor.enable_attention_dp = False
+    executor.dist = SimpleNamespace(is_first_pp_rank=True, pp_size=1)
+    executor.global_rank = 0
+
+    executor._publish_external_mm_encoder_demands({request.request_id: [0]})
+    assert executor.take_multimodal_encoder_demands() == [(17, [0])]
+
+    handle = SharedTensorContainer.from_tensor(output).dump_to_dict()
+    executor.enqueue_multimodal_encoder_outputs(17, [0], [handle])
+    # Completions must still be consumed on an iteration where the request is
+    # waiting and the LLM scheduler therefore selected no context tokens.
+    executor._forward_multimodal_encoder_step(ScheduledRequests())
+
+    cached = cache.get(cache_key)
+    torch.testing.assert_close(cached, output)
+    assert cached.data_ptr() != output.data_ptr()
+    assert "multimodal_embedding" not in request.py_multimodal_data
+
+
 def test_complete_external_handoff_keeps_direct_path():
     request = _llm_request(
         1,
@@ -422,6 +482,62 @@ def test_default_scheduler_accumulates_items_without_llm_chunking():
     assert second_output.scheduled_mm_encoder_items == {1: [1]}
     assert second_output.context_requests == [request]
     assert second_output.mm_encoder_context_chunk_sizes is None
+
+
+def test_external_encoder_demand_waits_for_cache_completion():
+    scheduler = _scheduler(
+        max_batch_size=1,
+        max_num_tokens=1,
+        base_scheduler=_BaseScheduler(chunk_size=3, chunk_unit_size=1),
+        encoder_outputs_ready_immediately=False,
+    )
+    request = _request(1, [1])
+
+    first_output = scheduler.schedule_request([request], set())
+
+    assert first_output.scheduled_mm_encoder_items == {1: [0]}
+    assert first_output.context_requests == [request]
+    assert request.context_chunk_size == 1
+    cache_key = request.py_mm_encoder_state.item_cache_keys[0]
+    assert scheduler.encoder_cache.get(cache_key, record_stats=False) is None
+
+    request.context_current_position = 1
+    waiting_output = scheduler.schedule_request([request], set())
+
+    assert waiting_output.scheduled_mm_encoder_items is None
+    assert waiting_output.context_requests == []
+    assert waiting_output.mm_encoder_blocked_request_ids == [1]
+    assert request.py_mm_encoder_state.item_cache_keys == [cache_key]
+
+    scheduler.encoder_cache.commit(cache_key, torch.ones(1))
+    ready_output = scheduler.schedule_request([request], set())
+
+    assert ready_output.scheduled_mm_encoder_items is None
+    assert ready_output.context_requests == [request]
+
+
+def test_external_encoder_demand_blocks_whole_request_without_llm_chunking():
+    scheduler = _scheduler(
+        max_batch_size=2,
+        max_num_tokens=2,
+        base_scheduler=SimpleScheduler(_CapacityScheduler(), _MicroBatchScheduler()),
+        encoder_outputs_ready_immediately=False,
+    )
+    request = _request(1, [1, 1])
+
+    first_output = scheduler.schedule_request([request], set())
+
+    assert first_output.scheduled_mm_encoder_items == {1: [0, 1]}
+    assert first_output.context_requests == []
+    assert first_output.mm_encoder_blocked_request_ids == [1]
+    cache_keys = list(request.py_mm_encoder_state.item_cache_keys)
+
+    for cache_key in cache_keys:
+        scheduler.encoder_cache.commit(cache_key, torch.ones(1))
+    ready_output = scheduler.schedule_request([request], set())
+
+    assert ready_output.scheduled_mm_encoder_items is None
+    assert ready_output.context_requests == [request]
 
 
 def test_default_scheduler_rejects_unshardable_outputs_without_llm_chunking():
