@@ -26,6 +26,7 @@ from ...tensor_lru_cache import CacheAcquireResult, TensorLRUCache
 from ..llm_request import (
     LlmRequest,
     LlmRequestState,
+    MultimodalEncoderRequestError,
     get_mm_items_for_chunk,
     make_mm_encoder_transient_cache_key,
 )
@@ -828,7 +829,7 @@ class MultimodalScheduler(RequestScheduler):
         return cache_key, acquire_result
 
     def _should_schedule_items_separately(self, requests: RequestList) -> bool:
-        """Return whether the first MM request cannot be scheduled as a whole."""
+        """Return whether the first MM request should follow LLM chunk demand."""
         for request in requests:
             state = request.py_mm_encoder_state
             if state is None:
@@ -860,8 +861,23 @@ class MultimodalScheduler(RequestScheduler):
                     encoder_tokens_by_unbound_key.setdefault(
                         cache_key, state.encoder_token_lengths[item_idx]
                     )
+            total_output_bytes = sum(expected_bytes_by_key.values())
+            if self._get_context_chunk_unit() is None:
+                if total_output_bytes > self.encoder_cache.max_bytes:
+                    raise MultimodalEncoderRequestError(
+                        "Multimodal request needs "
+                        f"{total_output_bytes} bytes of encoder output at once "
+                        "because LLM chunking is disabled, exceeding the "
+                        f"encoder cache capacity of {self.encoder_cache.max_bytes} bytes; "
+                        "enable chunked prefill or increase encoder cache capacity",
+                        request_ids={request.request_id},
+                    )
+                # Without LLM chunking there is no valid boundary before a
+                # later item. Accumulate outputs over encoder iterations, then
+                # run the existing whole-request prefill once all are ready.
+                return False
             return (
-                sum(expected_bytes_by_key.values()) > self.encoder_cache.max_bytes
+                total_output_bytes > self.encoder_cache.max_bytes
                 or len(encoder_tokens_by_unbound_key) > self.max_batch_size
                 or sum(encoder_tokens_by_unbound_key.values()) > self.max_num_tokens
             )

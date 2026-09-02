@@ -326,6 +326,50 @@ def test_default_scheduler_batches_all_request_items_when_they_fit():
     assert output.mm_encoder_context_chunk_sizes is None
 
 
+def test_default_scheduler_accumulates_items_without_llm_chunking():
+    scheduler = _scheduler(
+        max_batch_size=1,
+        max_num_tokens=1,
+        cache_capacity=8,
+        base_scheduler=SimpleScheduler(_CapacityScheduler(), _MicroBatchScheduler()),
+    )
+    request = _request(1, [1, 1])
+
+    first_output = scheduler.schedule_request([request], set())
+    first_cache_key = request.py_mm_encoder_state.item_cache_keys[0]
+    assert first_output.scheduled_mm_encoder_items == {1: [0]}
+    assert first_output.context_requests == []
+    assert first_output.mm_encoder_blocked_request_ids == [1]
+    assert first_output.mm_encoder_context_chunk_sizes is None
+    assert request.py_mm_encoder_state.item_cache_keys[1] is None
+
+    scheduler.encoder_cache.commit(first_cache_key, torch.ones(1))
+    second_output = scheduler.schedule_request([request], set())
+
+    assert second_output.scheduled_mm_encoder_items == {1: [1]}
+    assert second_output.context_requests == [request]
+    assert second_output.mm_encoder_context_chunk_sizes is None
+
+
+def test_default_scheduler_rejects_unshardable_outputs_without_llm_chunking():
+    scheduler = _scheduler(
+        max_batch_size=1,
+        max_num_tokens=1,
+        cache_capacity=4,
+        base_scheduler=SimpleScheduler(_CapacityScheduler(), _MicroBatchScheduler()),
+    )
+    request = _request(1, [1, 1])
+
+    with pytest.raises(
+        MultimodalEncoderRequestError,
+        match="because LLM chunking is disabled",
+    ) as exc_info:
+        scheduler.schedule_request([request], set())
+
+    assert exc_info.value.request_ids == frozenset({request.request_id})
+    assert request.py_mm_encoder_state.item_cache_keys == [None, None]
+
+
 def test_default_scheduler_reuses_cached_outputs_for_the_whole_request():
     key_calls = []
     scheduler = MultimodalScheduler(
