@@ -547,6 +547,74 @@ def test_prepare_multimodal_inputs_accepts_tensor_encoder_output_cuda():
     _test_prepare_multimodal_inputs_accepts_tensor_encoder_output("cuda")
 
 
+def test_empty_scheduled_segments_return_typed_empty_embedding():
+    model = DummyMultimodalModel(make_embedding(hidden_size=1), torch.tensor([7]))
+    runtime = MultimodalRuntimeData(
+        past_seen_token_num=0,
+        chunk_end_pos=2,
+        embed_mask_cumsum=torch.tensor([0, 0], dtype=torch.int64),
+    )
+    param = MultimodalParams(
+        multimodal_data={"multimodal_embedding": ()},
+        multimodal_runtime=runtime,
+    )
+
+    embeddings = model._get_or_encode_multimodal_embeddings([param])
+
+    assert len(embeddings) == 1
+    assert embeddings[0].shape == (0, 1)
+
+
+def test_single_scheduled_segment_is_used_without_a_copy():
+    model = DummyMultimodalModel(make_embedding(hidden_size=1), torch.tensor([7]))
+    segment = torch.arange(3, dtype=torch.float32).unsqueeze(1)
+    param = MultimodalParams(multimodal_data={"multimodal_embedding": (segment,)})
+
+    embeddings = model._get_or_encode_multimodal_embeddings([param])
+
+    assert len(embeddings) == 1
+    assert embeddings[0] is segment
+
+
+def test_scheduled_and_full_request_embeddings_share_one_batch():
+    model = DummyMultimodalModel(make_embedding(hidden_size=1), torch.tensor([7]))
+    scheduled = torch.tensor([[10.0], [11.0]])
+    full = torch.tensor([[20.0], [21.0], [22.0], [23.0]])
+    scheduled_param = MultimodalParams(
+        multimodal_data={"multimodal_embedding": (scheduled,)},
+        multimodal_runtime=MultimodalRuntimeData(
+            past_seen_token_num=0,
+            chunk_end_pos=2,
+            embed_mask_cumsum=torch.tensor([1, 2], dtype=torch.int64),
+        ),
+    )
+    full_param = MultimodalParams(
+        multimodal_data={"multimodal_embedding": full},
+        multimodal_runtime=MultimodalRuntimeData(
+            past_seen_token_num=1,
+            chunk_end_pos=3,
+            embed_mask_cumsum=torch.tensor([1, 2, 3, 4], dtype=torch.int64),
+        ),
+    )
+
+    embeddings = model._get_or_encode_multimodal_embeddings([scheduled_param, full_param])
+
+    assert embeddings[0] is scheduled
+    torch.testing.assert_close(embeddings[1], full[1:3])
+
+
+def test_scheduled_segments_with_packed_auxiliary_streams_stay_joined():
+    model = DummyMultimodalModel(make_embedding(hidden_size=1), torch.tensor([7]))
+    first = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    second = torch.arange(4, 8, dtype=torch.float32).reshape(2, 2)
+    param = MultimodalParams(multimodal_data={"multimodal_embedding": (first, second)})
+
+    embeddings = model._get_or_encode_multimodal_embeddings([param])
+
+    assert len(embeddings) == 1
+    torch.testing.assert_close(embeddings[0], torch.cat((first, second)))
+
+
 def test_encoder_cache_first_request_writes_per_item_entries():
     model = CountingEncoderMultimodalModel(
         make_embedding(hidden_size=4),
