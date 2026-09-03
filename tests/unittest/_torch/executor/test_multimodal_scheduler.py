@@ -173,7 +173,6 @@ def test_collect_scheduled_batch_stats_includes_multimodal_work():
     scheduled.scheduled_mm_encoder_items = {request.request_id: [0, 1]}
     scheduled.mm_encoder_blocked_request_ids = [8]
     scheduled.mm_encoder_cache_removals = [("old", 0)]
-    scheduled.mm_encoder_schedule_time_ms = 0.25
     cache = TensorLRUCache(1 << 20)
     executor = SimpleNamespace(
         _mm_encoder_item_scheduling_enabled=True,
@@ -194,7 +193,6 @@ def test_collect_scheduled_batch_stats_includes_multimodal_work():
         "numBlockedRequests": 1,
         "numCacheRemovals": 1,
         "selectedOutputBytes": 8,
-        "scheduleTimeMS": 0.25,
         "cacheMaxBytes": 1 << 20,
         "cacheCurrentBytes": 0,
         "cacheReservedBytes": 0,
@@ -319,12 +317,22 @@ def test_external_encoder_demand_and_completion_use_existing_reservation():
     executor._external_mm_encoder_demands = Queue()
     executor._external_mm_encoder_demand_queue = None
     executor._external_mm_encoder_completions = Queue()
-    executor.enable_iter_perf_stats = False
+    executor.enable_iter_perf_stats = True
+    executor.perf_manager = SimpleNamespace(
+        borrow_forward_timing_events=lambda: pytest.fail(
+            "P-side external demand must not be timed as local encoder work"
+        )
+    )
     executor.enable_attention_dp = False
     executor.dist = SimpleNamespace(is_first_pp_rank=True, pp_size=1)
     executor.global_rank = 0
 
-    executor._publish_external_mm_encoder_demands({request.request_id: [0]})
+    scheduled = ScheduledRequests()
+    scheduled.scheduled_mm_encoder_items = {request.request_id: [0]}
+    executor._forward_multimodal_encoder_step(scheduled)
+
+    assert scheduled.mm_encoder_gpu_start_event is None
+    assert scheduled.mm_encoder_gpu_end_event is None
     assert executor.take_multimodal_encoder_demands() == [(17, [0])]
 
     handle = SharedTensorContainer.from_tensor(output).dump_to_dict()

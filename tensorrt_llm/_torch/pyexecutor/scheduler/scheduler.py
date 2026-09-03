@@ -235,8 +235,6 @@ class ScheduledRequests:
     """Cache keys to remove before running the selected encoders."""
     mm_encoder_context_chunk_sizes: dict[int, int] | None
     """Final context chunk size selected for each MM request."""
-    mm_encoder_schedule_time_ms: float | None
-    """MM-aware scheduler CPU time for optional iteration statistics."""
     mm_encoder_gpu_start_event: torch.cuda.Event | None
     mm_encoder_gpu_end_event: torch.cuda.Event | None
     """Runtime-only events used to report item-encoder GPU time."""
@@ -253,7 +251,6 @@ class ScheduledRequests:
         self.mm_encoder_blocked_request_ids: list[int] | None = None
         self.mm_encoder_cache_removals: list[Hashable] | None = None
         self.mm_encoder_context_chunk_sizes: dict[int, int] | None = None
-        self.mm_encoder_schedule_time_ms: float | None = None
         self.mm_encoder_gpu_start_event: torch.cuda.Event | None = None
         self.mm_encoder_gpu_end_event: torch.cuda.Event | None = None
 

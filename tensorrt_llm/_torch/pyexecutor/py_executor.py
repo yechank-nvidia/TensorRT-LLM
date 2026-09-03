@@ -1957,10 +1957,6 @@ class PyExecutor:
                 if bytes_per_embedding is not None:
                     mm_encoder_stats[
                         "selectedOutputBytes"] = num_output_rows * bytes_per_embedding
-                schedule_time_ms = scheduled_batch.mm_encoder_schedule_time_ms
-                if schedule_time_ms is not None:
-                    mm_encoder_stats["scheduleTimeMS"] = schedule_time_ms
-
                 encoder_cache = self.model_engine.mm_encoder_cache
                 if encoder_cache is not None:
                     cache_stats = encoder_cache.stats()
@@ -6372,13 +6368,8 @@ class PyExecutor:
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
-        mm_schedule_start = (time.perf_counter() if self.enable_iter_perf_stats
-                             and isinstance(self.scheduler, MultimodalScheduler)
-                             else None)
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
-        mm_schedule_time_ms = ((time.perf_counter() - mm_schedule_start) *
-                               1e3 if mm_schedule_start is not None else None)
 
         if self._pending_mm_encoder_cache_removals:
             if not self._owns_mm_encoder_cache_references():
@@ -6449,8 +6440,6 @@ class PyExecutor:
             scheduler_output.mm_encoder_cache_removals)
         scheduled_requests.mm_encoder_context_chunk_sizes = (
             scheduler_output.mm_encoder_context_chunk_sizes)
-        scheduled_requests.mm_encoder_schedule_time_ms = mm_schedule_time_ms
-
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, num_fitting
 
     def _forward_multimodal_encoder_step(
@@ -6469,7 +6458,11 @@ class PyExecutor:
                 and not has_external_request):
             return None
         gpu_start = gpu_end = None
-        if self.enable_iter_perf_stats and scheduled_items:
+        # External P ranks only publish demands and commit returned outputs;
+        # their local work is not encoder execution and must not be reported
+        # as encoder GPU time.
+        if (self.enable_iter_perf_stats and scheduled_items
+                and mm_encoder_is_local):
             gpu_start, gpu_end = self.perf_manager.borrow_forward_timing_events(
             )
             scheduled_requests.mm_encoder_gpu_start_event = gpu_start
