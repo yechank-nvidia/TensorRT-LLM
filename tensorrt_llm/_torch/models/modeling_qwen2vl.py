@@ -2622,8 +2622,14 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         else:
             mm_multimodal_params = []
         if len(mm_multimodal_params) > 0:
+            has_active_item_segments = any(
+                isinstance(param.multimodal_data.get("multimodal_embedding"),
+                           tuple) for param in mm_multimodal_params)
             # Local encoder present: raw pixels/videos become embeddings here.
-            if self.mm_encoder is not None:
+            if has_active_item_segments:
+                mm_embeds = self._get_or_encode_multimodal_embeddings(
+                    mm_multimodal_params)
+            elif self.mm_encoder is not None:
                 encoder_forward_fn = (self._run_multimodal_encoder
                                       if self.encoder_data_parallel_active else
                                       self.mm_encoder.forward)
@@ -2639,7 +2645,9 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
             else:
                 mm_embeds = get_attached_multimodal_embeddings(
                     mm_multimodal_params)
-            mm_embeds = find_input_mm_embeds(mm_embeds, mm_multimodal_params)
+            if not has_active_item_segments:
+                mm_embeds = find_input_mm_embeds(mm_embeds,
+                                                 mm_multimodal_params)
 
         if not self.model_config.pretrained_config.disable_fuse_rope:
             mrope_config = self.prepare_mrope_config(

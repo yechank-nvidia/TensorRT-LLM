@@ -180,3 +180,41 @@ def test_qwen2_5_vision_attention_reuses_fused_qkv(monkeypatch) -> None:
     assert forwarded["k"] is None
     assert forwarded["v"] is None
     assert output is fused_qkv
+
+
+def test_qwen2vl_forward_uses_scheduled_item_segments(monkeypatch) -> None:
+    segments = (torch.randn(2, 8), torch.randn(3, 8))
+    multimodal_param = SimpleNamespace(multimodal_data={"multimodal_embedding": segments})
+    active_embeddings = list(segments)
+    find_input_mm_embeds = MagicMock(
+        side_effect=AssertionError(
+            "scheduled item segments are already limited to the active chunk"
+        )
+    )
+    fuse_input_embeds = MagicMock(return_value=(torch.tensor([1]), torch.empty(5, 8)))
+    monkeypatch.setattr(modeling_qwen2vl, "find_input_mm_embeds", find_input_mm_embeds)
+    monkeypatch.setattr(modeling_qwen2vl, "fuse_input_embeds", fuse_input_embeds)
+
+    model = SimpleNamespace(
+        _get_requests_with_mm_data=lambda params: params,
+        _get_or_encode_multimodal_embeddings=MagicMock(return_value=active_embeddings),
+        mm_encoder=object(),
+        model_config=SimpleNamespace(pretrained_config=SimpleNamespace(disable_fuse_rope=True)),
+        llm=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=object()),
+            forward=MagicMock(return_value=torch.empty(1, 8)),
+        ),
+        mm_token_ids=torch.tensor([0]),
+    )
+
+    modeling_qwen2vl.Qwen2VLModelBase.forward(
+        model,
+        SimpleNamespace(num_contexts=1, num_generations=0),
+        input_ids=torch.tensor([0]),
+        position_ids=torch.tensor([0]),
+        multimodal_params=[multimodal_param],
+    )
+
+    model._get_or_encode_multimodal_embeddings.assert_called_once_with([multimodal_param])
+    find_input_mm_embeds.assert_not_called()
+    assert fuse_input_embeds.call_args.args[2] == active_embeddings
