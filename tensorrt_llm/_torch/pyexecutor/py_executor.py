@@ -2531,7 +2531,10 @@ class PyExecutor:
                                         batch_state.scheduled_requests,
                                         micro_batch_id,
                                         batch_state.scheduled_batch_stats)
-        if self.enable_attention_dp:
+        export_rank_local_stats = (os.environ.get("TLLM_METRICS_ALL_RANKS", "0")
+                                   == "1" and self.enable_iter_perf_stats
+                                   and self.dist.tp_size > 1)
+        if self.enable_attention_dp and not export_rank_local_stats:
             self._adp_iter_stats.queue(
                 stats,
                 req_stats,

@@ -712,6 +712,41 @@ def test_specdec_aggregates_multiple_real_requests():
     assert sd.acceptance_length == (4 + 2) / 2
 
 
+def test_attention_dp_all_rank_metrics_keep_local_mm_stats(monkeypatch):
+    """All-rank export bypasses rank-0-only ADP stats reconstruction."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    monkeypatch.setenv("TLLM_METRICS_ALL_RANKS", "1")
+    scheduled_requests = types.SimpleNamespace(
+        mm_encoder_gpu_start_event=None,
+        mm_encoder_gpu_end_event=None,
+    )
+    batch_state = types.SimpleNamespace(
+        scheduled_requests=scheduled_requests,
+        scheduled_batch_stats=types.SimpleNamespace(mm_encoder_stats={"cacheHits": 1}),
+        iter_start_time=0.0,
+        iter_stats=IterationStats(),
+        gpu_forward_start_event=None,
+        gpu_forward_end_event=None,
+        gpu_forward_events_from_perf_pool=False,
+    )
+    fake = MagicMock()
+    fake.enable_iter_req_stats = False
+    fake.enable_iter_perf_stats = True
+    fake.enable_attention_dp = True
+    fake.dist.tp_size = 2
+    fake._latest_host_step_time_ms = 1.0
+    fake._latest_prev_device_step_time_ms = 2.0
+    fake.perf_manager.try_compute_gpu_elapsed_time_ms.return_value = None
+    fake._update_iter_stats.return_value = batch_state.iter_stats
+
+    PyExecutor._process_iter_stats(fake, [], [], batch_state)
+
+    fake._append_iter_stats.assert_called_once()
+    assert fake._append_iter_stats.call_args.kwargs["mm_encoder_stats"] == {"cacheHits": 1}
+    fake._adp_iter_stats.queue.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Attention-DP fanout tests: completed rank-local payloads are carried by the
 # next ADP allgather, then rank 0 appends one row per ADP rank.
