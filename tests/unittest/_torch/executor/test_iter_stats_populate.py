@@ -747,6 +747,35 @@ def test_attention_dp_all_rank_metrics_keep_local_mm_stats(monkeypatch):
     fake._adp_iter_stats.queue.assert_not_called()
 
 
+def test_tp_all_rank_metrics_buffer_local_mm_stats(monkeypatch):
+    """All-rank export retains encoder-DP timings from ordinary TP ranks."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    monkeypatch.setenv("TLLM_METRICS_ALL_RANKS", "1")
+    fake = MagicMock()
+    fake.enable_attention_dp = False
+    fake.enable_iter_perf_stats = True
+    fake.disable_overlap_scheduler = False
+    fake.dist.tp_size = 2
+    fake.dist.tp_rank = 1
+    fake.dist.pp_size = 1
+    fake._latest_kv_iter_stats = None
+    fake._latest_host_step_time_ms = 1.0
+    fake._latest_prev_device_step_time_ms = 2.0
+    fake._pending_iter_stats_dict = None
+
+    PyExecutor._append_iter_stats(
+        fake,
+        IterationStats(),
+        gpu_forward_time_ms=3.0,
+        mm_encoder_stats={"gpuTimeMS": 4.0},
+    )
+
+    assert fake._pending_iter_stats_dict["rank"] == 1
+    assert fake._pending_iter_stats_dict["gpuForwardTimeMS"] == 3.0
+    assert fake._pending_iter_stats_dict["multimodalEncoderStats"] == {"gpuTimeMS": 4.0}
+
+
 # ---------------------------------------------------------------------------
 # Attention-DP fanout tests: completed rank-local payloads are carried by the
 # next ADP allgather, then rank 0 appends one row per ADP rank.

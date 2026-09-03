@@ -1132,19 +1132,18 @@ class PyExecutor:
                                 charge_budget=False)
 
     def _flush_iter_stats_synced(self):
-        """ADP-safe drain of the TLLM_METRICS_ALL_RANKS dict-gather collective.
+        """Synchronized drain of the all-rank iteration-stats gather.
 
         Lifted out of _append_iter_stats (same divergent-gate problem as
-        _handle_kv_transfer_timeouts_synced).  Under ADP every rank sends
-        either the local dict or ``None`` every iter so the gather stays in
-        lockstep with peer collectives.  When the gate doesn't hold,
-        _append_iter_stats takes its legacy path and never populates the
-        buffer.
+        _handle_kv_transfer_timeouts_synced). Every TP rank sends either its
+        local dict or ``None`` every iteration so the gather stays in lockstep
+        with peer collectives. When the gate doesn't hold, _append_iter_stats
+        takes its legacy path and never populates the buffer.
         """
         tp_size = self.dist.tp_size
         gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
-        if not (gather_all_ranks and self.enable_iter_perf_stats and tp_size > 1
-                and self.enable_attention_dp):
+        if not (gather_all_ranks and self.enable_iter_perf_stats
+                and tp_size > 1):
             return
         local_dict = self._pending_iter_stats_dict
         self._pending_iter_stats_dict = None
@@ -2362,7 +2361,8 @@ class PyExecutor:
 
         The normal Attention-DP path fans out rank-local rows before calling
         this method; those calls pass ``attention_dp_rank`` and must not enter
-        the collective all-rank gather below.
+        the collective all-rank gather below. Other multi-rank paths use the
+        opt-in gather to expose rank-local timings for diagnostics.
 
         Args:
             stats: Iteration-level stats.
@@ -2414,7 +2414,7 @@ class PyExecutor:
         tp_size = getattr(self.dist, "tp_size", 1)
         gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
         if (gather_all_ranks and self.enable_iter_perf_stats and tp_size > 1
-                and self.enable_attention_dp and attention_dp_rank is None):
+                and attention_dp_rank is None):
             import json as _json
             local_dict = _json.loads(stats.to_json_str())
             if req_stats:
