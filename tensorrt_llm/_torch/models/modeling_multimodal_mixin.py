@@ -1076,19 +1076,19 @@ class MultimodalModelMixin:
             isinstance(param.multimodal_data.get("multimodal_embedding"), tuple)
             for param in context_params
         )
-        full_embeddings = self._get_or_encode_multimodal_embeddings(context_params)
+        multimodal_embeddings = self._get_or_encode_multimodal_embeddings(context_params)
 
-        input_ids, full_embeddings = self.after_full_multimodal_embeddings(
+        input_ids, multimodal_embeddings = self.after_full_multimodal_embeddings(
             input_ids=input_ids,
             multimodal_params=context_params,
-            embeddings=full_embeddings,
+            embeddings=multimodal_embeddings,
             **forward_kwargs,
         )
 
         active_embeddings = (
-            full_embeddings
+            multimodal_embeddings
             if has_active_item_segments
-            else find_input_mm_embeds(full_embeddings, list(context_params))
+            else find_input_mm_embeds(multimodal_embeddings, list(context_params))
         )
         active_embeddings, extra_embeds = self.after_active_multimodal_embeddings(
             active_embeddings=active_embeddings,
@@ -1121,7 +1121,7 @@ class MultimodalModelMixin:
         self,
         multimodal_params: Sequence[MultimodalParams],
     ) -> list[torch.Tensor]:
-        """Return per-request cached embeddings or run the encoder for misses.
+        """Return cached embeddings, preserving request or active-item boundaries.
 
         Item scheduling marks its current-window cache segments with a tuple.
         Standard LLM-width segments stay separate until final fusion, which
@@ -1140,11 +1140,11 @@ class MultimodalModelMixin:
         # legacy lists used while accumulating encoder outputs. Interpret that
         # marker per request: one batch may contain both scheduled segments and
         # a whole-request handoff that still needs current-chunk slicing.
-        has_scheduled_segments = any(
+        has_active_item_segments = any(
             isinstance(param.multimodal_data.get("multimodal_embedding"), tuple)
             for param in multimodal_params
         )
-        if has_scheduled_segments:
+        if has_active_item_segments:
             embeddings: list[torch.Tensor] = []
             for param in multimodal_params:
                 embedding = param.multimodal_data.get("multimodal_embedding")
