@@ -1,14 +1,16 @@
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Sequence, Union
+from typing import Any, List, Literal, Optional, Sequence, Union, cast
 
+import torch
 from tqdm import tqdm
 
 from tensorrt_llm._utils import nvtx_range_debug
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.inputs import create_input_processor, prompt_inputs
 from tensorrt_llm.inputs.data import PromptInputs
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MULTIMODAL_ENCODER_ITEM_MODE_KEY,
-    MultimodalInput, MultimodalParams)
+    DisaggPrefillMultimodalInputs, MultimodalInput, MultimodalParams)
 from tensorrt_llm.inputs.registry import (MultimodalEncoderItemMetadata,
                                           get_multimodal_encoder_item_metadata)
 from tensorrt_llm.sampling_params import SamplingParams
@@ -242,3 +244,66 @@ class MultimodalEncoder(_TorchLLM):
         result = super().generate_async(inputs, sampling_params)
         # TODO: possible postprocess the result for disaggregated serving
         return result
+
+    @staticmethod
+    def build_prefill_disaggregated_params(
+        inputs: PreprocessedInputs, ) -> DisaggregatedParams:
+        """Build the prefill metadata for an item-level encoder handoff.
+
+        The caller retains ``inputs`` for encoder execution and sends the
+        returned metadata to prefill before encoder outputs are available.
+        The outer coordinator remains responsible for setting the request
+        phase and for delivering later item completions.
+        """
+        params = inputs.multimodal_params
+        if params is None or params.multimodal_input is None:
+            raise ValueError(
+                "Disaggregated prefill requires preprocessed multimodal input")
+
+        data = params.multimodal_data
+        item_metadata = get_multimodal_encoder_item_metadata(data)
+        if item_metadata is None:
+            raise ValueError(
+                "Disaggregated prefill requires encoder item metadata")
+        assert data is not None
+
+        mm_input = params.multimodal_input
+        layout_metadata = data.get("layout_metadata") or {}
+        cumsum = cast(
+            Optional[torch.Tensor],
+            params._apply_tensor_operation(
+                data.get("multimodal_embed_mask_cumsum"), "to_tensor"),
+        )
+        special_token_offsets = data.get("special_token_offsets")
+        item_types = layout_metadata.get("item_types")
+        layout = DisaggPrefillMultimodalInputs(
+            prompt_token_ids=list(inputs.prompt_token_ids),
+            multimodal_lengths=list(mm_input.multimodal_lengths),
+            multimodal_positions=list(mm_input.multimodal_positions),
+            multimodal_embedding_lengths=list(
+                item_metadata.output_embedding_lengths),
+            encoder_token_lengths=list(item_metadata.encoder_token_lengths),
+            multimodal_item_run_cu_offsets=(
+                None if mm_input.multimodal_item_run_cu_offsets is None else
+                list(mm_input.multimodal_item_run_cu_offsets)),
+            multimodal_run_positions=(None if mm_input.multimodal_run_positions
+                                      is None else list(
+                                          mm_input.multimodal_run_positions)),
+            multimodal_run_lengths=(None
+                                    if mm_input.multimodal_run_lengths is None
+                                    else list(mm_input.multimodal_run_lengths)),
+            special_token_offsets=(None if special_token_offsets is None else
+                                   list(special_token_offsets)),
+            item_types=(None if item_types is None else list(item_types)),
+            multimodal_embed_mask_cumsum=cumsum,
+        )
+        mrope_config = data.get("mrope_config", {})
+        return DisaggregatedParams(
+            multimodal_hashes=[
+                list(item_hash) for item_hash in mm_input.multimodal_hashes
+            ],
+            multimodal_layout=layout,
+            mrope_position_ids_handle=mrope_config.get("mrope_position_ids"),
+            mrope_position_deltas_handle=mrope_config.get(
+                "mrope_position_deltas"),
+        )

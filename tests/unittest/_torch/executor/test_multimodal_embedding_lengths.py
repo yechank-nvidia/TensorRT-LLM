@@ -15,8 +15,15 @@ from tensorrt_llm._torch.pyexecutor.sampler import EarlyStopWithMMResult, Multim
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
-from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs
-from tensorrt_llm.llmapi.llm import BaseLLM
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    DisaggPrefillMultimodalInputs,
+    MultimodalInput,
+    MultimodalParams,
+)
+from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
+from tensorrt_llm.llmapi.llm import BaseLLM, PreprocessedInputs
+from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.sampling_params import SamplingParams
 
 
@@ -287,6 +294,64 @@ def test_disagg_prefill_can_admit_layout_before_encoder_outputs():
     assert "multimodal_embedding" not in multimodal_params.multimodal_data
     assert multimodal_params.multimodal_data["multimodal_embedding_lengths"] == [2]
     assert multimodal_params.multimodal_data["encoder_token_lengths"] == [8]
+
+
+@pytest.mark.cpu_only
+def test_multimodal_encoder_builds_pending_prefill_metadata():
+    """One preprocessing result supplies E inputs and P's pending layout."""
+    cumsum = torch.tensor([0, 1, 2, 2, 3, 3], dtype=torch.int64)
+    cumsum_handle = SharedTensorContainer.from_tensor(cumsum).dump_to_dict()
+    position_ids_handle = {"position": "ids"}
+    position_deltas_handle = {"position": "deltas"}
+    multimodal_input = MultimodalInput.from_components(
+        [[1] * 8, [2] * 8],
+        [1, 4],
+        [2, 1],
+        mm_item_run_cu_offsets=[0, 1, 2],
+        mm_run_positions=[1, 4],
+        mm_run_lengths=[2, 1],
+    )
+    inputs = PreprocessedInputs(
+        prompt_token_ids=[7, 99, 99, 8, 99, 9],
+        multimodal_params=MultimodalParams(
+            multimodal_input=multimodal_input,
+            multimodal_data={
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+                    item_refs=[("image", 0), ("video", 0)],
+                    encoder_token_lengths=[8, 12],
+                    output_embedding_lengths=[2, 1],
+                ),
+                "special_token_offsets": [0, 2],
+                "layout_metadata": {"item_types": [0, 1]},
+                "multimodal_embed_mask_cumsum": cumsum_handle,
+                "mrope_config": {
+                    "mrope_position_ids": position_ids_handle,
+                    "mrope_position_deltas": position_deltas_handle,
+                },
+            },
+        ),
+    )
+
+    params = MultimodalEncoder.build_prefill_disaggregated_params(inputs)
+
+    assert params.request_type is None
+    assert params.multimodal_embedding_handles is None
+    assert params.multimodal_hashes == [[1] * 8, [2] * 8]
+    assert params.mrope_position_ids_handle is position_ids_handle
+    assert params.mrope_position_deltas_handle is position_deltas_handle
+    layout = params.multimodal_layout
+    assert layout is not None
+    assert layout.prompt_token_ids == inputs.prompt_token_ids
+    assert layout.multimodal_positions == [1, 4]
+    assert layout.multimodal_lengths == [2, 1]
+    assert layout.multimodal_embedding_lengths == [2, 1]
+    assert layout.encoder_token_lengths == [8, 12]
+    assert layout.multimodal_item_run_cu_offsets == [0, 1, 2]
+    assert layout.multimodal_run_positions == [1, 4]
+    assert layout.multimodal_run_lengths == [2, 1]
+    assert layout.special_token_offsets == [0, 2]
+    assert layout.item_types == [0, 1]
+    assert torch.equal(layout.multimodal_embed_mask_cumsum, cumsum)
 
 
 @pytest.mark.cpu_only
