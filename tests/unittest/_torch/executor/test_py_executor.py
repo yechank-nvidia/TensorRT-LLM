@@ -1432,6 +1432,9 @@ def test_schedule_prepares_snapshot_points_before_scheduling():
     executor.inflight_req_ids = set()
     executor.kv_cache_manager = Mock()
     executor.scheduler = Mock()
+    executor._mm_encoder_item_scheduling_enabled = False
+    executor._mm_encoder_is_local = False
+    executor._commit_external_mm_encoder_completions = Mock()
 
     calls = []
     executor.kv_cache_manager.prepare_expect_snapshot_points.side_effect = (
@@ -1451,6 +1454,7 @@ def test_schedule_prepares_snapshot_points_before_scheduling():
         ("prepare", executor.active_requests),
         ("schedule", executor.active_requests, executor.inflight_req_ids),
     ]
+    executor._commit_external_mm_encoder_completions.assert_not_called()
 
 
 class TestComputeScheduledTokens:

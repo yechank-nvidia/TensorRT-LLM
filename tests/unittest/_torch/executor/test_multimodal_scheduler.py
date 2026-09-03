@@ -243,6 +243,23 @@ def test_pending_external_encoder_outputs_initialize_item_state():
     assert state.encoder_token_lengths == [8, 12]
 
 
+def test_complete_external_encoder_outputs_keep_whole_request_path():
+    request = _llm_request(
+        1,
+        multimodal_data={
+            "multimodal_embedding": torch.ones(5, 4),
+            "multimodal_embedding_lengths": [2, 3],
+            "encoder_token_lengths": [8, 12],
+        },
+        multimodal_positions=[1, 5],
+        multimodal_lengths=[2, 3],
+    )
+
+    initialize_multimodal_encoder_request(request, max_num_tokens=16)
+
+    assert request.py_mm_encoder_state is None
+
+
 def test_external_encoder_outputs_commit_without_local_encoder():
     cache = TensorLRUCache(1 << 20, name="test")
 

@@ -6359,7 +6359,8 @@ class PyExecutor:
 
     @nvtx_range("_schedule")
     def _schedule(self):
-        if not getattr(self, "_mm_encoder_is_local", True):
+        if (getattr(self, "_mm_encoder_item_scheduling_enabled", False)
+                and not getattr(self, "_mm_encoder_is_local", True)):
             # Make outputs that arrived between iterations visible to the
             # scheduler now, so their LLM chunk does not wait for an otherwise
             # empty forward step just to commit the completion.
