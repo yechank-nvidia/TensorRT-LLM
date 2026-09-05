@@ -344,7 +344,6 @@ def test_external_encoder_demand_and_completion_use_existing_reservation():
     executor._mm_encoder_item_scheduling_enabled = True
     executor._external_mm_encoder_demands = Queue()
     executor._external_mm_encoder_demand_queue = None
-    executor._external_mm_encoder_completions = Queue()
     executor.enable_iter_perf_stats = True
     executor.perf_manager = SimpleNamespace(
         borrow_forward_timing_events=lambda: pytest.fail(
@@ -387,8 +386,7 @@ def test_external_encoder_demand_and_completion_use_existing_reservation():
     duplicate_handle = SharedTensorContainer.from_tensor(
         torch.full_like(output, -1), local=True
     ).dump_to_dict()
-    executor._external_mm_encoder_completions.put((17, [0], [duplicate_handle], None))
-    executor._commit_external_mm_encoder_completions()
+    executor._commit_external_mm_encoder_completion((17, [0], [duplicate_handle], None))
 
     torch.testing.assert_close(cache.get(cache_key), output)
     with pytest.raises(RuntimeError, match="REBUILD_LOCAL tensor missing"):
@@ -401,10 +399,8 @@ def test_stale_external_encoder_completion_consumes_output_handles():
     executor = object.__new__(PyExecutor)
     executor.active_requests = []
     executor.model_engine = SimpleNamespace(mm_encoder_cache=cache)
-    executor._external_mm_encoder_completions = Queue()
-    executor._external_mm_encoder_completions.put((17, [0], [stale_handle], None))
 
-    executor._commit_external_mm_encoder_completions()
+    executor._commit_external_mm_encoder_completion((17, [0], [stale_handle], None))
 
     with pytest.raises(RuntimeError, match="REBUILD_LOCAL tensor missing"):
         SharedTensorContainer.from_dict(stale_handle).get_local_view()
@@ -418,7 +414,6 @@ def test_external_encoder_error_is_scoped_to_its_request():
     executor = object.__new__(PyExecutor)
     executor.active_requests = [failed, unrelated]
     executor.model_engine = SimpleNamespace(mm_encoder_cache=TensorLRUCache(1 << 20, name="test"))
-    executor._external_mm_encoder_completions = Queue()
     executor._owns_mm_encoder_cache_references = lambda: True
     executor._handle_errors = lambda error, **kwargs: handled.append((error, kwargs))
     completion = RequestQueueItem(

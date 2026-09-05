@@ -460,8 +460,6 @@ class PyExecutor:
         self._pending_external_mm_encoder_demands: List[Tuple[int,
                                                               List[int]]] = []
         self._external_mm_encoder_demand_queue: Optional["IpcQueue"] = None
-        self._external_mm_encoder_completions: Queue[Tuple[
-            int, List[int], List[Dict[str, Any]], Optional[str]]] = Queue()
         self._multimodal_encoder_inputs: Dict[str, MultimodalParams] = {}
         self.scheduler = scheduler
         self.enable_attention_dp = model_engine.enable_attention_dp
@@ -5982,8 +5980,7 @@ class PyExecutor:
                     # RequestBroadcaster delivers the same completion before
                     # scheduling on every rank that owns the replicated cache.
                     try:
-                        self._external_mm_encoder_completions.put(completion)
-                        self._commit_external_mm_encoder_completions()
+                        self._commit_external_mm_encoder_completion(completion)
                     except MultimodalEncoderRequestError as error:
                         failed_ids = set(error.request_ids)
                         failed_requests = [
@@ -6677,8 +6674,11 @@ class PyExecutor:
             else:
                 self._external_mm_encoder_demand_queue.put(demand)
 
-    def _commit_external_mm_encoder_completions(self) -> None:
-        """Commit completed producer handles into their existing reservations."""
+    def _commit_external_mm_encoder_completion(
+        self,
+        completion: Tuple[int, List[int], List[Dict[str, Any]], Optional[str]],
+    ) -> None:
+        """Commit producer handles from one completion into existing reservations."""
         request_by_client_id = {
             request.py_client_id: request
             for request in self.active_requests
@@ -6687,89 +6687,81 @@ class PyExecutor:
         if encoder_cache is None:
             raise RuntimeError(
                 "External MM encoder completions require an encoder cache")
-        while True:
+        client_id, item_indices, output_handles, error = completion
+        request = request_by_client_id.get(client_id)
+        restored_outputs: List[Optional[torch.Tensor]] = []
+        restore_error: Optional[Exception] = None
+        for output_handle in output_handles:
             try:
-                (client_id, item_indices, output_handles,
-                 error) = self._external_mm_encoder_completions.get_nowait()
-            except Empty:
-                return
+                restored_outputs.append(
+                    SharedTensorContainer.from_dict(
+                        output_handle).get_local_view())
+            except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+                restored_outputs.append(None)
+                if restore_error is None:
+                    restore_error = exc
 
-            request = request_by_client_id.get(client_id)
-            restored_outputs: List[Optional[torch.Tensor]] = []
-            restore_error: Optional[Exception] = None
-            for output_handle in output_handles:
-                try:
-                    restored_outputs.append(
-                        SharedTensorContainer.from_dict(
-                            output_handle).get_local_view())
-                except (KeyError, RuntimeError, TypeError, ValueError) as exc:
-                    restored_outputs.append(None)
-                    if restore_error is None:
-                        restore_error = exc
+        if request is None or request.py_mm_encoder_state is None:
+            # CUDA IPC requires the consumer to rebuild every received handle
+            # before discarding it so the producer refcount drops.
+            return
+        if error is not None:
+            raise MultimodalEncoderRequestError(
+                f"External MM encoder failed: {error}",
+                request_ids={request.request_id},
+            )
+        if len(item_indices) != len(output_handles):
+            raise MultimodalEncoderRequestError(
+                "External MM encoder output count must match item indices",
+                request_ids={request.request_id},
+            )
+        if restore_error is not None:
+            raise MultimodalEncoderRequestError(
+                f"Invalid external MM encoder output: {restore_error}",
+                request_ids={request.request_id},
+            ) from restore_error
 
-            if request is None or request.py_mm_encoder_state is None:
-                # CUDA IPC requires the consumer to rebuild every received
-                # handle before discarding it so the producer refcount drops.
+        state = request.py_mm_encoder_state
+        pending_indices = []
+        pending_outputs = []
+        for item_idx, output in zip(item_indices, restored_outputs,
+                                    strict=True):
+            if item_idx < 0 or item_idx >= state.num_items:
+                raise MultimodalEncoderRequestError(
+                    f"External MM encoder item {item_idx} is out of range",
+                    request_ids={request.request_id},
+                )
+            cache_key = state.item_cache_keys[item_idx]
+            if (cache_key is None or encoder_cache.get(
+                    cache_key, record_stats=False) is not None):
                 continue
-            if error is not None:
-                raise MultimodalEncoderRequestError(
-                    f"External MM encoder failed: {error}",
-                    request_ids={request.request_id},
-                )
-            if len(item_indices) != len(output_handles):
-                raise MultimodalEncoderRequestError(
-                    "External MM encoder output count must match item indices",
-                    request_ids={request.request_id},
-                )
-            if restore_error is not None:
-                raise MultimodalEncoderRequestError(
-                    f"Invalid external MM encoder output: {restore_error}",
-                    request_ids={request.request_id},
-                ) from restore_error
+            assert output is not None
+            pending_indices.append(item_idx)
+            pending_outputs.append(output)
 
-            state = request.py_mm_encoder_state
-            pending_indices = []
-            pending_outputs = []
-            for item_idx, output in zip(item_indices,
-                                        restored_outputs,
-                                        strict=True):
-                if item_idx < 0 or item_idx >= state.num_items:
-                    raise MultimodalEncoderRequestError(
-                        f"External MM encoder item {item_idx} is out of range",
-                        request_ids={request.request_id},
-                    )
-                cache_key = state.item_cache_keys[item_idx]
-                if (cache_key is None or encoder_cache.get(
-                        cache_key, record_stats=False) is not None):
-                    continue
-                assert output is not None
-                pending_indices.append(item_idx)
-                pending_outputs.append(output)
-
-            if not pending_indices:
-                continue
-            mm_data = request.py_multimodal_data
-            if not isinstance(mm_data, dict):
-                raise MultimodalEncoderRequestError(
-                    "External MM encoder request has no multimodal data",
-                    request_ids={request.request_id},
-                )
-            item_outputs: List[Optional[torch.Tensor]] = [None
-                                                          ] * state.num_items
-            for item_idx, output in zip(pending_indices,
-                                        pending_outputs,
-                                        strict=True):
-                item_outputs[item_idx] = output
-            previous_outputs = mm_data.get("multimodal_embedding")
-            mm_data["multimodal_embedding"] = item_outputs
-            try:
-                self.model_engine.forward_multimodal_encoder_items(
-                    [request], {request.request_id: pending_indices})
-            finally:
-                if previous_outputs is None:
-                    mm_data.pop("multimodal_embedding", None)
-                else:
-                    mm_data["multimodal_embedding"] = previous_outputs
+        if not pending_indices:
+            return
+        mm_data = request.py_multimodal_data
+        if not isinstance(mm_data, dict):
+            raise MultimodalEncoderRequestError(
+                "External MM encoder request has no multimodal data",
+                request_ids={request.request_id},
+            )
+        item_outputs: List[Optional[torch.Tensor]] = [None] * state.num_items
+        for item_idx, output in zip(pending_indices,
+                                    pending_outputs,
+                                    strict=True):
+            item_outputs[item_idx] = output
+        previous_outputs = mm_data.get("multimodal_embedding")
+        mm_data["multimodal_embedding"] = item_outputs
+        try:
+            self.model_engine.forward_multimodal_encoder_items(
+                [request], {request.request_id: pending_indices})
+        finally:
+            if previous_outputs is None:
+                mm_data.pop("multimodal_embedding", None)
+            else:
+                mm_data["multimodal_embedding"] = previous_outputs
 
     def _handle_multimodal_encoder_request_error(
             self, scheduled_requests: ScheduledRequests, error_msg: str,
