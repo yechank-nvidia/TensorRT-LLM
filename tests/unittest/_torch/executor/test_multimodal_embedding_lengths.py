@@ -198,6 +198,26 @@ def test_mm_encoder_sampler_aligns_mixed_batch_by_request_index():
 
 
 @pytest.mark.cpu_only
+def test_mm_encoder_sampler_does_not_export_follower_results():
+    request = _FakeRequest(multimodal_lengths=[4])
+    sampler = EarlyStopWithMMResult(return_mm_results=False)
+    state = sampler.SampleState(
+        requests=[request],
+        data=MultimodalResult(
+            mm_embeddings=[torch.ones(4, 2)],
+            mm_embedding_request_indices=[0],
+            mm_embedding_lengths=[[4]],
+            num_context_requests=1,
+        ),
+    )
+
+    sampler.update_requests(state)
+
+    assert request.state == LlmRequestState.GENERATION_COMPLETE
+    assert request.py_result.mm_embeddings == []
+
+
+@pytest.mark.cpu_only
 def test_disagg_prefill_reuses_encoder_side_multimodal_layout():
     """Prefill adopts the encoder layout without calling the legacy rebuilder."""
 

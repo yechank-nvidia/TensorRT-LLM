@@ -3353,7 +3353,7 @@ def instantiate_sampler(
 
     if mm_encoder_only:
         # NOTE: handle model outputs specially for mm encoder executor/engine
-        return EarlyStopWithMMResult()
+        return EarlyStopWithMMResult(return_mm_results=mapping.rank == 0)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()
