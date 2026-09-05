@@ -167,7 +167,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._is_pytorch_backend = _backend in ["pytorch", "_autodeploy"]
         self._enable_mm_encoder_demand_queue = bool(
             _backend == "pytorch" and _llm_args is not None
-            and _llm_args.disable_mm_encoder)
+            and _llm_args.disable_mm_encoder
+            and os.getenv("TLLM_MULTIMODAL_DISAGGREGATED", "0") == "1")
         self._enable_resource_governor = bool(
             getattr(_llm_args, "enable_resource_governor", False))
 
