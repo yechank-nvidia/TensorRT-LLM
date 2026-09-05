@@ -5842,13 +5842,13 @@ class TorchLlmArgs(BaseLlmArgs):
     @model_validator(mode="after")
     def normalize_disabled_mm_encoder_cache(self) -> 'TorchLlmArgs':
         if (self.disable_mm_encoder
+                and os.getenv("TLLM_MULTIMODAL_DISAGGREGATED", "0") != "1"
                 and self.multimodal_config.encoder_cache_max_bytes != 0):
             logger.info(
                 "Setting multimodal_config.encoder_cache_max_bytes to 0 "
                 "because disable_mm_encoder=True.")
-            # The cache defaults to enabled, so disabling the encoder must override it to also
-            # disable an unused cache. Although `multimodal_config` is unlikely to be used
-            # standalone outside of a `TorchLlmArgs` instance, we make a copy to be safe.
+            # Plain text-only mode has no encoder outputs to cache. Explicit
+            # MM E/P instead keeps this P-owned cache for external outputs.
             self.multimodal_config = self.multimodal_config.model_copy(
                 update={"encoder_cache_max_bytes": 0})
         return self

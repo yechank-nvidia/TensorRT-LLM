@@ -1097,7 +1097,8 @@ class TestMultimodalConfig:
         assert args.multimodal_config.encoder_scheduling_policy == "DEFAULT"
         assert args.multimodal_config.video_pruning_rate is None
 
-    def test_disable_mm_encoder_disables_encoder_cache(self):
+    def test_disable_mm_encoder_cache_respects_mm_ep_mode(self, monkeypatch):
+        monkeypatch.delenv("TLLM_MULTIMODAL_DISAGGREGATED", raising=False)
         multimodal_config = MultimodalConfig(encoder_cache_max_bytes="1MiB")
         args = TorchLlmArgs(
             model=llama_model_path,
@@ -1108,6 +1109,16 @@ class TestMultimodalConfig:
 
         assert args.multimodal_config.encoder_cache_max_bytes == 0
         assert multimodal_config.encoder_cache_max_bytes == 1024**2
+
+        monkeypatch.setenv("TLLM_MULTIMODAL_DISAGGREGATED", "1")
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            checkpoint_format="HF",
+            disable_mm_encoder=True,
+            multimodal_config=multimodal_config,
+        )
+
+        assert args.multimodal_config.encoder_cache_max_bytes == 1024**2
 
     @pytest.mark.parametrize(
         ("value", "expected"),
