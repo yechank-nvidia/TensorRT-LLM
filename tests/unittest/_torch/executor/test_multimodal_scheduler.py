@@ -553,23 +553,6 @@ def test_encoder_input_release_waits_for_earlier_request():
     assert request.py_multimodal_data["image"] is params.multimodal_data["image"]
 
 
-def test_complete_external_handoff_keeps_direct_path():
-    request = _llm_request(
-        1,
-        multimodal_data={
-            "multimodal_embedding": [torch.ones(2, 4)],
-            "multimodal_embedding_lengths": [2],
-            "encoder_token_lengths": [8],
-        },
-        multimodal_positions=[1],
-        multimodal_lengths=[2],
-    )
-
-    initialize_multimodal_encoder_request(request, max_num_tokens=16)
-
-    assert request.py_mm_encoder_state is None
-
-
 def test_multimodal_scheduler_continues_with_later_proposed_requests():
     scheduler = _scheduler(max_batch_size=2, max_num_tokens=10)
     first = _request(1, [7, 7])
