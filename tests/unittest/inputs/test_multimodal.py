@@ -503,6 +503,7 @@ def test_disagg_prefill_multimodal_inputs_builds_typed_handoff():
     assert handoff.special_token_offsets == [2]
     assert handoff.item_types == [0]
     assert handoff.multimodal_embed_mask_cumsum is cumsum
+    assert handoff._get_or_build_embed_mask_cumsum() is cumsum
 
 
 def test_disagg_prefill_multimodal_inputs_rejects_misaligned_encoder_costs():
@@ -514,6 +515,39 @@ def test_disagg_prefill_multimodal_inputs_rejects_misaligned_encoder_costs():
             multimodal_embedding_lengths=[1],
             encoder_token_lengths=[4, 8],
         )
+
+
+def test_disagg_prefill_multimodal_inputs_build_cumsum_from_exact_runs():
+    handoff = DisaggPrefillMultimodalInputs(
+        prompt_token_ids=[10, 1001, 2001, 20, 1002, 30, 2002, 1003],
+        multimodal_lengths=[2, 3],
+        multimodal_positions=[1, 4],
+        multimodal_embedding_lengths=[1, 2],
+        multimodal_item_run_cu_offsets=[0, 1, 3],
+        multimodal_run_positions=[1, 4, 6],
+        multimodal_run_lengths=[2, 1, 2],
+        special_token_offsets=[1, 3],
+    )
+
+    assert torch.equal(
+        handoff._get_or_build_embed_mask_cumsum(),
+        torch.tensor([0, 1, 1, 1, 2, 2, 2, 3], dtype=torch.int64),
+    )
+
+
+def test_disagg_prefill_multimodal_inputs_fall_back_on_incomplete_metadata():
+    handoff = DisaggPrefillMultimodalInputs(
+        prompt_token_ids=[10, 2001, 2002, 20, 1001, 1002],
+        multimodal_lengths=[2, 2],
+        multimodal_positions=[1, 4],
+        multimodal_embedding_lengths=[1, 1],
+        multimodal_item_run_cu_offsets=[0, 1, 2],
+        multimodal_run_positions=[1, 4],
+        multimodal_run_lengths=[2, 2],
+        special_token_offsets=[0, 1],
+    )
+
+    assert handoff._get_or_build_embed_mask_cumsum() is None
 
 
 def test_multimodal_input_rejects_invalid_prompt_spans():

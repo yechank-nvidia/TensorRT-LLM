@@ -279,13 +279,13 @@ def test_disagg_prefill_can_admit_layout_before_encoder_outputs():
         mm_bidirectional_blocks = False
 
         def get_vocab_size(self):
-            return 100
+            raise AssertionError("exact runs should avoid token classification")
 
         def get_mm_token_ids(self):
-            return torch.tensor([99])
+            raise AssertionError("exact runs should avoid token classification")
 
         def get_mm_special_token_ids(self):
-            return None
+            raise AssertionError("exact runs should avoid token classification")
 
     layout = DisaggPrefillMultimodalInputs(
         prompt_token_ids=[7, 99, 99, 8],
@@ -293,6 +293,9 @@ def test_disagg_prefill_can_admit_layout_before_encoder_outputs():
         multimodal_positions=[1],
         multimodal_embedding_lengths=[2],
         encoder_token_lengths=[8],
+        multimodal_item_run_cu_offsets=[0, 1],
+        multimodal_run_positions=[1],
+        multimodal_run_lengths=[2],
     )
     disaggregated_params = DisaggregatedParams(
         multimodal_embedding_handles=None,
@@ -314,6 +317,10 @@ def test_disagg_prefill_can_admit_layout_before_encoder_outputs():
     assert "multimodal_embedding" not in multimodal_params.multimodal_data
     assert multimodal_params.multimodal_data["multimodal_embedding_lengths"] == [2]
     assert multimodal_params.multimodal_data["encoder_token_lengths"] == [8]
+    assert torch.equal(
+        multimodal_params.multimodal_data["multimodal_embed_mask_cumsum"],
+        torch.tensor([0, 1, 2, 2], dtype=torch.int64),
+    )
 
 
 @pytest.mark.cpu_only

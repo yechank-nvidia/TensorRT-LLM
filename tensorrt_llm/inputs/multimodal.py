@@ -428,6 +428,72 @@ class DisaggPrefillMultimodalInputs:
             mm_run_lengths=self.multimodal_run_lengths,
         )
 
+    def _get_or_build_embed_mask_cumsum(self) -> Optional[torch.Tensor]:
+        """Return the carried cumsum or derive it from exact prompt runs.
+
+        Returns ``None`` when the layout does not contain enough consistent
+        metadata. Callers can then fall back to classifying prompt token IDs.
+        """
+        if self.multimodal_embed_mask_cumsum is not None:
+            return self.multimodal_embed_mask_cumsum
+
+        run_positions = self.multimodal_run_positions
+        run_lengths = self.multimodal_run_lengths
+        if run_positions is None or run_lengths is None:
+            return None
+
+        prompt_length = len(self.prompt_token_ids)
+        runs = list(zip(run_positions, run_lengths))
+        if runs != sorted(runs):
+            return None
+        if any(position + length > prompt_length for position, length in runs):
+            return None
+        if any(position < previous_position + previous_length
+               for (previous_position,
+                    previous_length), (position, _) in zip(runs, runs[1:])):
+            return None
+
+        special_offsets = self.special_token_offsets or []
+        if special_offsets != sorted(set(special_offsets)):
+            return None
+        total_multimodal_tokens = sum(length for _, length in runs)
+        if any(offset >= total_multimodal_tokens for offset in special_offsets):
+            return None
+
+        special_index = 0
+        flat_item_end = 0
+        for item_length, embedding_length in zip(
+                self.multimodal_lengths,
+                self.multimodal_embedding_lengths,
+                strict=True,
+        ):
+            flat_item_end += item_length
+            item_special_begin = special_index
+            while (special_index < len(special_offsets)
+                   and special_offsets[special_index] < flat_item_end):
+                special_index += 1
+            if (special_index - item_special_begin
+                    != item_length - embedding_length):
+                return None
+
+        embed_mask = torch.zeros(prompt_length, dtype=torch.bool)
+        for position, length in runs:
+            embed_mask[position:position + length] = True
+
+        special_index = 0
+        flat_run_start = 0
+        for position, length in runs:
+            flat_run_end = flat_run_start + length
+            while (special_index < len(special_offsets)
+                   and special_offsets[special_index] < flat_run_end):
+                offset_in_run = (special_offsets[special_index] -
+                                 flat_run_start)
+                embed_mask[position + offset_in_run] = False
+                special_index += 1
+            flat_run_start = flat_run_end
+
+        return embed_mask.cumsum(0, dtype=torch.int64)
+
 
 @dataclass
 class MultimodalRuntimeData:
