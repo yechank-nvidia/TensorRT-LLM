@@ -455,6 +455,8 @@ class PyExecutor:
         self._pending_mm_encoder_cache_removals: List[Hashable] = []
         self._external_mm_encoder_demands: Queue[Tuple[int,
                                                        List[int]]] = Queue()
+        self._pending_external_mm_encoder_demands: List[Tuple[int,
+                                                              List[int]]] = []
         self._external_mm_encoder_demand_queue: Optional["IpcQueue"] = None
         self._external_mm_encoder_completions: Queue[Tuple[
             int, List[int], List[Dict[str, Any]], Optional[str]]] = Queue()
@@ -5857,8 +5859,19 @@ class PyExecutor:
             # clear stats once every rank is aligned.
             iter_stats_payload = (self._adp_iter_stats.next_payload()
                                   if self.enable_iter_perf_stats else None)
+            mm_encoder_demands = (self._pending_external_mm_encoder_demands
+                                  if not self._mm_encoder_is_local else None)
             all_rank_states = self.adp_router.gather_all_rank_states(
-                active_requests, iter_stats_payload=iter_stats_payload)
+                active_requests,
+                iter_stats_payload=iter_stats_payload,
+                mm_encoder_demands=mm_encoder_demands,
+            )
+            if mm_encoder_demands is not None:
+                mm_encoder_demands.clear()
+                if self.dist.rank == 0:
+                    self._queue_external_mm_encoder_demands(
+                        demand for rank_state in all_rank_states
+                        for demand in rank_state.mm_encoder_demands)
             if self.enable_iter_perf_stats:
                 for record in self._adp_iter_stats.finalize(
                         all_rank_states, is_rank0=self.dist.rank == 0):
@@ -6560,19 +6573,32 @@ class PyExecutor:
 
     def _publish_external_mm_encoder_demands(
             self, scheduled_items: Dict[int, List[int]]) -> None:
-        # The proxy exposes one demand queue, owned by rank 0. TP peers make
-        # the same scheduling decision but must not publish duplicate work.
-        if self.dist.rank != 0:
+        # Ordinary TP peers make the same scheduling decision, so rank 0 emits
+        # one copy. Attention-DP ranks own different requests; buffer each
+        # rank's work for the next already-required ADP state allgather.
+        attention_dp = getattr(self, "enable_attention_dp", False)
+        if not attention_dp and self.dist.rank != 0:
             return
         request_by_id = {
             request.request_id: request
             for request in self.active_requests
         }
+        demands = []
         for request_id, item_indices in scheduled_items.items():
             request = request_by_id.get(request_id)
             if request is None:
                 continue
-            demand = (request.py_client_id, list(item_indices))
+            demands.append((request.py_client_id, list(item_indices)))
+        if attention_dp:
+            self._pending_external_mm_encoder_demands.extend(demands)
+        else:
+            self._queue_external_mm_encoder_demands(demands)
+
+    def _queue_external_mm_encoder_demands(
+            self, demands: Iterable[Tuple[int, List[int]]]) -> None:
+        """Send owner-selected demands to the external encoder frontend."""
+        for client_id, item_indices in demands:
+            demand = (client_id, list(item_indices))
             if self._external_mm_encoder_demand_queue is None:
                 self._external_mm_encoder_demands.put(demand)
             else:

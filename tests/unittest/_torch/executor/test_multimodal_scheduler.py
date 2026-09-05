@@ -377,6 +377,23 @@ def test_external_encoder_demand_and_completion_use_existing_reservation():
     assert "multimodal_embedding" not in request.py_multimodal_data
 
 
+def test_attention_dp_buffers_owner_encoder_demand_for_rank_state_gather():
+    request = _request(1, [1])
+    request.py_client_id = 17
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = [request]
+    executor.enable_attention_dp = True
+    executor.dist = SimpleNamespace(rank=1)
+    executor._pending_external_mm_encoder_demands = []
+    executor._external_mm_encoder_demands = Queue()
+    executor._external_mm_encoder_demand_queue = None
+
+    executor._publish_external_mm_encoder_demands({request.request_id: [0]})
+
+    assert executor._pending_external_mm_encoder_demands == [(17, [0])]
+    assert executor.take_multimodal_encoder_demands() == []
+
+
 def test_proxy_sends_encoder_completion_through_request_ingress():
     proxy = object.__new__(GenerationExecutorProxy)
     proxy.workers_started = False

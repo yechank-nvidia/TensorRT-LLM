@@ -100,6 +100,7 @@ class RankState:
     num_active_requests: int = 0
     num_active_tokens: int = 0
     iter_stats: RankIterStatsPayload = field(default_factory=RankIterStatsPayload)
+    mm_encoder_demands: list[tuple[int, list[int]]] = field(default_factory=list)
 
     def copy_iter_stats_from(self, iter_stats_payload: RankIterStatsPayload | None) -> None:
         if iter_stats_payload is None:
@@ -108,12 +109,20 @@ class RankState:
 
     def serialize(self) -> list[int]:
         """Serialize to a flat list for allgather transport."""
-        return [
+        data = [
             self.rank,
             self.num_active_requests,
             self.num_active_tokens,
             *self.iter_stats.serialize(),
         ]
+        # Preserve the byte-for-byte common payload when there is no external
+        # encoder work. A variable-length tail is present only in that optional
+        # topology.
+        if self.mm_encoder_demands:
+            data.append(len(self.mm_encoder_demands))
+            for client_id, item_indices in self.mm_encoder_demands:
+                data.extend((client_id, len(item_indices), *item_indices))
+        return data
 
     @classmethod
     def deserialize(cls, data: list[int]) -> RankState:
@@ -121,13 +130,9 @@ class RankState:
         values = list(data)
         rank_state_prefix_field_count = 3
         rank_state_fields = fields(cls)[:rank_state_prefix_field_count]
-        max_field_count = rank_state_prefix_field_count + len(fields(RankIterStatsPayload))
+        base_field_count = rank_state_prefix_field_count + len(fields(RankIterStatsPayload))
         if len(values) < 1:
             raise ValueError("RankState payload is missing required field rank")
-        if len(values) > max_field_count:
-            raise ValueError(
-                f"RankState payload has {len(values)} fields, expected at most {max_field_count}"
-            )
         rank_values = values[:rank_state_prefix_field_count]
         for field_info in rank_state_fields[len(rank_values) :]:
             if field_info.default is not MISSING:
@@ -136,11 +141,32 @@ class RankState:
                 rank_values.append(field_info.default_factory())
             else:
                 raise ValueError(f"RankState payload is missing required field {field_info.name}")
+        mm_encoder_demands = []
+        if len(values) > base_field_count:
+            demand_data = values[base_field_count:]
+            num_demands = demand_data.pop(0)
+            if num_demands <= 0:
+                raise ValueError("RankState MM encoder demand count must be positive")
+            for _ in range(num_demands):
+                if len(demand_data) < 2:
+                    raise ValueError("RankState MM encoder demand is incomplete")
+                client_id = demand_data.pop(0)
+                num_items = demand_data.pop(0)
+                if num_items <= 0 or len(demand_data) < num_items:
+                    raise ValueError("RankState MM encoder item count is invalid")
+                mm_encoder_demands.append((client_id, demand_data[:num_items]))
+                del demand_data[:num_items]
+            if demand_data:
+                raise ValueError("RankState MM encoder demand has trailing data")
+
         return cls(
             rank=rank_values[0],
             num_active_requests=rank_values[1],
             num_active_tokens=rank_values[2],
-            iter_stats=RankIterStatsPayload.deserialize(values[rank_state_prefix_field_count:]),
+            iter_stats=RankIterStatsPayload.deserialize(
+                values[rank_state_prefix_field_count:base_field_count]
+            ),
+            mm_encoder_demands=mm_encoder_demands,
         )
 
 
@@ -245,6 +271,7 @@ class ADPRouter(ABC):
         active_requests: list[LlmRequest],
         new_requests: list[RequestQueueItem] | None = None,
         iter_stats_payload: RankIterStatsPayload | None = None,
+        mm_encoder_demands: list[tuple[int, list[int]]] | None = None,
     ) -> list[RankState]:
         """Build local RankState, allgather across DP ranks, return all states.
 
@@ -255,9 +282,15 @@ class ADPRouter(ABC):
                 new-request info (e.g. KV-cache-aware routing).
             iter_stats_payload: Completed previous-iteration stats payload to
                 piggyback on this allgather, if one is pending.
+            mm_encoder_demands: External encoder work selected by this rank in
+                the previous iteration, if any.
         """
         local_state = self.create_rank_state(active_requests, new_requests or [])
         local_state.copy_iter_stats_from(iter_stats_payload)
+        if mm_encoder_demands:
+            local_state.mm_encoder_demands = [
+                (client_id, list(item_indices)) for client_id, item_indices in mm_encoder_demands
+            ]
         responses = self.dist.tp_allgather(local_state.serialize())
         return [RankState.deserialize(data=resp) for resp in responses]
 

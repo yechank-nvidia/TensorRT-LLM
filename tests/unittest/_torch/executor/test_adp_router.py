@@ -154,6 +154,18 @@ class TestRankState:
         restored = RankState.deserialize(data=original.serialize())
         assert original == restored
 
+    def test_roundtrip_with_multimodal_encoder_demands(self):
+        original = RankState(
+            rank=1,
+            num_active_requests=2,
+            num_active_tokens=20,
+            mm_encoder_demands=[(17, [0]), (23, [1, 3])],
+        )
+
+        restored = RankState.deserialize(data=original.serialize())
+
+        assert restored == original
+
     def test_defaults(self):
         state = RankState(rank=0)
         assert state.num_active_requests == 0
@@ -329,6 +341,18 @@ class TestDefaultADPRouter:
 
         assert states[0] == expected_local
         assert states[1] == rank1
+        dist.tp_allgather.assert_called_once_with(expected_local.serialize())
+
+    def test_gather_all_rank_states_piggybacks_multimodal_encoder_demands(self):
+        dist = _mock_dist(tp_rank=1, tp_size=2, has_cp_helix=False)
+        demands = [(17, [0]), (23, [1, 3])]
+        expected_local = RankState(rank=1, mm_encoder_demands=demands)
+        dist.tp_allgather.return_value = [RankState(rank=0).serialize(), expected_local.serialize()]
+
+        router = DefaultADPRouter(dist=dist)
+        states = router.gather_all_rank_states([], mm_encoder_demands=demands)
+
+        assert states[1] == expected_local
         dist.tp_allgather.assert_called_once_with(expected_local.serialize())
 
 
