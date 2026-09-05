@@ -6695,9 +6695,21 @@ class PyExecutor:
                 return
 
             request = request_by_client_id.get(client_id)
+            restored_outputs: List[Optional[torch.Tensor]] = []
+            restore_error: Optional[Exception] = None
+            for output_handle in output_handles:
+                try:
+                    restored_outputs.append(
+                        SharedTensorContainer.from_dict(
+                            output_handle).get_local_view())
+                except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+                    restored_outputs.append(None)
+                    if restore_error is None:
+                        restore_error = exc
+
             if request is None or request.py_mm_encoder_state is None:
-                # A canceled or preempted request no longer owns the
-                # reservation. Dropping the handles releases the stale result.
+                # CUDA IPC requires the consumer to rebuild every received
+                # handle before discarding it so the producer refcount drops.
                 continue
             if error is not None:
                 raise MultimodalEncoderRequestError(
@@ -6709,13 +6721,18 @@ class PyExecutor:
                     "External MM encoder output count must match item indices",
                     request_ids={request.request_id},
                 )
+            if restore_error is not None:
+                raise MultimodalEncoderRequestError(
+                    f"Invalid external MM encoder output: {restore_error}",
+                    request_ids={request.request_id},
+                ) from restore_error
 
             state = request.py_mm_encoder_state
             pending_indices = []
             pending_outputs = []
-            for item_idx, output_handle in zip(item_indices,
-                                               output_handles,
-                                               strict=True):
+            for item_idx, output in zip(item_indices,
+                                        restored_outputs,
+                                        strict=True):
                 if item_idx < 0 or item_idx >= state.num_items:
                     raise MultimodalEncoderRequestError(
                         f"External MM encoder item {item_idx} is out of range",
@@ -6725,14 +6742,7 @@ class PyExecutor:
                 if (cache_key is None or encoder_cache.get(
                         cache_key, record_stats=False) is not None):
                     continue
-                try:
-                    output = SharedTensorContainer.from_dict(
-                        output_handle).get_local_view()
-                except (KeyError, RuntimeError, TypeError, ValueError) as exc:
-                    raise MultimodalEncoderRequestError(
-                        f"Invalid external MM encoder output: {exc}",
-                        request_ids={request.request_id},
-                    ) from exc
+                assert output is not None
                 pending_indices.append(item_idx)
                 pending_outputs.append(output)
 

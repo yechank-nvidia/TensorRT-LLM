@@ -13,6 +13,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin,
 )
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
+    MM_ENCODER_COMPLETION_REQUEST_ID,
     MM_ENCODER_INPUT_REQUEST_ID,
     ExecutorRequestQueue,
     RequestQueueItem,
@@ -382,6 +383,56 @@ def test_external_encoder_demand_and_completion_use_existing_reservation():
     torch.testing.assert_close(cached, output)
     assert cached.data_ptr() != output.data_ptr()
     assert "multimodal_embedding" not in request.py_multimodal_data
+
+    duplicate_handle = SharedTensorContainer.from_tensor(
+        torch.full_like(output, -1), local=True
+    ).dump_to_dict()
+    executor._external_mm_encoder_completions.put((17, [0], [duplicate_handle], None))
+    executor._commit_external_mm_encoder_completions()
+
+    torch.testing.assert_close(cache.get(cache_key), output)
+    with pytest.raises(RuntimeError, match="REBUILD_LOCAL tensor missing"):
+        SharedTensorContainer.from_dict(duplicate_handle).get_local_view()
+
+
+def test_stale_external_encoder_completion_consumes_output_handles():
+    cache = TensorLRUCache(1 << 20, name="test")
+    stale_handle = SharedTensorContainer.from_tensor(torch.ones(2, 4), local=True).dump_to_dict()
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = []
+    executor.model_engine = SimpleNamespace(mm_encoder_cache=cache)
+    executor._external_mm_encoder_completions = Queue()
+    executor._external_mm_encoder_completions.put((17, [0], [stale_handle], None))
+
+    executor._commit_external_mm_encoder_completions()
+
+    with pytest.raises(RuntimeError, match="REBUILD_LOCAL tensor missing"):
+        SharedTensorContainer.from_dict(stale_handle).get_local_view()
+
+
+def test_external_encoder_error_is_scoped_to_its_request():
+    failed = _request(1, [4])
+    failed.py_client_id = 17
+    unrelated = _request(2, [4])
+    handled = []
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = [failed, unrelated]
+    executor.model_engine = SimpleNamespace(mm_encoder_cache=TensorLRUCache(1 << 20, name="test"))
+    executor._external_mm_encoder_completions = Queue()
+    executor._owns_mm_encoder_cache_references = lambda: True
+    executor._handle_errors = lambda error, **kwargs: handled.append((error, kwargs))
+    completion = RequestQueueItem(
+        MM_ENCODER_COMPLETION_REQUEST_ID,
+        mm_encoder_completion=(17, [0], [], "encoder peer unavailable"),
+    )
+
+    assert executor._handle_special_queue_items([completion]) == []
+    assert handled == [
+        (
+            "External MM encoder failed: encoder peer unavailable",
+            {"requests": [failed], "charge_budget": False},
+        )
+    ]
 
 
 def test_attention_dp_buffers_owner_encoder_demand_for_rank_state_gather():
