@@ -5944,6 +5944,28 @@ class PyExecutor:
                 if self.dist.rank == 0:
                     self.request_accumulated.extend(new_requests[idx + 1:])
                 break
+            elif req_item.is_mm_encoder_completion:
+                completion = req_item.mm_encoder_completion
+                if completion is None:
+                    raise RuntimeError(
+                        "Multimodal encoder completion has no payload")
+                if self._owns_mm_encoder_cache_references():
+                    # RequestBroadcaster delivers the same completion before
+                    # scheduling on every rank that owns the replicated cache.
+                    try:
+                        self._external_mm_encoder_completions.put(completion)
+                        self._commit_external_mm_encoder_completions()
+                    except MultimodalEncoderRequestError as error:
+                        failed_ids = set(error.request_ids)
+                        failed_requests = [
+                            request for request in self.active_requests
+                            if request.request_id in failed_ids
+                        ]
+                        self._handle_errors(
+                            str(error),
+                            requests=failed_requests,
+                            charge_budget=False,
+                        )
             else:
                 accepted_new_requests.append(req_item)
 
@@ -6362,12 +6384,6 @@ class PyExecutor:
 
     @nvtx_range("_schedule")
     def _schedule(self):
-        if (getattr(self, "_mm_encoder_item_scheduling_enabled", False)
-                and not getattr(self, "_mm_encoder_is_local", True)):
-            # Make outputs that arrived between iterations visible to the
-            # scheduler now, so their LLM chunk does not wait for an otherwise
-            # empty forward step just to commit the completion.
-            self._commit_external_mm_encoder_completions()
         if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
@@ -6474,7 +6490,6 @@ class PyExecutor:
             gpu_start.record()
         try:
             if not mm_encoder_is_local:
-                self._commit_external_mm_encoder_completions()
                 self._publish_external_mm_encoder_demands(scheduled_items)
 
             # External selections are demands, not local forward work. Keep
@@ -6511,9 +6526,17 @@ class PyExecutor:
         """Publish external encoder work independently of model forward RPCs."""
         self._external_mm_encoder_demand_queue = queue
 
-    def take_multimodal_encoder_demands(self) -> List[Tuple[int, List[int]]]:
+    def take_multimodal_encoder_demands(
+            self,
+            timeout: Optional[float] = None) -> List[Tuple[int, List[int]]]:
         """Drain item demands as ``(client_id, item_indices)`` pairs."""
         demands = []
+        if timeout is not None:
+            try:
+                demands.append(
+                    self._external_mm_encoder_demands.get(timeout=timeout))
+            except Empty:
+                return demands
         while True:
             try:
                 demands.append(self._external_mm_encoder_demands.get_nowait())
@@ -6527,12 +6550,20 @@ class PyExecutor:
         output_handles: List[Dict[str, Any]],
         error: Optional[str] = None,
     ) -> None:
-        """Queue externally produced item outputs for the next iteration."""
-        self._external_mm_encoder_completions.put(
-            (client_id, list(item_indices), list(output_handles), error))
+        """Queue externally produced item outputs for rank-wide delivery."""
+        self.executor_request_queue.enqueue_multimodal_encoder_completion(
+            client_id,
+            item_indices,
+            output_handles,
+            error,
+        )
 
     def _publish_external_mm_encoder_demands(
             self, scheduled_items: Dict[int, List[int]]) -> None:
+        # The proxy exposes one demand queue, owned by rank 0. TP peers make
+        # the same scheduling decision but must not publish duplicate work.
+        if self.dist.rank != 0:
+            return
         request_by_id = {
             request.request_id: request
             for request in self.active_requests

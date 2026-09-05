@@ -465,6 +465,29 @@ methods:
     parameters: {}
     return_annotation: bytes
     status: prototype
+  take_multimodal_encoder_demands:
+    parameters:
+      timeout:
+        annotation: Optional[float]
+        default: null
+    return_annotation: List[Tuple[int, List[int]]]
+    status: prototype
+  enqueue_multimodal_encoder_outputs:
+    parameters:
+      client_id:
+        annotation: int
+        default: inspect._empty
+      item_indices:
+        annotation: List[int]
+        default: inspect._empty
+      output_handles:
+        annotation: List[Dict[str, Any]]
+        default: inspect._empty
+      error:
+        annotation: Optional[str]
+        default: null
+    return_annotation: None
+    status: prototype
   shutdown:
     parameters: {}
     return_annotation: None

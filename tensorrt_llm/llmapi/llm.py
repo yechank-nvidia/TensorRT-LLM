@@ -1893,6 +1893,46 @@ class _TorchLLM(BaseLLM):
                 f"Executor type {type(self._executor)} does not support collective RPC."
             )
 
+    @set_api_status("prototype")
+    def take_multimodal_encoder_demands(
+            self,
+            timeout: Optional[float] = None) -> List[Tuple[int, List[int]]]:
+        """Return item-level work requested from an external MM encoder.
+
+        Args:
+            timeout (float, optional): Maximum number of seconds to wait for
+                the first demand. ``None`` returns immediately.
+
+        Returns:
+            List[Tuple[int, List[int]]]: Pairs containing a client ID and the
+            multimodal item indices that its encoder must produce.
+        """
+        return self._executor.take_multimodal_encoder_demands(timeout)
+
+    @set_api_status("prototype")
+    def enqueue_multimodal_encoder_outputs(
+        self,
+        client_id: int,
+        item_indices: List[int],
+        output_handles: List[Dict[str, Any]],
+        error: Optional[str] = None,
+    ) -> None:
+        """Deliver item outputs produced by an external MM encoder.
+
+        Args:
+            client_id (int): Client ID returned with the encoder demand.
+            item_indices (List[int]): Completed multimodal item indices.
+            output_handles (List[Dict[str, Any]]): Shared-tensor handles for
+                the completed items, in the same order as ``item_indices``.
+            error (str, optional): Encoder error for this demand, if any.
+        """
+        self._executor.enqueue_multimodal_encoder_outputs(
+            client_id,
+            item_indices,
+            output_handles,
+            error,
+        )
+
     def _reject_token_encoder_config_without_buckets(self) -> None:
         """Reject a bucket-less token-encoder config before weights load.
 

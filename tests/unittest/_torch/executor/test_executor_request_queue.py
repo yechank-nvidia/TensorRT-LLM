@@ -16,7 +16,8 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
-    SHUTDOWN_REQUEST_ID, ExecutorRequestQueue, RequestQueueItem)
+    MM_ENCODER_COMPLETION_REQUEST_ID, SHUTDOWN_REQUEST_ID, ExecutorRequestQueue,
+    RequestQueueItem)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -145,6 +146,19 @@ def test_enqueue_shutdown_request(executor_queue):
     assert not executor_queue.active
     item = executor_queue.request_queue.get_nowait()
     assert item.is_shutdown_request
+
+
+def test_enqueue_multimodal_encoder_completion(executor_queue):
+    output_handle = {"shape": [2, 4]}
+
+    executor_queue.enqueue_multimodal_encoder_completion(
+        17, [0], [output_handle])
+
+    item = executor_queue.request_queue.get_nowait()
+    assert item.id == MM_ENCODER_COMPLETION_REQUEST_ID
+    assert item.is_mm_encoder_completion
+    assert not item.is_normal_request
+    assert item.mm_encoder_completion == (17, [0], [output_handle], None)
 
 
 def test_enqueue_request_after_shutdown(executor_queue):
@@ -277,6 +291,7 @@ def test_request_queue_item_special_types():
     normal_req = RequestQueueItem(1, mock_request)
     cancel_req = RequestQueueItem(2, is_canceled_request=True)
     shutdown_req = RequestQueueItem(SHUTDOWN_REQUEST_ID)
+    completion = RequestQueueItem(MM_ENCODER_COMPLETION_REQUEST_ID)
 
     # Test normal request
     assert normal_req.is_normal_request
@@ -292,6 +307,10 @@ def test_request_queue_item_special_types():
     assert shutdown_req.is_shutdown_request
     assert not shutdown_req.is_canceled_request
     assert not shutdown_req.is_normal_request
+
+    # Test external encoder completion
+    assert completion.is_mm_encoder_completion
+    assert not completion.is_normal_request
 
 
 def test_queue_size_methods(executor_queue):

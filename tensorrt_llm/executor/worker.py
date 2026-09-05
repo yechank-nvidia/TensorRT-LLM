@@ -23,7 +23,8 @@ from .base_worker import BaseWorker, _init_hf_modules
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
-from .request import CancellingRequest, GenerationRequest
+from .request import (CancellingRequest, GenerationRequest,
+                      MultimodalEncoderCompletion)
 from .rpc_worker_mixin import RpcWorkerMixin
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     WorkerCommIpcAddrs)
@@ -427,6 +428,13 @@ def worker_main(
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
+                    elif isinstance(req, MultimodalEncoderCompletion):
+                        worker.enqueue_multimodal_encoder_outputs(
+                            req.client_id,
+                            req.item_indices,
+                            req.output_handles,
+                            req.error,
+                        )
                     elif isinstance(req, GenerationRequest):
                         try:
                             worker.submit(req)

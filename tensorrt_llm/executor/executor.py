@@ -11,8 +11,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from pathlib import Path
 from queue import Empty, Queue
-from typing import (TYPE_CHECKING, AsyncIterable, Dict, Generator, List,
-                    Optional, Union)
+from typing import (TYPE_CHECKING, Any, AsyncIterable, Dict, Generator, List,
+                    Optional, Tuple, Union)
 
 import numpy as np
 import torch
@@ -122,6 +122,26 @@ class GenerationExecutor(ABC):
     @abstractmethod
     def abort_request(self, request_id: int) -> None:
         pass
+
+    def take_multimodal_encoder_demands(
+            self,
+            timeout: Optional[float] = None) -> List[Tuple[int, List[int]]]:
+        """Return multimodal items requested from an external encoder."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support an external multimodal encoder"
+        )
+
+    def enqueue_multimodal_encoder_outputs(
+        self,
+        client_id: int,
+        item_indices: List[int],
+        output_handles: List[Dict[str, Any]],
+        error: Optional[str] = None,
+    ) -> None:
+        """Deliver completed items produced by an external encoder."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support an external multimodal encoder"
+        )
 
     def generate_async(
         self,

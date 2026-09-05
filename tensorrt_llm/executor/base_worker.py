@@ -22,7 +22,7 @@ import uuid
 import weakref
 from pathlib import Path
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -297,17 +297,21 @@ class BaseWorker(GenerationExecutor):
                 return
             self.engine.cancel_request(request_id)
 
-    def take_multimodal_encoder_demands(self):
+    def take_multimodal_encoder_demands(
+            self,
+            timeout: Optional[float] = None) -> List[Tuple[int, List[int]]]:
         """Return pending external encoder work from the PyTorch runtime."""
         if self.engine is None:
             return []
-        return self.engine.take_multimodal_encoder_demands()
+        return self.engine.take_multimodal_encoder_demands(timeout)
 
-    def enqueue_multimodal_encoder_outputs(self,
-                                           client_id,
-                                           item_indices,
-                                           output_handles,
-                                           error=None):
+    def enqueue_multimodal_encoder_outputs(
+        self,
+        client_id: int,
+        item_indices: List[int],
+        output_handles: List[Dict[str, Any]],
+        error: Optional[str] = None,
+    ) -> None:
         """Deliver external encoder results at an executor iteration boundary."""
         if self.engine is None:
             raise RuntimeError("Engine is not initialized")

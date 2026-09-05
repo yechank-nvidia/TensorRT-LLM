@@ -11,6 +11,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
 )
+from tensorrt_llm._torch.pyexecutor.executor_request_queue import ExecutorRequestQueue
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
     LlmRequestState,
@@ -33,6 +34,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.bindings import SamplingConfig
+from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+from tensorrt_llm.executor.request import MultimodalEncoderCompletion
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalParams,
@@ -341,8 +344,14 @@ def test_external_encoder_demand_and_completion_use_existing_reservation():
         )
     )
     executor.enable_attention_dp = False
-    executor.dist = SimpleNamespace(is_first_pp_rank=True, pp_size=1)
+    executor.dist = SimpleNamespace(rank=0, is_first_pp_rank=True, pp_size=1)
     executor.global_rank = 0
+    executor.executor_request_queue = ExecutorRequestQueue(
+        dist=executor.dist,
+        max_batch_size=8,
+        enable_iter_perf_stats=False,
+        batch_wait_timeout_ms=0,
+    )
 
     scheduled = ScheduledRequests()
     scheduled.scheduled_mm_encoder_items = {request.request_id: [0]}
@@ -351,17 +360,34 @@ def test_external_encoder_demand_and_completion_use_existing_reservation():
     assert scheduled.mm_encoder_gpu_start_event is None
     assert scheduled.mm_encoder_gpu_end_event is None
     assert executor.take_multimodal_encoder_demands() == [(17, [0])]
+    executor.dist.rank = 1
+    executor._publish_external_mm_encoder_demands({request.request_id: [0]})
+    assert executor.take_multimodal_encoder_demands() == []
+    executor.dist.rank = 0
 
     handle = SharedTensorContainer.from_tensor(output).dump_to_dict()
     executor.enqueue_multimodal_encoder_outputs(17, [0], [handle])
-    # Completions must still be consumed on an iteration where the request is
-    # waiting and the LLM scheduler therefore selected no context tokens.
-    executor._forward_multimodal_encoder_step(ScheduledRequests())
+    queue_items = [executor.executor_request_queue.request_queue.get_nowait()]
+    assert queue_items[0].is_mm_encoder_completion
+    assert executor._handle_special_queue_items(queue_items) == []
 
     cached = cache.get(cache_key)
     torch.testing.assert_close(cached, output)
     assert cached.data_ptr() != output.data_ptr()
     assert "multimodal_embedding" not in request.py_multimodal_data
+
+
+def test_proxy_sends_encoder_completion_through_request_ingress():
+    proxy = object.__new__(GenerationExecutorProxy)
+    proxy.workers_started = False
+    proxy._multi_frontend_ipc_dir = None
+    proxy.request_queue = Queue()
+    output_handle = {"shape": [2, 4]}
+
+    proxy.enqueue_multimodal_encoder_outputs(17, [0], [output_handle])
+
+    completion = proxy.request_queue.get_nowait()
+    assert completion == MultimodalEncoderCompletion(17, [0], [output_handle], None)
 
 
 def test_complete_external_handoff_keeps_direct_path():

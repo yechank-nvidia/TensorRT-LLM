@@ -1,7 +1,7 @@
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -255,3 +255,13 @@ class CancellingRequest:
 
     def __init__(self, id: int):
         self.id = id
+
+
+@dataclass(slots=True)
+class MultimodalEncoderCompletion:
+    """Externally produced encoder items delivered to a live P request."""
+
+    client_id: int
+    item_indices: List[int]
+    output_handles: List[Dict[str, Any]]
+    error: Optional[str] = None

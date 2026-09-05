@@ -21,7 +21,7 @@ import tempfile
 import threading
 import weakref
 from queue import Empty
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import zmq
@@ -39,7 +39,8 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
-from .request import CancellingRequest, GenerationRequest
+from .request import (CancellingRequest, GenerationRequest,
+                      MultimodalEncoderCompletion)
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
@@ -495,7 +496,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
     def take_multimodal_encoder_demands(
             self,
-            timeout: Optional[float] = None) -> list[tuple[int, list[int]]]:
+            timeout: Optional[float] = None) -> List[Tuple[int, List[int]]]:
         """Return item demands without waiting for a worker RPC round trip."""
         queue = getattr(self, "_mm_encoder_demand_queue", None)
         if queue is None:
@@ -507,6 +508,22 @@ class GenerationExecutorProxy(GenerationExecutor):
             demands.append(queue.get())
         demands.extend(queue.drain())
         return demands
+
+    def enqueue_multimodal_encoder_outputs(
+        self,
+        client_id: int,
+        item_indices: List[int],
+        output_handles: List[Dict[str, Any]],
+        error: Optional[str] = None,
+    ) -> None:
+        """Send completed encoder items through the normal worker ingress."""
+        self.request_queue.put(
+            MultimodalEncoderCompletion(
+                client_id,
+                list(item_indices),
+                list(output_handles),
+                error,
+            ))
 
     def multi_frontend_attach_info(self) -> Optional[dict]:
         """The attach payload consumed by attached serving frontends.

@@ -3,7 +3,7 @@ import datetime
 import queue
 import threading
 import time
-from typing import Iterable, List, Optional
+from typing import Any, Iterable, List, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
@@ -13,6 +13,7 @@ from .request_utils import get_num_child_requests
 
 SHUTDOWN_REQUEST_ID = -1
 CONTROL_REQUEST_ID = -2
+MM_ENCODER_COMPLETION_REQUEST_ID = -3
 
 
 @dataclasses.dataclass
@@ -28,6 +29,8 @@ class RequestQueueItem:
     # See ``PyExecutor.control_action``.
     control_requires_drain: bool = True
     control_id: Optional[str] = None
+    mm_encoder_completion: Optional[tuple[int, list[int], list[dict[str, Any]],
+                                          Optional[str]]] = None
 
     @property
     def is_shutdown_request(self):
@@ -36,11 +39,15 @@ class RequestQueueItem:
     @property
     def is_normal_request(self):
         return not (self.is_shutdown_request or self.is_canceled_request
-                    or self.is_control_request)
+                    or self.is_control_request or self.is_mm_encoder_completion)
 
     @property
     def is_control_request(self):
         return self.id == CONTROL_REQUEST_ID
+
+    @property
+    def is_mm_encoder_completion(self):
+        return self.id == MM_ENCODER_COMPLETION_REQUEST_ID
 
 
 class ExecutorRequestQueue:
@@ -123,6 +130,27 @@ class ExecutorRequestQueue:
         with self.enqueue_lock:
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
+
+    def enqueue_multimodal_encoder_completion(
+        self,
+        client_id: int,
+        item_indices: list[int],
+        output_handles: list[dict[str, Any]],
+        error: Optional[str] = None,
+    ) -> None:
+        """Enqueue one completion for rank-symmetric handling."""
+        with self.enqueue_lock:
+            assert self.active, "PyExecutor has already been shutdown."
+            self.request_queue.put(
+                RequestQueueItem(
+                    MM_ENCODER_COMPLETION_REQUEST_ID,
+                    mm_encoder_completion=(
+                        client_id,
+                        list(item_indices),
+                        list(output_handles),
+                        error,
+                    ),
+                ))
 
     def enqueue_control_request(self,
                                 drain: bool = True,
