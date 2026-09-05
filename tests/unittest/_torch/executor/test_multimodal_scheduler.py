@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import nullcontext
 from queue import Queue
 from types import SimpleNamespace
 
@@ -35,6 +36,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     SchedulerOutput,
     SimpleScheduler,
 )
+from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import FCFSWaitingQueue
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.bindings import SamplingConfig
@@ -461,20 +463,48 @@ def test_registered_encoder_input_is_attached_to_item_request():
 
 def test_encoder_input_release_waits_for_earlier_request():
     executor = object.__new__(PyExecutor)
+    executor.control_requests = []
+    executor.is_shutdown = False
     executor.dist = SimpleNamespace(rank=0)
-    executor.request_accumulated = []
-    executor._multimodal_encoder_inputs = {"input": MultimodalParams(multimodal_data={})}
-    request = RequestQueueItem(1, request=SimpleNamespace())
+    executor.hang_detector = SimpleNamespace(pause=nullcontext)
+    executor.executor_request_queue = SimpleNamespace(get_from_request_queue=lambda _timeout: [])
+    executor.request_broadcaster = SimpleNamespace(broadcast=lambda requests: (requests, None))
+    executor._multimodal_encoder_inputs = {}
+    params = MultimodalParams(multimodal_data={"image": {"pixels": torch.ones(2, 3)}})
+    register = RequestQueueItem(
+        MM_ENCODER_INPUT_REQUEST_ID,
+        mm_encoder_input=("input", params),
+    )
+    request = _llm_request(
+        1,
+        multimodal_data={
+            MULTIMODAL_ENCODER_INPUT_ID_KEY: "input",
+            "multimodal_embedding_lengths": [3],
+        },
+        multimodal_positions=[10],
+        multimodal_lengths=[3],
+    )
+    request_item = RequestQueueItem(1, request=request)
     release = RequestQueueItem(
         MM_ENCODER_INPUT_REQUEST_ID,
         mm_encoder_input=("input", None),
     )
+    executor.request_accumulated = [register, request_item, release]
+    waiting_queue = FCFSWaitingQueue()
 
-    accepted = executor._handle_special_queue_items([request, release])
+    executor._fetch_and_enqueue_requests(waiting_queue, total_num_active_requests=1)
 
-    assert accepted == [request]
     assert executor.request_accumulated == [release]
     assert "input" in executor._multimodal_encoder_inputs
+    queued_request = waiting_queue.peek_request().request
+    assert queued_request is request
+    assert MULTIMODAL_ENCODER_INPUT_ID_KEY not in request.py_multimodal_data
+    assert request.py_multimodal_data["image"] is params.multimodal_data["image"]
+
+    executor._fetch_and_enqueue_requests(waiting_queue, total_num_active_requests=1)
+
+    assert executor._multimodal_encoder_inputs == {}
+    assert request.py_multimodal_data["image"] is params.multimodal_data["image"]
 
 
 def test_complete_external_handoff_keeps_direct_path():

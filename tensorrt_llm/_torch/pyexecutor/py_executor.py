@@ -5787,6 +5787,19 @@ class PyExecutor:
                                    > 1) and self.dist.rank > 0:
             attach_py_objects_to_requests(new_requests, py_request_objects)
 
+        # Retain raw input on the queued request before a later release can
+        # remove the worker-local registration. Failed lookups remain tagged
+        # and are reported by the existing admission validation path.
+        for req_item in new_requests:
+            request = req_item.request
+            mm_data = request.py_multimodal_data if request is not None else None
+            if (isinstance(mm_data, dict)
+                    and MULTIMODAL_ENCODER_INPUT_ID_KEY in mm_data):
+                try:
+                    self._attach_multimodal_encoder_input(request)
+                except (TypeError, ValueError):
+                    pass
+
         waiting_queue.add_requests(new_requests)
 
     def _get_request_admission_capacity(self) -> int:
