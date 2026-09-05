@@ -1,3 +1,5 @@
+import threading
+import uuid
 from pathlib import Path
 from typing import Any, List, Literal, Optional, Sequence, Union, cast
 
@@ -9,8 +11,9 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.inputs import create_input_processor, prompt_inputs
 from tensorrt_llm.inputs.data import PromptInputs
 from tensorrt_llm.inputs.multimodal import (
-    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MULTIMODAL_ENCODER_ITEM_MODE_KEY,
-    DisaggPrefillMultimodalInputs, MultimodalInput, MultimodalParams)
+    MULTIMODAL_ENCODER_INPUT_ID_KEY, MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MULTIMODAL_ENCODER_ITEM_MODE_KEY, DisaggPrefillMultimodalInputs,
+    MultimodalInput, MultimodalParams)
 from tensorrt_llm.inputs.registry import (MultimodalEncoderItemMetadata,
                                           get_multimodal_encoder_item_metadata)
 from tensorrt_llm.sampling_params import SamplingParams
@@ -18,6 +21,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from .llm import BaseLLM, PreprocessedInputs, RequestOutput, _TorchLLM
 from .llm_args import TorchLlmArgs
 from .mpi_session import external_mpi_comm_available
+from .utils import set_api_status
 
 
 def _select_multimodal_encoder_items(
@@ -117,6 +121,38 @@ def _select_multimodal_encoder_items(
     )
 
 
+def _multimodal_encoder_input_metadata(
+        inputs: PreprocessedInputs) -> PreprocessedInputs:
+    """Keep the metadata needed to build later item requests."""
+    params = inputs.multimodal_params
+    if params is None or params.multimodal_input is None:
+        raise ValueError(
+            "Retained MM encoder input requires multimodal input metadata")
+    data = params.multimodal_data
+    item_metadata = get_multimodal_encoder_item_metadata(data)
+    if item_metadata is None:
+        raise ValueError(
+            "Retained MM encoder input requires encoder item metadata")
+    metadata = {
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY:
+        item_metadata,
+        "multimodal_embedding_lengths":
+        list(item_metadata.output_embedding_lengths),
+    }
+    if data is not None and "encoder_token_lengths" in data:
+        metadata["encoder_token_lengths"] = list(data["encoder_token_lengths"])
+    return PreprocessedInputs(
+        prompt_token_ids=list(inputs.prompt_token_ids),
+        multimodal_params=MultimodalParams(
+            multimodal_input=params.multimodal_input,
+            multimodal_data=metadata,
+            mm_item_order=params.mm_item_order,
+        ),
+        encoder_input_token_ids=(None if inputs.encoder_input_token_ids is None
+                                 else list(inputs.encoder_input_token_ids)),
+    )
+
+
 class MultimodalEncoder(_TorchLLM):
     """MultimodalEncoder class is the main class for running a multimodal encoder model using PyTorch backend."""
 
@@ -159,6 +195,9 @@ class MultimodalEncoder(_TorchLLM):
             checkpoint_format,
             trust_remote_code=trust_remote_code)
         self._tokenizer = self.input_processor.tokenizer
+
+        self._registered_inputs: dict[str, PreprocessedInputs] = {}
+        self._registered_inputs_lock = threading.Lock()
 
         assert isinstance(self.args, TorchLlmArgs)
         self.args.mm_encoder_only = True
@@ -244,6 +283,57 @@ class MultimodalEncoder(_TorchLLM):
         result = super().generate_async(inputs, sampling_params)
         # TODO: possible postprocess the result for disaggregated serving
         return result
+
+    @set_api_status("prototype")
+    def register_input(self, inputs: PreprocessedInputs) -> str:
+        """Retain one preprocessed input for later item-level encoding.
+
+        Registration is queued on the encoder's normal request ingress. The
+        returned id may be used immediately because a later item request is
+        processed after its registration. Use the preprocessed input for this
+        registered item path or for one whole request, not both.
+        """
+        metadata = _multimodal_encoder_input_metadata(inputs)
+        params = inputs.multimodal_params
+        assert params is not None
+        input_id = uuid.uuid4().hex
+        worker_params = MultimodalParams(multimodal_data=params.multimodal_data)
+        with self._registered_inputs_lock:
+            self._executor.set_multimodal_encoder_input(input_id, worker_params)
+            self._registered_inputs[input_id] = metadata
+        return input_id
+
+    @set_api_status("prototype")
+    def generate_items_async(
+        self,
+        input_id: str,
+        item_indices: Sequence[int],
+    ) -> RequestOutput:
+        """Encode selected items from a previously registered input."""
+        with self._registered_inputs_lock:
+            inputs = self._registered_inputs.get(input_id)
+            if inputs is None:
+                raise ValueError(
+                    f"Multimodal encoder input {input_id!r} is not registered")
+            selected = _select_multimodal_encoder_items(inputs, item_indices)
+            params = selected.multimodal_params
+            assert params is not None and params.multimodal_data is not None
+            params.multimodal_data[MULTIMODAL_ENCODER_INPUT_ID_KEY] = input_id
+            # Keep submission ordered before a concurrent release_input().
+            return self.generate_async(selected)
+
+    @set_api_status("prototype")
+    def release_input(self, input_id: str) -> None:
+        """Stop accepting item work and queue release of retained raw input.
+
+        This may be called after the final item request is submitted; ingress
+        ordering keeps that earlier request valid without waiting for it here.
+        """
+        with self._registered_inputs_lock:
+            if input_id not in self._registered_inputs:
+                return
+            self._executor.set_multimodal_encoder_input(input_id, None)
+            del self._registered_inputs[input_id]
 
     @staticmethod
     def build_prefill_disaggregated_params(

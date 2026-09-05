@@ -143,6 +143,15 @@ class GenerationExecutor(ABC):
             f"{type(self).__name__} does not support an external multimodal encoder"
         )
 
+    def set_multimodal_encoder_input(
+        self,
+        input_id: str,
+        multimodal_params: Optional[MultimodalParams],
+    ) -> None:
+        """Register raw encoder input, or release it when params is ``None``."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support retained multimodal input")
+
     def generate_async(
         self,
         prompt_token_ids: List[int],

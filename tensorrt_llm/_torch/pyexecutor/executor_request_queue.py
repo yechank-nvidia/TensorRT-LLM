@@ -5,6 +5,7 @@ import threading
 import time
 from typing import Any, Iterable, List, Optional
 
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
 from ..distributed import Distributed
@@ -14,6 +15,7 @@ from .request_utils import get_num_child_requests
 SHUTDOWN_REQUEST_ID = -1
 CONTROL_REQUEST_ID = -2
 MM_ENCODER_COMPLETION_REQUEST_ID = -3
+MM_ENCODER_INPUT_REQUEST_ID = -4
 
 
 @dataclasses.dataclass
@@ -31,6 +33,7 @@ class RequestQueueItem:
     control_id: Optional[str] = None
     mm_encoder_completion: Optional[tuple[int, list[int], list[dict[str, Any]],
                                           Optional[str]]] = None
+    mm_encoder_input: Optional[tuple[str, Optional[MultimodalParams]]] = None
 
     @property
     def is_shutdown_request(self):
@@ -39,7 +42,8 @@ class RequestQueueItem:
     @property
     def is_normal_request(self):
         return not (self.is_shutdown_request or self.is_canceled_request
-                    or self.is_control_request or self.is_mm_encoder_completion)
+                    or self.is_control_request or self.is_mm_encoder_completion
+                    or self.is_mm_encoder_input)
 
     @property
     def is_control_request(self):
@@ -48,6 +52,10 @@ class RequestQueueItem:
     @property
     def is_mm_encoder_completion(self):
         return self.id == MM_ENCODER_COMPLETION_REQUEST_ID
+
+    @property
+    def is_mm_encoder_input(self):
+        return self.id == MM_ENCODER_INPUT_REQUEST_ID
 
 
 class ExecutorRequestQueue:
@@ -150,6 +158,20 @@ class ExecutorRequestQueue:
                         list(output_handles),
                         error,
                     ),
+                ))
+
+    def enqueue_multimodal_encoder_input(
+        self,
+        input_id: str,
+        multimodal_params: Optional[MultimodalParams],
+    ) -> None:
+        """Enqueue retained encoder-input registration or release."""
+        with self.enqueue_lock:
+            assert self.active, "PyExecutor has already been shutdown."
+            self.request_queue.put(
+                RequestQueueItem(
+                    MM_ENCODER_INPUT_REQUEST_ID,
+                    mm_encoder_input=(input_id, multimodal_params),
                 ))
 
     def enqueue_control_request(self,

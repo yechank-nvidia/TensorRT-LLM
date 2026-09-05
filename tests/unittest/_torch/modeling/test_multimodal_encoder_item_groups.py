@@ -13,6 +13,7 @@ back empty; the row-count check in `forward_multimodal_encoder_items` turns that
 into a hard error, but only after the wasted encoder forward.
 """
 
+from threading import Lock
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +28,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_INPUT_ID_KEY,
     MULTIMODAL_ENCODER_ITEM_MODE_KEY,
     MultimodalInput,
     MultimodalParams,
@@ -34,9 +36,10 @@ from tensorrt_llm.inputs.multimodal import (
 from tensorrt_llm.inputs.registry import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalEncoderItemMetadata,
+    get_multimodal_encoder_item_metadata,
 )
 from tensorrt_llm.llmapi.llm import PreprocessedInputs
-from tensorrt_llm.llmapi.mm_encoder import _select_multimodal_encoder_items
+from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder, _select_multimodal_encoder_items
 
 HIDDEN = 4
 # Rows the encoder emits per patch-grid item. Distinct values catch splits that
@@ -301,6 +304,38 @@ def test_encoder_only_request_executes_selected_preprocessed_items(monkeypatch):
     assert len(result["mm_embeddings"]) == 1
     torch.testing.assert_close(result["mm_embeddings"][0], _expected_rows(original, 1))
     assert provider.encoder_calls == [ITEM_ROWS["image"][1]]
+
+
+@pytest.mark.cpu_only
+def test_encoder_registered_input_sends_only_item_metadata(monkeypatch):
+    original = _make_request(["image", "image"])
+    original.multimodal_input = MultimodalInput.from_components([[0] * 8, [1] * 8], [1, 10], [2, 3])
+    inputs = PreprocessedInputs(prompt_token_ids=list(range(16)), multimodal_params=original)
+    updates = []
+    executor = SimpleNamespace(
+        set_multimodal_encoder_input=lambda *args: updates.append(args),
+        shutdown=lambda: None,
+    )
+    encoder = object.__new__(MultimodalEncoder)
+    encoder._executor = executor
+    encoder._registered_inputs = {}
+    encoder._registered_inputs_lock = Lock()
+    monkeypatch.setattr(MultimodalEncoder, "generate_async", lambda _self, selected: selected)
+
+    input_id = encoder.register_input(inputs)
+    selected = encoder.generate_items_async(input_id, [1])
+    encoder.release_input(input_id)
+
+    assert updates[0][0] == input_id
+    assert updates[0][1].multimodal_data is original.multimodal_data
+    assert updates[1] == (input_id, None)
+    selected_params = selected.multimodal_params
+    assert selected_params is not None
+    selected_data = selected_params.multimodal_data
+    assert selected_data[MULTIMODAL_ENCODER_INPUT_ID_KEY] == input_id
+    assert "image" not in selected_data
+    assert selected_data["multimodal_embedding_lengths"] == [3]
+    assert get_multimodal_encoder_item_metadata(selected_data).item_refs == [("image", 1)]
 
 
 def test_wrong_encoder_output_rows_are_request_contract_error():

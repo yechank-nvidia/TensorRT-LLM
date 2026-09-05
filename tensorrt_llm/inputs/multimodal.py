@@ -19,6 +19,7 @@ default_hasher = blake3
 _INT32_MAX = 2**31 - 1
 MULTIMODAL_ENCODER_ITEM_METADATA_KEY = "multimodal_encoder_item_metadata"
 MULTIMODAL_ENCODER_ITEM_MODE_KEY = "multimodal_encoder_item_mode"
+MULTIMODAL_ENCODER_INPUT_ID_KEY = "multimodal_encoder_input_id"
 
 # Versioned tag prefixed to every content hash so the canonical, self-describing
 # serialization scheme can evolve without silently reusing stale cache keys.

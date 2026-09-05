@@ -41,7 +41,9 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
-from tensorrt_llm.inputs.multimodal import (strip_mm_data_for_generation,
+from tensorrt_llm.inputs.multimodal import (MULTIMODAL_ENCODER_INPUT_ID_KEY,
+                                            MultimodalParams,
+                                            strip_mm_data_for_generation,
                                             strip_mm_encoder_inputs)
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
@@ -460,6 +462,7 @@ class PyExecutor:
         self._external_mm_encoder_demand_queue: Optional["IpcQueue"] = None
         self._external_mm_encoder_completions: Queue[Tuple[
             int, List[int], List[Dict[str, Any]], Optional[str]]] = Queue()
+        self._multimodal_encoder_inputs: Dict[str, MultimodalParams] = {}
         self.scheduler = scheduler
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
@@ -5979,6 +5982,25 @@ class PyExecutor:
                             requests=failed_requests,
                             charge_budget=False,
                         )
+            elif req_item.is_mm_encoder_input:
+                # Registration and release are ordered with encoder requests.
+                # Do not let a later release in the same queue drain overtake
+                # a request that still needs the retained input.
+                if accepted_new_requests:
+                    if self.dist.rank == 0:
+                        self.request_accumulated.extend(new_requests[idx:])
+                    break
+                update = req_item.mm_encoder_input
+                if update is None:
+                    raise RuntimeError(
+                        "Multimodal encoder input update has no payload")
+                input_id, multimodal_params = update
+                if multimodal_params is None:
+                    self._multimodal_encoder_inputs.pop(input_id, None)
+                elif input_id not in self._multimodal_encoder_inputs:
+                    multimodal_params.to_tensor("multimodal_data")
+                    self._multimodal_encoder_inputs[input_id] = (
+                        multimodal_params)
             else:
                 accepted_new_requests.append(req_item)
 
@@ -6008,6 +6030,10 @@ class PyExecutor:
             """
             try:
                 mm_data = request.py_multimodal_data
+                if (isinstance(mm_data, dict)
+                        and MULTIMODAL_ENCODER_INPUT_ID_KEY in mm_data):
+                    self._attach_multimodal_encoder_input(request)
+                    mm_data = request.py_multimodal_data
                 if (isinstance(mm_data, dict)
                         and self.model_engine.mm_encoder_cache is not None):
                     # Capture the model-owned namespace once at admission so
@@ -6047,6 +6073,31 @@ class PyExecutor:
 
         self.active_requests.extend(validated_requests)
         return validated_requests
+
+    def _attach_multimodal_encoder_input(self, request: LlmRequest) -> None:
+        """Attach worker-local raw input to a lightweight encoder request."""
+        request_data = request.py_multimodal_data
+        if not isinstance(request_data, dict):
+            return
+        input_id = request_data.get(MULTIMODAL_ENCODER_INPUT_ID_KEY)
+        if input_id is None:
+            return
+        if not isinstance(input_id, str):
+            raise TypeError(
+                f"{MULTIMODAL_ENCODER_INPUT_ID_KEY} must be a string")
+        registered = self._multimodal_encoder_inputs.get(input_id)
+        if registered is None or registered.multimodal_data is None:
+            raise ValueError(
+                f"Multimodal encoder input {input_id!r} is not registered")
+        selected_data = {
+            key: value
+            for key, value in request_data.items()
+            if key != MULTIMODAL_ENCODER_INPUT_ID_KEY
+        }
+        request.py_multimodal_data = {
+            **registered.multimodal_data,
+            **selected_data,
+        }
 
     def _add_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -6570,6 +6621,15 @@ class PyExecutor:
             output_handles,
             error,
         )
+
+    def set_multimodal_encoder_input(
+        self,
+        input_id: str,
+        multimodal_params: Optional[MultimodalParams],
+    ) -> None:
+        """Queue raw encoder-input registration or release on every rank."""
+        self.executor_request_queue.enqueue_multimodal_encoder_input(
+            input_id, multimodal_params)
 
     def _publish_external_mm_encoder_demands(
             self, scheduled_items: Dict[int, List[int]]) -> None:

@@ -11,7 +11,11 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
 )
-from tensorrt_llm._torch.pyexecutor.executor_request_queue import ExecutorRequestQueue
+from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
+    MM_ENCODER_INPUT_REQUEST_ID,
+    ExecutorRequestQueue,
+    RequestQueueItem,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
     LlmRequestState,
@@ -35,8 +39,9 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
-from tensorrt_llm.executor.request import MultimodalEncoderCompletion
+from tensorrt_llm.executor.request import MultimodalEncoderCompletion, MultimodalEncoderInput
 from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_INPUT_ID_KEY,
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalParams,
     MultimodalRuntimeData,
@@ -405,6 +410,71 @@ def test_proxy_sends_encoder_completion_through_request_ingress():
 
     completion = proxy.request_queue.get_nowait()
     assert completion == MultimodalEncoderCompletion(17, [0], [output_handle], None)
+
+
+def test_registered_encoder_input_is_attached_to_item_request():
+    proxy = object.__new__(GenerationExecutorProxy)
+    proxy.workers_started = False
+    proxy._multi_frontend_ipc_dir = None
+    proxy.request_queue = Queue()
+    params = MultimodalParams(multimodal_data={"image": {"pixels": torch.ones(2, 3)}})
+
+    proxy.set_multimodal_encoder_input("input", params)
+
+    assert proxy.request_queue.get_nowait() == MultimodalEncoderInput("input", params)
+
+    executor = object.__new__(PyExecutor)
+    executor._multimodal_encoder_inputs = {}
+    executor._handle_special_queue_items(
+        [
+            RequestQueueItem(
+                MM_ENCODER_INPUT_REQUEST_ID,
+                mm_encoder_input=("input", params),
+            )
+        ]
+    )
+    request = _llm_request(
+        1,
+        multimodal_data={
+            MULTIMODAL_ENCODER_INPUT_ID_KEY: "input",
+            "multimodal_embedding_lengths": [3],
+        },
+        multimodal_positions=[10],
+        multimodal_lengths=[3],
+    )
+
+    executor._attach_multimodal_encoder_input(request)
+
+    assert request.py_multimodal_data["image"] is params.multimodal_data["image"]
+    assert request.py_multimodal_data["multimodal_embedding_lengths"] == [3]
+    assert MULTIMODAL_ENCODER_INPUT_ID_KEY not in request.py_multimodal_data
+    executor._handle_special_queue_items(
+        [
+            RequestQueueItem(
+                MM_ENCODER_INPUT_REQUEST_ID,
+                mm_encoder_input=("input", None),
+            )
+        ]
+    )
+    assert executor._multimodal_encoder_inputs == {}
+
+
+def test_encoder_input_release_waits_for_earlier_request():
+    executor = object.__new__(PyExecutor)
+    executor.dist = SimpleNamespace(rank=0)
+    executor.request_accumulated = []
+    executor._multimodal_encoder_inputs = {"input": MultimodalParams(multimodal_data={})}
+    request = RequestQueueItem(1, request=SimpleNamespace())
+    release = RequestQueueItem(
+        MM_ENCODER_INPUT_REQUEST_ID,
+        mm_encoder_input=("input", None),
+    )
+
+    accepted = executor._handle_special_queue_items([request, release])
+
+    assert accepted == [request]
+    assert executor.request_accumulated == [release]
+    assert "input" in executor._multimodal_encoder_inputs
 
 
 def test_complete_external_handoff_keeps_direct_path():

@@ -16,8 +16,9 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
-    MM_ENCODER_COMPLETION_REQUEST_ID, SHUTDOWN_REQUEST_ID, ExecutorRequestQueue,
-    RequestQueueItem)
+    MM_ENCODER_COMPLETION_REQUEST_ID, MM_ENCODER_INPUT_REQUEST_ID,
+    SHUTDOWN_REQUEST_ID, ExecutorRequestQueue, RequestQueueItem)
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 pytestmark = pytest.mark.cpu_only
 
@@ -159,6 +160,21 @@ def test_enqueue_multimodal_encoder_completion(executor_queue):
     assert item.is_mm_encoder_completion
     assert not item.is_normal_request
     assert item.mm_encoder_completion == (17, [0], [output_handle], None)
+
+
+def test_enqueue_multimodal_encoder_input_lifecycle(executor_queue):
+    params = MultimodalParams(multimodal_data={"image": {}})
+
+    executor_queue.enqueue_multimodal_encoder_input("input", params)
+    executor_queue.enqueue_multimodal_encoder_input("input", None)
+
+    register = executor_queue.request_queue.get_nowait()
+    release = executor_queue.request_queue.get_nowait()
+    assert register.id == MM_ENCODER_INPUT_REQUEST_ID
+    assert register.is_mm_encoder_input
+    assert not register.is_normal_request
+    assert register.mm_encoder_input == ("input", params)
+    assert release.mm_encoder_input == ("input", None)
 
 
 def test_enqueue_request_after_shutdown(executor_queue):

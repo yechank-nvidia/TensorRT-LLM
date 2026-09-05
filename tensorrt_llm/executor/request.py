@@ -265,3 +265,14 @@ class MultimodalEncoderCompletion:
     item_indices: List[int]
     output_handles: List[Dict[str, Any]]
     error: Optional[str] = None
+
+
+@dataclass(slots=True)
+class MultimodalEncoderInput:
+    """Register or release raw input retained by an encoder worker.
+
+    ``multimodal_params`` registers the input. ``None`` releases it.
+    """
+
+    input_id: str
+    multimodal_params: Optional[MultimodalParams]

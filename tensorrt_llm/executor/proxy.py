@@ -27,6 +27,7 @@ import torch
 import zmq
 import zmq.asyncio
 
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
@@ -40,7 +41,7 @@ from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
 from .request import (CancellingRequest, GenerationRequest,
-                      MultimodalEncoderCompletion)
+                      MultimodalEncoderCompletion, MultimodalEncoderInput)
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
@@ -524,6 +525,15 @@ class GenerationExecutorProxy(GenerationExecutor):
                 list(output_handles),
                 error,
             ))
+
+    def set_multimodal_encoder_input(
+        self,
+        input_id: str,
+        multimodal_params: Optional[MultimodalParams],
+    ) -> None:
+        """Send retained encoder-input lifecycle through worker ingress."""
+        self.request_queue.put(
+            MultimodalEncoderInput(input_id, multimodal_params))
 
     def multi_frontend_attach_info(self) -> Optional[dict]:
         """The attach payload consumed by attached serving frontends.

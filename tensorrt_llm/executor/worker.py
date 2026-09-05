@@ -24,7 +24,7 @@ from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
 from .request import (CancellingRequest, GenerationRequest,
-                      MultimodalEncoderCompletion)
+                      MultimodalEncoderCompletion, MultimodalEncoderInput)
 from .rpc_worker_mixin import RpcWorkerMixin
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     WorkerCommIpcAddrs)
@@ -435,6 +435,9 @@ def worker_main(
                             req.output_handles,
                             req.error,
                         )
+                    elif isinstance(req, MultimodalEncoderInput):
+                        worker.set_multimodal_encoder_input(
+                            req.input_id, req.multimodal_params)
                     elif isinstance(req, GenerationRequest):
                         try:
                             worker.submit(req)

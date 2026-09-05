@@ -35,6 +35,7 @@ from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
+from ..inputs.multimodal import MultimodalParams
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
@@ -317,6 +318,16 @@ class BaseWorker(GenerationExecutor):
             raise RuntimeError("Engine is not initialized")
         self.engine.enqueue_multimodal_encoder_outputs(client_id, item_indices,
                                                        output_handles, error)
+
+    def set_multimodal_encoder_input(
+        self,
+        input_id: str,
+        multimodal_params: Optional[MultimodalParams],
+    ) -> None:
+        """Register or release retained raw input on every encoder rank."""
+        if self.engine is None:
+            raise RuntimeError("Engine is not initialized")
+        self.engine.set_multimodal_encoder_input(input_id, multimodal_params)
 
     def _engine_response_callback(self, response: tllm.Response):
         return response
