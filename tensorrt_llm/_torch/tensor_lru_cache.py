@@ -278,6 +278,18 @@ class TensorLRUCache(Generic[K]):
             assert entry.value is not None
             return entry.value
 
+    def contains_ready(self, key: K) -> bool:
+        """Return whether ``key`` has a readable value without touching it.
+
+        Unlike :meth:`get`, this query does not update counters or LRU order
+        and does not prepare the tensor for the current CUDA stream. It is for
+        placement decisions that need to know where data resides without
+        claiming that data for consumption.
+        """
+        with self._lock:
+            entry = self._items.get(key)
+            return entry is not None and entry.state is _CacheEntryState.READY
+
     def put(
         self,
         key: K,

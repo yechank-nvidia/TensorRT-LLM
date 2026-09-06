@@ -144,6 +144,22 @@ def test_get_promotes_entry_before_lru_eviction() -> None:
     assert cache.current_bytes == 16
 
 
+def test_contains_ready_does_not_promote_or_count_entry() -> None:
+    cache = TensorLRUCache[str](max_bytes=16)
+    assert cache.put("first", torch.ones(2, dtype=torch.float32))
+    assert cache.put("second", torch.ones(2, dtype=torch.float32))
+
+    before = cache.stats()
+    assert cache.contains_ready("first")
+    assert not cache.contains_ready("missing")
+    assert cache.stats() == before
+
+    assert cache.put("third", torch.ones(2, dtype=torch.float32))
+    assert not cache.contains_ready("first")
+    assert cache.contains_ready("second")
+    assert cache.contains_ready("third")
+
+
 def test_replace_updates_size_and_oversized_replace_leaves_old_value() -> None:
     cache = TensorLRUCache[str](max_bytes=20)
     small = torch.ones(2, dtype=torch.float32)

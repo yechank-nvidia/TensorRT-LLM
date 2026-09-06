@@ -3951,6 +3951,45 @@ class PyTorchModelEngine(ModelEngine):
             state.stable_item_cache_keys = keys
         return keys
 
+    def get_mm_encoder_cache_match(self, request: Any) -> tuple[int, int]:
+        """Return locally reusable and total MM encoder cost for a new request.
+
+        Attention-DP routing runs before the queue request becomes an
+        ``LlmRequest``, but the processed request already carries the same
+        content hashes and item metadata used by normal cache acquisition.
+        Probe those existing keys without changing cache LRU state.
+        """
+        encoder_cache = self.mm_encoder_cache
+        mm_data = getattr(request, "py_multimodal_data", None)
+        if encoder_cache is None or not isinstance(mm_data, dict):
+            return 0, 0
+
+        item_metadata = get_multimodal_encoder_item_metadata(mm_data)
+        if item_metadata is None:
+            return 0, 0
+        total_cost = sum(item_metadata.encoder_token_lengths)
+
+        mm_input = getattr(request, "multimodal_input", None)
+        multimodal_hashes = getattr(mm_input, "multimodal_hashes", None)
+        cache_keys = self.model.build_encoder_cache_item_keys(
+            multimodal_hashes,
+            item_metadata.item_refs,
+            item_metadata.output_embedding_lengths,
+            mm_data.get("mm_processor_kwargs_hash"),
+            processor_version=mm_data.get("mm_processor_version"),
+            # Admission stamps this same model-owned namespace after routing.
+            encoder_version=self.mm_encoder_version,
+        )
+        if cache_keys is None:
+            return 0, total_cost
+        if len(cache_keys) != len(item_metadata.encoder_token_lengths):
+            raise ValueError(
+                "MM encoder cache keys must match request item count")
+        cached_cost = sum(item_cost for cache_key, item_cost in zip(
+            cache_keys, item_metadata.encoder_token_lengths, strict=True)
+                          if encoder_cache.contains_ready(cache_key))
+        return cached_cost, total_cost
+
     def _get_mm_encoder_embedding_size_bytes(self) -> int:
         """Return the byte size of one multimodal encoder output row.
 

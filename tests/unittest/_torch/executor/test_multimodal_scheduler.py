@@ -50,6 +50,7 @@ from tensorrt_llm.executor.request import (
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_INPUT_ID_KEY,
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalInput,
     MultimodalParams,
     MultimodalRuntimeData,
     strip_mm_encoder_inputs,
@@ -1681,6 +1682,51 @@ def test_model_engine_invalidation_advances_encoder_version():
 
     assert engine.mm_encoder_version == 1
     assert model._multimodal_encoder_cache.get(cache_key) is None
+
+
+def test_model_engine_reports_ready_mm_cost_before_request_admission():
+    class _Model(MultimodalModelMixin):
+        pass
+
+    model = _Model()
+    model._multimodal_encoder_cache = TensorLRUCache(64)
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = model
+    engine.mm_encoder_item_scheduling_enabled = True
+    engine.mapping = SimpleNamespace(is_first_pp_rank=lambda: True)
+
+    metadata = MultimodalEncoderItemMetadata(
+        item_refs=[("image", 0), ("image", 1)],
+        encoder_token_lengths=[2, 3],
+        output_embedding_lengths=[1, 1],
+    )
+    mm_data = {
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
+        "mm_processor_kwargs_hash": "kwargs",
+        "mm_processor_version": "processor",
+        "mm_encoder_version": 0,
+    }
+    mm_input = MultimodalInput(
+        multimodal_hashes=[[1] * 8, [2] * 8],
+        multimodal_positions=[0, 1],
+        multimodal_lengths=[1, 1],
+    )
+    cache_keys = model.build_encoder_cache_item_keys(
+        mm_input.multimodal_hashes,
+        metadata.item_refs,
+        metadata.output_embedding_lengths,
+        mm_data["mm_processor_kwargs_hash"],
+        processor_version=mm_data["mm_processor_version"],
+        encoder_version=mm_data["mm_encoder_version"],
+    )
+    assert cache_keys is not None
+    assert model._multimodal_encoder_cache.put(cache_keys[1], torch.ones(1, dtype=torch.float32))
+    request = SimpleNamespace(
+        py_multimodal_data=mm_data,
+        multimodal_input=mm_input,
+    )
+
+    assert engine.get_mm_encoder_cache_match(request) == (3, 5)
 
 
 def test_executor_stamps_encoder_version_when_admitting_cached_request():

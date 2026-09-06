@@ -1557,10 +1557,12 @@ class AttentionDpConfig(StrictBaseModel):
         description="The number of iterations to wait for batching.")
     enable_kv_cache_aware_routing: bool = Field(
         default=False,
-        description="Enable internal KV cache-aware routing for attention DP. "
+        description="Enable internal cache-aware routing for attention DP. "
         "When enabled, distributes requests among ranks within a single "
-        "instance's attention DP group, routing them to the rank with the "
-        "matching prefix KV cache to reduce redundant prefill computation.")
+        "instance's attention DP group. A material prefix KV match keeps its "
+        "existing priority. Otherwise, a multimodal request may prefer a rank "
+        "with reusable encoder outputs, subject to strict fair-share, to avoid "
+        "redundant encoder computation.")
     kv_cache_routing_load_balance_weight: float = Field(
         default=1.0,
         description=
@@ -1571,13 +1573,13 @@ class AttentionDpConfig(StrictBaseModel):
         default=0.1,
         description=
         "Cache-affinity gate in KV cache-aware routing. For each request, "
-        "match_len contributes to scoring only when max(match_len) / "
-        "request_tokens across eligible ranks is strictly above this "
-        "threshold; otherwise match_len is forced to 0 so routing is driven "
-        "purely by load. Default 0.1 requires at least a 10% hit rate before "
-        "cache affinity kicks in, which prevents a small universal prefix "
-        "(e.g. a shared system prompt) from pinning all traffic to the "
-        "first warm ranks. Set to 0.0 to honour any nonzero match. "
+        "a prefix match contributes to scoring only when max(match_len) / "
+        "request_tokens across eligible ranks is strictly above this threshold. "
+        "When that KV gate is inactive, multimodal encoder-cache affinity uses "
+        "the same threshold against reusable declared encoder cost / total "
+        "declared encoder cost. Default 0.1 prevents a small universal prefix "
+        "from pinning traffic to the first warm ranks. Set to 0.0 to honour "
+        "any nonzero match. "
         "Only used when enable_kv_cache_aware_routing is True.")
     kv_cache_routing_fair_share_multiplier: float = Field(
         default=2.0,
@@ -1588,7 +1590,10 @@ class AttentionDpConfig(StrictBaseModel):
         "within a scheduling batch it is removed from the eligible set for "
         "the remainder of the batch. Default 2.0 permits a 2x slack so "
         "cache affinity can dominate while preventing runaway concentration "
-        "on a single rank. Set to 1.0 for strict fair share. "
+        "on a single rank. Multimodal encoder-cache affinity is independently "
+        "bounded by strict fair share; when it is the only available cache "
+        "affinity, the effective multiplier is at most 1.0. Set to 1.0 for "
+        "strict fair share throughout. "
         "Only used when enable_kv_cache_aware_routing is True.")
     kv_cache_routing_cold_start_warmup: bool = Field(
         default=False,

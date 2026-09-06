@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Attention Data Parallelism (ADP) abstractions.
 
@@ -23,7 +26,7 @@ import random
 from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
 from dataclasses import MISSING, astuple, dataclass, field, fields, replace
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -199,6 +202,7 @@ class ADPRouter(ABC):
         kv_cache_manager=None,
         attention_dp_config=None,
         async_transfer_manager=None,
+        mm_cache_matcher: Optional[Callable[[object], tuple[int, int]]] = None,
     ) -> "ADPRouter":
         """Factory method to create the appropriate ADP router.
 
@@ -209,11 +213,12 @@ class ADPRouter(ABC):
             async_transfer_manager: PyExecutor's AsyncTransferManager, used by
                 KVCacheAwareADPRouter to account for KV-transfer-in-progress
                 requests in per-rank load.  Ignored by DefaultADPRouter.
+            mm_cache_matcher: Optional local MM encoder-cache probe returning
+                ``(reusable_cost, total_cost)`` for one new request.
 
         Returns:
-            A KVCacheAwareADPRouter if config requests it and the
-            kv_cache_manager has block reuse enabled; DefaultADPRouter
-            otherwise.
+            A KVCacheAwareADPRouter if config requests it and either the KV or
+            MM encoder cache can report matches; DefaultADPRouter otherwise.
         """
         if (
             attention_dp_config is not None
@@ -233,18 +238,35 @@ class ADPRouter(ABC):
         if (
             attention_dp_config is not None
             and attention_dp_config.enable_kv_cache_aware_routing
-            and kv_cache_manager is not None
-            and kv_cache_manager.enable_block_reuse
+            and (
+                (kv_cache_manager is not None and kv_cache_manager.enable_block_reuse)
+                or mm_cache_matcher is not None
+            )
         ):
             return KVCacheAwareADPRouter(
                 dist=dist,
-                kv_cache_manager=kv_cache_manager,
+                kv_cache_manager=(
+                    kv_cache_manager
+                    if kv_cache_manager is not None and kv_cache_manager.enable_block_reuse
+                    else None
+                ),
                 load_balance_weight=attention_dp_config.kv_cache_routing_load_balance_weight,
                 match_rate_threshold=attention_dp_config.kv_cache_routing_match_rate_threshold,
-                fair_share_multiplier=attention_dp_config.kv_cache_routing_fair_share_multiplier,
+                # MM reuse must not concentrate a burst on one lane. Preserve
+                # the configured slack for KV routing, but use strict fair
+                # share when MM is the only available cache affinity.
+                fair_share_multiplier=(
+                    attention_dp_config.kv_cache_routing_fair_share_multiplier
+                    if kv_cache_manager is not None and kv_cache_manager.enable_block_reuse
+                    else min(
+                        attention_dp_config.kv_cache_routing_fair_share_multiplier,
+                        1.0,
+                    )
+                ),
                 cold_start_warmup=attention_dp_config.kv_cache_routing_cold_start_warmup,
                 async_transfer_manager=async_transfer_manager,
                 account_for_in_transfer=attention_dp_config.kv_cache_routing_account_for_in_transfer,
+                mm_cache_matcher=mm_cache_matcher,
             )
 
         return DefaultADPRouter(dist=dist)
@@ -514,11 +536,13 @@ class DefaultADPRouter(ADPRouter):
 
 
 class KVCacheAwareADPRouter(ADPRouter):
-    """KV cache-aware request router for attention data parallelism.
+    """Cache-aware request router for attention data parallelism.
 
     Routes requests considering both load balance and KV cache prefix match
     length on each rank. When a request's prefix is already cached on a rank,
     that rank is preferred to avoid redundant prefill computation.
+    When no material KV match exists, an optional multimodal matcher can prefer
+    reusable encoder outputs without exceeding strict request fair-share.
 
     Scoring: score(rank, request) = effective_tokens + β * normalized_load
     where:
@@ -530,8 +554,8 @@ class KVCacheAwareADPRouter(ADPRouter):
     ranks (floored at req_tokens) so that both terms remain on the same
     scale regardless of absolute load levels.
 
-    Requires a KV cache manager with enable_block_reuse=True.
-    Falls back to load-based routing when no cache hits exist.
+    Requires either reusable KV blocks or a multimodal cache matcher. Falls
+    back to load-based routing when no cache hits exist.
     """
 
     needs_prefix_matches: bool = True
@@ -539,13 +563,14 @@ class KVCacheAwareADPRouter(ADPRouter):
     def __init__(
         self,
         dist: "Distributed",
-        kv_cache_manager,
+        kv_cache_manager=None,
         load_balance_weight: float = 1.0,
         match_rate_threshold: float = 0.1,
         fair_share_multiplier: float = 2.0,
         cold_start_warmup: bool = False,
         async_transfer_manager=None,
         account_for_in_transfer: bool = False,
+        mm_cache_matcher: Optional[Callable[[object], tuple[int, int]]] = None,
     ):
         super().__init__(dist)
         self.kv_cache_manager = kv_cache_manager
@@ -553,6 +578,8 @@ class KVCacheAwareADPRouter(ADPRouter):
         self.match_rate_threshold = match_rate_threshold
         self.fair_share_multiplier = fair_share_multiplier
         self._all_ranks_prefix_matches: List[Dict[int, int]] = []
+        self._all_ranks_mm_matches: List[Dict[int, tuple[int, int]]] = []
+        self.mm_cache_matcher = mm_cache_matcher
         # Cold-start warmup: ranks not yet targeted through this router.
         # Empty set disables warmup; see ``route_requests``.
         self._pending_warmup_ranks: Set[int] = (
@@ -603,16 +630,20 @@ class KVCacheAwareADPRouter(ADPRouter):
         self,
         new_requests: list[RequestQueueItem],
     ) -> None:
-        """Probe local radix tree for each new request, allgather across ranks.
+        """Probe local cache matches for each request and all-gather them.
 
-        Populates self._all_ranks_prefix_matches for use by route_requests.
-        Must be called after new_requests are available and before route_requests.
+        The existing KV prefix-match payload optionally carries reusable and
+        total multimodal encoder cost. Must run after new requests are
+        available and before :meth:`route_requests`.
         """
+        include_mm = self.mm_cache_matcher is not None
         local_matches: list[int] = []
         for req_item in new_requests:
             req = req_item.request
             if req is None:
                 local_matches.extend([req_item.id, 0])
+                if include_mm:
+                    local_matches.extend([0, 0])
                 continue
             input_tokens = getattr(req, "input_token_ids", None) or []
             probe_tokens = input_tokens[:-1] if len(input_tokens) > 1 else []
@@ -621,22 +652,35 @@ class KVCacheAwareADPRouter(ADPRouter):
             # cache_salt scopes block reuse on the backend; passing None for
             # non-salted requests is a no-op.
             cache_salt = getattr(req, "cache_salt", None)
-            match_len = self.kv_cache_manager.probe_prefix_match_length(
-                probe_tokens,
-                lora_task_id,
-                cache_salt=cache_salt,
+            match_len = (
+                self.kv_cache_manager.probe_prefix_match_length(
+                    probe_tokens,
+                    lora_task_id,
+                    cache_salt=cache_salt,
+                )
+                if self.kv_cache_manager is not None
+                else 0
             )
             local_matches.extend([req_item.id, match_len])
+            if include_mm:
+                cached_mm_cost, total_mm_cost = self.mm_cache_matcher(req)
+                local_matches.extend([cached_mm_cost, total_mm_cost])
 
         all_data = self.dist.tp_allgather(local_matches)
 
         self._all_ranks_prefix_matches = []
+        self._all_ranks_mm_matches = []
+        stride = 4 if include_mm else 2
         for rank_data in all_data:
             matches: Dict[int, int] = {}
-            for i in range(0, len(rank_data), 2):
+            mm_matches: Dict[int, tuple[int, int]] = {}
+            for i in range(0, len(rank_data), stride):
                 req_id = rank_data[i]
                 matches[req_id] = rank_data[i + 1]
+                if include_mm:
+                    mm_matches[req_id] = (rank_data[i + 2], rank_data[i + 3])
             self._all_ranks_prefix_matches.append(matches)
+            self._all_ranks_mm_matches.append(mm_matches)
 
     def _score_rank(
         self,
@@ -675,6 +719,10 @@ class KVCacheAwareADPRouter(ADPRouter):
     def _match_len(self, rank: int, req_id: int) -> int:
         matches = self._all_ranks_prefix_matches
         return matches[rank].get(req_id, 0) if rank < len(matches) else 0
+
+    def _mm_match(self, rank: int, req_id: int) -> tuple[int, int]:
+        matches = self._all_ranks_mm_matches
+        return matches[rank].get(req_id, (0, 0)) if rank < len(matches) else (0, 0)
 
     def route_requests(
         self,
@@ -755,6 +803,16 @@ class KVCacheAwareADPRouter(ADPRouter):
             multiplier=self.fair_share_multiplier,
             hard_cap=max_num_active_requests,
         )
+        mm_fair_share = (
+            self._expected_num_active_requests(
+                all_ranks_num_active_requests,
+                num_new_requests_all_ranks,
+                tp_size,
+                hard_cap=max_num_active_requests,
+            )
+            if self.mm_cache_matcher is not None
+            else expected_num_active_requests
+        )
         eligible_ranks = [
             rank
             for rank in range(tp_size)
@@ -784,23 +842,51 @@ class KVCacheAwareADPRouter(ADPRouter):
             # so the load penalty is scale-invariant.
             total_load = sum(all_ranks_num_active_tokens[r] for r in eligible_ranks)
             load_denom = max(total_load, float(req_tokens))
+            mm_matches = (
+                {r: self._mm_match(r, req_id) for r in eligible_ranks}
+                if self.mm_cache_matcher is not None
+                else {}
+            )
+            total_mm_cost = max((total for _, total in mm_matches.values()), default=0)
 
             # Per-rank prefix match lengths, reused by gate + scoring +
             # post-decision bookkeeping.
             match_lens = {r: self._match_len(r, req_id) for r in eligible_ranks}
 
-            # Cache-affinity gate: below the threshold, zero out match_len
-            # so routing is driven purely by load.
-            max_match_for_req = max(match_lens.values(), default=0)
-            cache_affinity_active = (
-                max_match_for_req / max(req_tokens, 1)
-            ) > self.match_rate_threshold
+            # Preserve the existing KV score whenever a material prefix match
+            # exists. Physical encoder tokens are a capacity bound, not a
+            # time-equivalent LLM-token unit, so MM affinity is considered
+            # only when the KV gate is inactive.
+            max_kv_match = max(match_lens.values(), default=0)
+            kv_affinity_active = (max_kv_match / max(req_tokens, 1)) > self.match_rate_threshold
+            mm_eligible_ranks = (
+                [
+                    rank
+                    for rank in eligible_ranks
+                    if all_ranks_num_active_requests[rank] < mm_fair_share
+                ]
+                if self.mm_cache_matcher is not None
+                else []
+            )
+            max_eligible_mm_match = max(
+                (mm_matches[rank][0] for rank in mm_eligible_ranks), default=0
+            )
+            mm_affinity_active = (
+                not kv_affinity_active
+                and max_eligible_mm_match / max(total_mm_cost, 1) > self.match_rate_threshold
+            )
 
             for rank in iter_ranks:
-                match_len = match_lens[rank] if cache_affinity_active else 0
-                score = self._score_rank(
-                    req_tokens, match_len, all_ranks_num_active_tokens[rank], load_denom
-                )
+                if mm_affinity_active:
+                    score = -mm_matches[rank][0] if rank in mm_eligible_ranks else float("inf")
+                else:
+                    match_len = match_lens[rank] if kv_affinity_active else 0
+                    score = self._score_rank(
+                        req_tokens,
+                        match_len,
+                        all_ranks_num_active_tokens[rank],
+                        load_denom,
+                    )
                 # Tie-break on active_tokens to spread traffic when scores
                 # collide; cache-affinity wins are unaffected (lower score).
                 if (score, all_ranks_num_active_tokens[rank]) < (

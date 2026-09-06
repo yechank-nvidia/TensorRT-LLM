@@ -17,6 +17,7 @@
 These tests use mock objects and do NOT require GPU.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 import pytest
@@ -168,6 +169,31 @@ class TestKVCacheAwareADPRouter:
         assert router._all_ranks_prefix_matches[0] == {1: 64, 2: 0}
         assert router._all_ranks_prefix_matches[1] == {1: 32, 2: 0}
 
+    def test_gather_prefix_matches_carries_mm_cost_in_same_collective(self):
+        dist = _mock_dist(tp_rank=0, tp_size=2)
+        dist.tp_allgather = Mock(
+            return_value=[
+                [1, 64, 0, 100],
+                [1, 32, 100, 100],
+            ]
+        )
+        mm_cache_matcher = Mock(return_value=(0, 100))
+        router = KVCacheAwareADPRouter(
+            dist=dist,
+            kv_cache_manager=_mock_kv_cache_manager(),
+            mm_cache_matcher=mm_cache_matcher,
+        )
+        request = _make_request_item(1, num_tokens=100)
+
+        router.gather_prefix_matches([request])
+
+        assert router._all_ranks_prefix_matches == [{1: 64}, {1: 32}]
+        assert router._all_ranks_mm_matches == [
+            {1: (0, 100)},
+            {1: (100, 100)},
+        ]
+        mm_cache_matcher.assert_called_once_with(request.request)
+
     def test_gather_prefix_matches_with_lora(self):
         tokens_a = list(range(100))
         probe_results = {
@@ -233,6 +259,102 @@ class TestKVCacheAwareADPRouter:
         result, _ = router.route_requests(states, [req], max_num_active_requests=10)
         assert len(result[0]) == 1  # routed to rank 0
         assert len(result[1]) == 0
+
+    def test_route_prefers_mm_when_kv_gate_is_inactive(self):
+        dist = _mock_dist(tp_rank=0, tp_size=2)
+        router = KVCacheAwareADPRouter(
+            dist=dist,
+            kv_cache_manager=_mock_kv_cache_manager(),
+            match_rate_threshold=0.1,
+            fair_share_multiplier=1.0,
+            mm_cache_matcher=Mock(),
+        )
+        router._all_ranks_prefix_matches = [{1: 5}, {1: 0}]
+        router._all_ranks_mm_matches = [
+            {1: (0, 200)},
+            {1: (200, 200)},
+        ]
+        request = _make_request_item(1, num_tokens=100)
+        states = [RankState(rank=0), RankState(rank=1)]
+
+        result, _ = router.route_requests(states, [request], max_num_active_requests=10)
+
+        assert result[0] == []
+        assert result[1] == [request]
+
+    def test_route_preserves_material_kv_affinity_over_mm(self):
+        dist = _mock_dist(tp_rank=0, tp_size=2)
+        router = KVCacheAwareADPRouter(
+            dist=dist,
+            kv_cache_manager=_mock_kv_cache_manager(),
+            match_rate_threshold=0.1,
+            fair_share_multiplier=1.0,
+            mm_cache_matcher=Mock(),
+        )
+        router._all_ranks_prefix_matches = [{1: 80}, {1: 0}]
+        router._all_ranks_mm_matches = [
+            {1: (0, 200)},
+            {1: (200, 200)},
+        ]
+        request = _make_request_item(1, num_tokens=100)
+
+        result, _ = router.route_requests(
+            [RankState(rank=0), RankState(rank=1)],
+            [request],
+            max_num_active_requests=10,
+        )
+
+        assert result[0] == [request]
+        assert result[1] == []
+
+    def test_route_bounds_mm_affinity_to_strict_fair_share(self):
+        dist = _mock_dist(tp_rank=0, tp_size=2)
+        router = KVCacheAwareADPRouter(
+            dist=dist,
+            kv_cache_manager=_mock_kv_cache_manager(),
+            fair_share_multiplier=2.0,
+            mm_cache_matcher=Mock(),
+        )
+        request_ids = range(4)
+        router._all_ranks_prefix_matches = [
+            {request_id: 0 for request_id in request_ids},
+            {request_id: 0 for request_id in request_ids},
+        ]
+        router._all_ranks_mm_matches = [
+            {request_id: (100, 100) for request_id in request_ids},
+            {request_id: (0, 100) for request_id in request_ids},
+        ]
+        requests = [_make_request_item(request_id, num_tokens=100) for request_id in request_ids]
+
+        result, _ = router.route_requests(
+            [RankState(rank=0), RankState(rank=1)],
+            requests,
+            max_num_active_requests=10,
+        )
+
+        assert len(result[0]) == 2
+        assert len(result[1]) == 2
+
+    def test_factory_uses_strict_fair_share_for_mm_only_routing(self):
+        config = SimpleNamespace(
+            kv_cache_routing_conversation_affinity=False,
+            enable_kv_cache_aware_routing=True,
+            kv_cache_routing_load_balance_weight=1.0,
+            kv_cache_routing_match_rate_threshold=0.1,
+            kv_cache_routing_fair_share_multiplier=2.0,
+            kv_cache_routing_cold_start_warmup=False,
+            kv_cache_routing_account_for_in_transfer=False,
+        )
+
+        router = ADPRouter.create(
+            dist=_mock_dist(tp_rank=0, tp_size=2),
+            kv_cache_manager=SimpleNamespace(enable_block_reuse=False),
+            attention_dp_config=config,
+            mm_cache_matcher=Mock(return_value=(0, 0)),
+        )
+
+        assert isinstance(router, KVCacheAwareADPRouter)
+        assert router.fair_share_multiplier == 1.0
 
     def test_route_degenerates_to_load_balance_no_cache(self):
         """No cache hits → routes to least loaded rank."""
