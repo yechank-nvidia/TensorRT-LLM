@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List, Optional
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -687,6 +688,23 @@ def test_qwen3vl_enables_local_encoder_cuda_graph() -> None:
     model.enable_multimodal_encoder_cuda_graph()
 
     assert model.mm_encoder.enabled is True
+
+
+def test_qwen3vl_llm_compile_uses_recompile_limit(monkeypatch) -> None:
+    eager_model = object()
+    compiled_model = object()
+    compile_mock = MagicMock(return_value=compiled_model)
+    monkeypatch.setattr(torch, "compile", compile_mock)
+    model = SimpleNamespace(llm=SimpleNamespace(model=eager_model))
+
+    modeling_qwen3vl.Qwen3VLModelBase.apply_llm_torch_compile(
+        model, backend="backend", fullgraph=True, recompile_limit=16
+    )
+
+    compile_mock.assert_called_once_with(
+        eager_model, backend="backend", fullgraph=True, recompile_limit=16
+    )
+    assert model.llm.model is compiled_model
 
 
 def test_qwen3_processor_max_pixels_maps_to_fixed_attention_capacity() -> None:

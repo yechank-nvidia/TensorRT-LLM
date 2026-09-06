@@ -218,3 +218,20 @@ def test_qwen2vl_forward_uses_scheduled_item_segments(monkeypatch) -> None:
     model._get_or_encode_multimodal_embeddings.assert_called_once_with([multimodal_param])
     find_input_mm_embeds.assert_not_called()
     assert fuse_input_embeds.call_args.args[2] == active_embeddings
+
+
+def test_qwen2vl_llm_compile_uses_recompile_limit(monkeypatch) -> None:
+    eager_model = object()
+    compiled_model = object()
+    compile_mock = MagicMock(return_value=compiled_model)
+    monkeypatch.setattr(torch, "compile", compile_mock)
+    model = SimpleNamespace(llm=SimpleNamespace(model=eager_model))
+
+    modeling_qwen2vl.Qwen2VLModelBase.apply_llm_torch_compile(
+        model, backend="backend", fullgraph=True, recompile_limit=16
+    )
+
+    compile_mock.assert_called_once_with(
+        eager_model, backend="backend", fullgraph=True, recompile_limit=16
+    )
+    assert model.llm.model is compiled_model

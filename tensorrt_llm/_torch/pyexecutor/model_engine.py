@@ -838,6 +838,8 @@ class PyTorchModelEngine(ModelEngine):
                 and self._init_userbuffers(self.model.config.hidden_size))
             if self._torch_compile_enabled:
                 set_torch_compiling(True)
+                torch_compile_recompile_limit = max(
+                    torch._dynamo.config.recompile_limit, 16)
                 use_ub = not use_ub_for_nccl and (
                     torch_compile_enable_userbuffers
                     and self._init_userbuffers(self.model.config.hidden_size))
@@ -860,19 +862,22 @@ class PyTorchModelEngine(ModelEngine):
                     self.model.model = torch.compile(
                         self.model.model,
                         backend=self._torch_compile_backend,
-                        fullgraph=torch_compile_fullgraph)
+                        fullgraph=torch_compile_fullgraph,
+                        recompile_limit=torch_compile_recompile_limit)
                 elif callable(apply_llm_torch_compile):
                     # TODO: Move this contract to MultimodalModelMixin once
                     # multimodal models consistently expose their LLM compile
                     # scope through the mixin.
-                    apply_llm_torch_compile(backend=self._torch_compile_backend,
-                                            fullgraph=torch_compile_fullgraph)
+                    apply_llm_torch_compile(
+                        backend=self._torch_compile_backend,
+                        fullgraph=torch_compile_fullgraph,
+                        recompile_limit=torch_compile_recompile_limit)
                 else:
                     self.model = torch.compile(
                         self.model,
                         backend=self._torch_compile_backend,
-                        fullgraph=torch_compile_fullgraph)
-                torch._dynamo.config.cache_size_limit = 16
+                        fullgraph=torch_compile_fullgraph,
+                        recompile_limit=torch_compile_recompile_limit)
             else:
                 set_torch_compiling(False)
 
