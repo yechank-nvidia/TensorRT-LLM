@@ -531,9 +531,10 @@ class MultimodalEncoderCudaGraphConfig(StrictBaseModel):
 
     enable_replay_stats: bool = Field(
         default=False,
-        description=
-        ("Log diagnostic details for encoder CUDA graph bucket hits and misses. "
-         "When enabled, each request's bucket decision is logged at INFO."),
+        description=(
+            "Collect aggregate encoder CUDA graph replay, fallback, and padding "
+            "counters in multimodal iteration statistics. Unlike per-request "
+            "logging, this keeps shape diagnostics off the encoder hot path."),
         status="prototype",
     )
 

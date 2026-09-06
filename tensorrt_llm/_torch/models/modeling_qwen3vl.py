@@ -1133,14 +1133,15 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
             seq_lens, attn_metadata, max_seq_len=self._fixed_max_seq_len
         )
 
-    def enable_cuda_graph(self) -> None:
+    def enable_cuda_graph(self) -> Optional[MultimodalEncoderGraphRunner]:
         """Capture configured CUDA graphs for the vision block loop."""
         if self._encoder_cuda_graph_config is None or self._blocks_graph_runner is not None:
-            return
+            return self._blocks_graph_runner
 
         graph_runner = self._build_blocks_graph_runner(self._encoder_cuda_graph_config)
         graph_runner.capture_all(self.device)
         self._blocks_graph_runner = graph_runner
+        return graph_runner
 
     def _build_blocks_graph_runner(
         self, config: "MultimodalEncoderCudaGraphConfig"
@@ -1388,8 +1389,8 @@ class Qwen3VisionModelBase(nn.Module):
     def post_config(self):
         self.config = self.model_config.pretrained_config.vision_config
 
-    def enable_cuda_graph(self) -> None:
-        self.visual.enable_cuda_graph()
+    def enable_cuda_graph(self) -> Optional[MultimodalEncoderGraphRunner]:
+        return self.visual.enable_cuda_graph()
 
     def load_weights(
         self,
@@ -1711,9 +1712,12 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         """Compile only the LLM decoder; the vision encoder stays eager."""
         self.llm.model = torch.compile(self.llm.model, backend=backend, fullgraph=fullgraph)
 
-    def enable_multimodal_encoder_cuda_graph(self) -> None:
+    def enable_multimodal_encoder_cuda_graph(
+        self,
+    ) -> Optional[MultimodalEncoderGraphRunner]:
         if self.mm_encoder is not None:
-            self.mm_encoder.enable_cuda_graph()
+            return self.mm_encoder.enable_cuda_graph()
+        return None
 
     def init_mrope_embedding(self, model_config: ModelConfig[PretrainedConfig]):
         config = model_config.pretrained_config.text_config

@@ -747,6 +747,47 @@ def test_attention_dp_all_rank_metrics_keep_local_mm_stats(monkeypatch):
     fake._adp_iter_stats.queue.assert_not_called()
 
 
+def test_process_iter_stats_includes_encoder_graph_stats():
+    """Graph replay counters share the existing multimodal stats payload."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    scheduled_requests = types.SimpleNamespace(
+        mm_encoder_gpu_start_event=None,
+        mm_encoder_gpu_end_event=None,
+    )
+    batch_state = types.SimpleNamespace(
+        scheduled_requests=scheduled_requests,
+        scheduled_batch_stats=types.SimpleNamespace(mm_encoder_stats=None),
+        iter_start_time=0.0,
+        iter_stats=IterationStats(),
+        gpu_forward_start_event=None,
+        gpu_forward_end_event=None,
+        gpu_forward_events_from_perf_pool=False,
+    )
+    fake = MagicMock()
+    fake.enable_iter_req_stats = False
+    fake.enable_iter_perf_stats = True
+    fake.enable_attention_dp = False
+    fake.dist.tp_size = 1
+    fake._latest_host_step_time_ms = 1.0
+    fake._latest_prev_device_step_time_ms = 2.0
+    fake.perf_manager.try_compute_gpu_elapsed_time_ms.return_value = None
+    fake._update_iter_stats.return_value = batch_state.iter_stats
+    fake.model_engine.take_multimodal_encoder_graph_stats.return_value = {
+        "graphReplays": 1,
+        "graphUsefulTokens": 200,
+        "graphPaddingTokens": 57,
+    }
+
+    PyExecutor._process_iter_stats(fake, [], [], batch_state)
+
+    assert fake._append_iter_stats.call_args.kwargs["mm_encoder_stats"] == {
+        "graphReplays": 1,
+        "graphUsefulTokens": 200,
+        "graphPaddingTokens": 57,
+    }
+
+
 def test_tp_all_rank_metrics_buffer_local_mm_stats(monkeypatch):
     """All-rank export retains encoder-DP timings from ordinary TP ranks."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor

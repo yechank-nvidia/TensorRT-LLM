@@ -876,10 +876,12 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 set_torch_compiling(False)
 
+            self._multimodal_encoder_graph_runner = None
             enable_mm_encoder_cuda_graph = getattr(
                 self.model, "enable_multimodal_encoder_cuda_graph", None)
             if callable(enable_mm_encoder_cuda_graph):
-                enable_mm_encoder_cuda_graph()
+                self._multimodal_encoder_graph_runner = enable_mm_encoder_cuda_graph(
+                )
         except Exception as e:
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)
@@ -3568,6 +3570,11 @@ class PyTorchModelEngine(ModelEngine):
                     getattr(provider, "multimodal_data_device_paths", None)),
             )
         return provider.forward_multimodal_encoder_items(encoder_inputs)
+
+    def take_multimodal_encoder_graph_stats(self) -> Dict[str, int]:
+        """Return graph decisions collected by the active MM encoder runner."""
+        runner = getattr(self, "_multimodal_encoder_graph_runner", None)
+        return runner.take_replay_stats() if runner is not None else {}
 
     @torch.inference_mode()
     def forward_multimodal_encoder_items(

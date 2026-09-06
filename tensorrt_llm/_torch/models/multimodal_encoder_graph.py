@@ -201,6 +201,12 @@ class MultimodalEncoderGraphRunner:
         self._captured: Dict[EncoderGraphKey, _CapturedGraph] = {}
         self._warned_no_bucket_match: bool = False
         self._replay_stats_enabled: bool = config.enable_replay_stats
+        self._replay_count: int = 0
+        self._no_bucket_fallback_count: int = 0
+        self._missing_capture_fallback_count: int = 0
+        self._useful_token_count: int = 0
+        self._padding_token_count: int = 0
+        self._fallback_token_count: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -249,10 +255,8 @@ class MultimodalEncoderGraphRunner:
         bucket = self._select_bucket(real_contexts, real_tokens)
         if bucket is None:
             if self._replay_stats_enabled:
-                logger.info(
-                    "Multimodal encoder CUDA graph bucket miss: no bucket for "
-                    f"{real_contexts=}, {real_tokens=}."
-                )
+                self._no_bucket_fallback_count += 1
+                self._fallback_token_count += real_tokens
             return None
 
         padded_seq_lengths = self._padded_seq_lengths(
@@ -265,22 +269,38 @@ class MultimodalEncoderGraphRunner:
         captured = self._captured.get(key)
         if captured is None:
             if self._replay_stats_enabled:
-                logger.info(
-                    "Multimodal encoder CUDA graph bucket miss: selected "
-                    f"{bucket=} with {key=}, but no graph has been captured."
-                )
+                self._missing_capture_fallback_count += 1
+                self._fallback_token_count += real_tokens
             return None
         self._copy_inputs_into_static(captured, inputs, real_tokens=real_tokens)
         self._metadata_provider.refresh_in_place(captured.metadata, padded_seq_lengths)
         self._assert_metadata_buffers_stable(captured.metadata, captured.metadata_tensor_ptrs)
         captured.graph.replay()
         if self._replay_stats_enabled:
-            logger.info(
-                "Multimodal encoder CUDA graph bucket hit: "
-                f"{bucket=}, {real_contexts=}, {real_tokens=}, "
-                f"pad_slack={bucket.total_tokens - real_tokens}."
-            )
+            self._replay_count += 1
+            self._useful_token_count += real_tokens
+            self._padding_token_count += key.total_tokens - real_tokens
         return self._collect_outputs(captured, real_tokens=real_tokens)
+
+    def take_replay_stats(self) -> Dict[str, int]:
+        """Return and reset aggregate graph decisions since the last call."""
+        if not self._replay_stats_enabled:
+            return {}
+        stats = {
+            "graphReplays": self._replay_count,
+            "graphNoBucketFallbacks": self._no_bucket_fallback_count,
+            "graphMissingCaptureFallbacks": self._missing_capture_fallback_count,
+            "graphUsefulTokens": self._useful_token_count,
+            "graphPaddingTokens": self._padding_token_count,
+            "graphFallbackTokens": self._fallback_token_count,
+        }
+        self._replay_count = 0
+        self._no_bucket_fallback_count = 0
+        self._missing_capture_fallback_count = 0
+        self._useful_token_count = 0
+        self._padding_token_count = 0
+        self._fallback_token_count = 0
+        return stats if any(stats.values()) else {}
 
     # ------------------------------------------------------------------
     # Bucket selection / padding

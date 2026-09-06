@@ -256,7 +256,7 @@ def test_maybe_run_replays_captured_graph_and_slices_output():
     assert graph.replay_calls == 1
 
 
-def test_replay_stats_disabled_does_not_log():
+def test_replay_stats_disabled_does_not_collect_or_log():
     runner = _make_logic_runner()
     assert runner._replay_stats_enabled is False
 
@@ -264,21 +264,43 @@ def test_replay_stats_disabled_does_not_log():
         out = runner.maybe_run(seq_lengths=[9000], inputs={"x": torch.zeros(9000, 4)})
 
     assert out is None
+    assert runner.take_replay_stats() == {}
     info.assert_not_called()
 
 
-def test_replay_stats_enabled_logs_per_request_decision():
+def test_replay_stats_enabled_collects_aggregate_decisions():
     bucket = EncoderGraphKey(num_contexts=1, total_tokens=256)
     runner = _make_logic_runner(buckets=[bucket], enable_replay_stats=True)
     _install_fake_captured_graph(runner, bucket)
 
-    with mock.patch("tensorrt_llm._torch.models.multimodal_encoder_graph.logger.info") as info:
-        runner.maybe_run(seq_lengths=[200], inputs={"x": torch.ones(200, 4)})  # hit
-        runner.maybe_run(seq_lengths=[9000], inputs={"x": torch.zeros(9000, 4)})  # no-bucket miss
+    runner.maybe_run(seq_lengths=[200], inputs={"x": torch.ones(200, 4)})
+    runner.maybe_run(seq_lengths=[9000], inputs={"x": torch.zeros(9000, 4)})
 
-    messages = [call.args[0] for call in info.call_args_list]
-    assert any("bucket hit" in m for m in messages)
-    assert any("no bucket" in m for m in messages)
+    assert runner.take_replay_stats() == {
+        "graphReplays": 1,
+        "graphNoBucketFallbacks": 1,
+        "graphMissingCaptureFallbacks": 0,
+        "graphUsefulTokens": 200,
+        # The 256-token bucket includes the runner's reserved dummy token.
+        "graphPaddingTokens": 57,
+        "graphFallbackTokens": 9000,
+    }
+    assert runner.take_replay_stats() == {}
+
+
+def test_replay_stats_distinguishes_missing_capture():
+    bucket = EncoderGraphKey(num_contexts=1, total_tokens=256)
+    runner = _make_logic_runner(buckets=[bucket], enable_replay_stats=True)
+
+    assert runner.maybe_run(seq_lengths=[200], inputs={"x": torch.ones(200, 4)}) is None
+    assert runner.take_replay_stats() == {
+        "graphReplays": 0,
+        "graphNoBucketFallbacks": 0,
+        "graphMissingCaptureFallbacks": 1,
+        "graphUsefulTokens": 0,
+        "graphPaddingTokens": 0,
+        "graphFallbackTokens": 200,
+    }
 
 
 def test_empty_buckets_rejected():

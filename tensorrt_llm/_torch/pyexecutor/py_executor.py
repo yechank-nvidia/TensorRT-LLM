@@ -2509,6 +2509,15 @@ class PyExecutor:
                     batch_state.gpu_forward_end_event)
             return
 
+        take_graph_stats = getattr(self.model_engine,
+                                   "take_multimodal_encoder_graph_stats", None)
+        if callable(take_graph_stats):
+            graph_stats = take_graph_stats()
+            if isinstance(graph_stats, dict) and graph_stats:
+                if mm_encoder_stats is None:
+                    mm_encoder_stats = {}
+                mm_encoder_stats.update(graph_stats)
+
         # Snapshot per-loop profiler timings plus the batch-matched GPU
         # forward time. The FPM GPU value is read from CUDA events without
         # synchronizing here; the normal sampler/update path has already
