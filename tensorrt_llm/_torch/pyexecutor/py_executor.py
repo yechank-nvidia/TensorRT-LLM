@@ -5799,7 +5799,7 @@ class PyExecutor:
         # and are reported by the existing admission validation path.
         for req_item in new_requests:
             request = req_item.request
-            mm_data = request.py_multimodal_data if request is not None else None
+            mm_data = getattr(request, "py_multimodal_data", None)
             if (isinstance(mm_data, dict)
                     and MULTIMODAL_ENCODER_INPUT_ID_KEY in mm_data):
                 try:

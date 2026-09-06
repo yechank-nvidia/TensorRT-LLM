@@ -42,7 +42,11 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
-from tensorrt_llm.executor.request import MultimodalEncoderCompletion, MultimodalEncoderInput
+from tensorrt_llm.executor.request import (
+    DEFAULT_REQUEST_PRIORITY,
+    MultimodalEncoderCompletion,
+    MultimodalEncoderInput,
+)
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_INPUT_ID_KEY,
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -531,11 +535,12 @@ def test_encoder_input_release_waits_for_earlier_request():
         multimodal_lengths=[3],
     )
     request_item = RequestQueueItem(1, request=request)
+    plain_item = RequestQueueItem(2, request=SimpleNamespace(priority=DEFAULT_REQUEST_PRIORITY))
     release = RequestQueueItem(
         MM_ENCODER_INPUT_REQUEST_ID,
         mm_encoder_input=("input", None),
     )
-    executor.request_accumulated = [register, request_item, release]
+    executor.request_accumulated = [register, request_item, plain_item, release]
     waiting_queue = FCFSWaitingQueue()
 
     executor._fetch_and_enqueue_requests(waiting_queue, total_num_active_requests=1)
@@ -546,6 +551,7 @@ def test_encoder_input_release_waits_for_earlier_request():
     assert queued_request is request
     assert MULTIMODAL_ENCODER_INPUT_ID_KEY not in request.py_multimodal_data
     assert request.py_multimodal_data["image"] is params.multimodal_data["image"]
+    assert list(waiting_queue) == [request_item, plain_item]
 
     executor._fetch_and_enqueue_requests(waiting_queue, total_num_active_requests=1)
 
