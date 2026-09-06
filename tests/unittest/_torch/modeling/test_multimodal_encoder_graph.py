@@ -10,7 +10,8 @@ The runner has two layers worth testing:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence
+from types import SimpleNamespace
+from typing import Callable, Dict, Hashable, List, Optional, Sequence
 from unittest import mock
 
 import pytest
@@ -61,13 +62,22 @@ class _ToyMetadataProvider:
     def __init__(self, device: torch.device) -> None:
         self._device = device
 
-    def build(self, key: EncoderGraphKey) -> _ToyMetadata:
+    def build(
+        self,
+        key: EncoderGraphKey,
+        _layout: Optional[Hashable] = None,
+    ) -> _ToyMetadata:
         return _ToyMetadata(
             max_contexts=key.num_contexts,
             seq_lens_cuda=torch.zeros(key.num_contexts, dtype=torch.int32, device=self._device),
         )
 
-    def refresh_in_place(self, metadata: _ToyMetadata, padded_seq_lengths: Sequence[int]) -> None:
+    def refresh_in_place(
+        self,
+        metadata: _ToyMetadata,
+        padded_seq_lengths: Sequence[int],
+        _layout: Optional[Hashable] = None,
+    ) -> None:
         n = len(padded_seq_lengths)
         if n > metadata.max_contexts:
             raise ValueError(
@@ -84,10 +94,19 @@ class _NoopMetadataProvider:
 
     graph_critical_attrs: Sequence[str] = ()
 
-    def build(self, key: EncoderGraphKey):
+    def build(
+        self,
+        key: EncoderGraphKey,
+        _layout: Optional[Hashable] = None,
+    ):
         return None
 
-    def refresh_in_place(self, metadata, padded_seq_lengths: Sequence[int]) -> None:
+    def refresh_in_place(
+        self,
+        metadata,
+        padded_seq_lengths: Sequence[int],
+        _layout: Optional[Hashable] = None,
+    ) -> None:
         return None
 
 
@@ -144,6 +163,7 @@ def _make_logic_runner(
     buckets: Optional[List[EncoderGraphKey]] = None,
     enable_padding: bool = True,
     enable_replay_stats: bool = False,
+    capture_on_first_use: bool = False,
     encoder_fn=None,
 ) -> MultimodalEncoderGraphRunner:
     """Build a pure-Python runner with default buckets."""
@@ -164,6 +184,7 @@ def _make_logic_runner(
         input_specs={"x": EncoderGraphTensorSpec(shape=(4,), dtype=torch.float32)},
         output_specs={"y": 0},
         config=config,
+        capture_on_first_use=capture_on_first_use,
     )
 
 
@@ -239,6 +260,7 @@ def _install_fake_captured_graph(
         metadata=None,
         outputs={"y": torch.zeros(key.total_tokens, 4)},
         metadata_tensor_ptrs={},
+        layout=None,
     )
     return graph
 
@@ -280,6 +302,7 @@ def test_replay_stats_enabled_collects_aggregate_decisions():
         "graphReplays": 1,
         "graphNoBucketFallbacks": 1,
         "graphMissingCaptureFallbacks": 0,
+        "graphLayoutFallbacks": 0,
         "graphUsefulTokens": 200,
         # The 256-token bucket includes the runner's reserved dummy token.
         "graphPaddingTokens": 57,
@@ -297,6 +320,7 @@ def test_replay_stats_distinguishes_missing_capture():
         "graphReplays": 0,
         "graphNoBucketFallbacks": 0,
         "graphMissingCaptureFallbacks": 1,
+        "graphLayoutFallbacks": 0,
         "graphUsefulTokens": 0,
         "graphPaddingTokens": 0,
         "graphFallbackTokens": 200,
@@ -339,6 +363,58 @@ def test_capture_all_processes_largest_bucket_first():
     assert [key.total_tokens for key in captured_keys] == [1025, 513, 257]
 
 
+def test_deferred_capture_keeps_one_layout_per_bucket():
+    bucket = EncoderGraphKey(num_contexts=1, total_tokens=256)
+    runner = _make_logic_runner(
+        buckets=[bucket],
+        enable_padding=False,
+        enable_replay_stats=True,
+        capture_on_first_use=True,
+    )
+    graph = _FakeGraph()
+
+    def install_capture(key, padded_seq_lengths, device, **kwargs):
+        assert key == bucket
+        assert padded_seq_lengths == [256]
+        assert kwargs["layout"] == (128, 128)
+        runner._captured[key] = _CapturedGraph(
+            graph=graph,
+            inputs={"x": torch.zeros(256, 4)},
+            metadata=None,
+            outputs={"y": torch.zeros(256, 4)},
+            metadata_tensor_ptrs={},
+            layout=(128, 128),
+        )
+
+    with mock.patch.object(runner, "_capture_key", side_effect=install_capture) as capture:
+        runner.capture_all(torch.device("cpu"))
+        capture.assert_not_called()
+        first = runner.maybe_run(
+            seq_lengths=[256],
+            layout=(128, 128),
+            inputs={"x": torch.ones(256, 4)},
+        )
+        second = runner.maybe_run(
+            seq_lengths=[256],
+            layout=(64, 192),
+            inputs={"x": torch.ones(256, 4)},
+        )
+
+    assert first is not None
+    assert second is None
+    assert capture.call_count == 1
+    assert graph.replay_calls == 1
+    assert runner.take_replay_stats() == {
+        "graphReplays": 1,
+        "graphNoBucketFallbacks": 0,
+        "graphMissingCaptureFallbacks": 0,
+        "graphLayoutFallbacks": 1,
+        "graphUsefulTokens": 256,
+        "graphPaddingTokens": 0,
+        "graphFallbackTokens": 256,
+    }
+
+
 def test_metadata_buffer_snapshot_records_declared_attrs():
     md = _ToyMetadata(
         max_contexts=2,
@@ -346,6 +422,18 @@ def test_metadata_buffer_snapshot_records_declared_attrs():
     )
     snapshot = MultimodalEncoderGraphRunner._snapshot_metadata_tensor_ptrs(md, ("seq_lens_cuda",))
     assert snapshot == {"seq_lens_cuda": md.seq_lens_cuda.data_ptr()}
+
+
+def test_metadata_buffer_snapshot_supports_nested_state():
+    md = _ToyMetadata(
+        max_contexts=2,
+        seq_lens_cuda=torch.zeros(2, dtype=torch.int32),
+    )
+    state = SimpleNamespace(full=md)
+    snapshot = MultimodalEncoderGraphRunner._snapshot_metadata_tensor_ptrs(
+        state, ("full.seq_lens_cuda",)
+    )
+    assert snapshot == {"full.seq_lens_cuda": md.seq_lens_cuda.data_ptr()}
 
 
 def test_metadata_buffer_snapshot_rejects_non_tensor_attr():
@@ -464,7 +552,11 @@ class _PlanRunMetadataProvider:
     def __init__(self, device: torch.device) -> None:
         self._device = device
 
-    def build(self, key: EncoderGraphKey) -> _PlanRunMetadata:
+    def build(
+        self,
+        key: EncoderGraphKey,
+        _layout: Optional[Hashable] = None,
+    ) -> _PlanRunMetadata:
         return _PlanRunMetadata(
             plan_cuda=torch.zeros(key.total_tokens, dtype=torch.float32, device=self._device),
         )
@@ -473,6 +565,7 @@ class _PlanRunMetadataProvider:
         self,
         metadata: _PlanRunMetadata,
         padded_seq_lengths: Sequence[int],
+        _layout: Optional[Hashable] = None,
     ) -> None:
         metadata.max_work_items = max(padded_seq_lengths)
         metadata.plan_cuda.zero_()
@@ -647,13 +740,22 @@ class _ReallocatingProvider:
     def __init__(self, device: torch.device) -> None:
         self._device = device
 
-    def build(self, key: EncoderGraphKey) -> _ToyMetadata:
+    def build(
+        self,
+        key: EncoderGraphKey,
+        _layout: Optional[Hashable] = None,
+    ) -> _ToyMetadata:
         return _ToyMetadata(
             max_contexts=key.num_contexts,
             seq_lens_cuda=torch.zeros(key.num_contexts, dtype=torch.int32, device=self._device),
         )
 
-    def refresh_in_place(self, metadata: _ToyMetadata, padded_seq_lengths: Sequence[int]) -> None:
+    def refresh_in_place(
+        self,
+        metadata: _ToyMetadata,
+        padded_seq_lengths: Sequence[int],
+        _layout: Optional[Hashable] = None,
+    ) -> None:
         # BUG: rebinds the tensor instead of copying into it.
         metadata.seq_lens_cuda = torch.tensor(
             list(padded_seq_lengths) + [0] * (metadata.max_contexts - len(padded_seq_lengths)),

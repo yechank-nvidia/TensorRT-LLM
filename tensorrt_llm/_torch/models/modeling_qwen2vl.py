@@ -9,7 +9,8 @@ from collections import OrderedDict
 from concurrent.futures import Future
 from contextlib import nullcontext
 from functools import lru_cache
-from typing import Any, Dict, Hashable, List, Mapping, Optional, Tuple, Union
+from typing import (TYPE_CHECKING, Any, Dict, Hashable, List, Mapping,
+                    NamedTuple, Optional, Sequence, Tuple, Union)
 
 import numpy as np
 import torch
@@ -87,6 +88,12 @@ from .modeling_multimodal_utils import (
 from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
                              filter_weights, register_auto_model,
                              register_vision_encoder)
+from .multimodal_encoder_graph import (EncoderGraphKey, EncoderGraphTensorSpec,
+                                       EncoderMetadataProvider,
+                                       MultimodalEncoderGraphRunner)
+
+if TYPE_CHECKING:
+    from ...llmapi.llm_args import MultimodalEncoderCudaGraphConfig
 
 PAD_INDEX = -100  # NOTE: refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py#L269
 
@@ -1620,6 +1627,10 @@ class Qwen2VisionModelBase(nn.Module):
             raise NotImplementedError(
                 f"Model class {model_class} not implemented")
 
+    def enable_cuda_graph(self) -> Optional[MultimodalEncoderGraphRunner]:
+        enable_cuda_graph = getattr(self.visual, "enable_cuda_graph", None)
+        return enable_cuda_graph() if callable(enable_cuda_graph) else None
+
     def _split_fused_vision_qkv_tensor(
         self, tensor: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -2033,6 +2044,20 @@ class Qwen2_5_VLPatchMerger(torch.nn.Module):
         return hidden_states
 
 
+class _Qwen2_5_VisionGraphMetadata(NamedTuple):
+    """Fixed-address full/window attention state for one graph bucket."""
+
+    full: AttentionMetadata
+    window: AttentionMetadata
+
+
+class _Qwen2_5_VisionGraphLayout(NamedTuple):
+    """Exact full/window sequence partitions captured by one graph."""
+
+    full_seq_lens: Tuple[int, ...]
+    window_seq_lens: Tuple[int, ...]
+
+
 class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
@@ -2078,6 +2103,20 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         self.full_attn_metadata: Optional[AttentionMetadata] = None
         self.window_attn_metadata: Optional[AttentionMetadata] = None
         self.set_attn_max_seq_len(self.model_config.max_num_tokens)
+        self._blocks_graph_runner: Optional[MultimodalEncoderGraphRunner] = None
+
+        mm_config = self.model_config.multimodal_config
+        self._encoder_cuda_graph_config: Optional[
+            MultimodalEncoderCudaGraphConfig] = None
+        if mm_config is not None and mm_config.encoder_cuda_graph is not None:
+            unknown_modalities = set(mm_config.encoder_cuda_graph) - {"vision"}
+            if unknown_modalities:
+                raise ValueError(
+                    "Unsupported Qwen2.5-VL encoder CUDA graph modalities: "
+                    f"{sorted(unknown_modalities)}. Supported modalities: ['vision']."
+                )
+            self._encoder_cuda_graph_config = mm_config.encoder_cuda_graph.get(
+                "vision")
         # Pre-allocated `arange` for the vision block's `rope_position_ids`;
         # per-call code slices `[:seq_len]` instead of a fresh `(seq_len,) int32`
         # + H->D copy. Sized by `setup_attn_metadata` (engine-driven); `forward`
@@ -2313,6 +2352,136 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
 
+    def enable_cuda_graph(self) -> Optional[MultimodalEncoderGraphRunner]:
+        """Enable exact-layout CUDA graphs for the vision block loop."""
+        config = self._encoder_cuda_graph_config
+        if config is None or self._blocks_graph_runner is not None:
+            return self._blocks_graph_runner
+        if config.enable_padding:
+            raise ValueError(
+                "Qwen2.5-VL encoder CUDA graphs require enable_padding=False "
+                "because full and window attention layouts must match exactly.")
+        if self.model_config.attn_backend != "TRTLLM":
+            raise ValueError(
+                "Qwen2.5-VL encoder CUDA graphs currently require the TRTLLM "
+                "attention backend.")
+
+        graph_runner = self._build_blocks_graph_runner(config)
+        graph_runner.capture_all(self.device)
+        self._blocks_graph_runner = graph_runner
+        return graph_runner
+
+    def _build_blocks_graph_runner(
+        self,
+        config: "MultimodalEncoderCudaGraphConfig",
+    ) -> MultimodalEncoderGraphRunner:
+        rotary_dim = self.rotary_pos_emb.rotary_cos_sin.shape[-1] * 2
+        return MultimodalEncoderGraphRunner(
+            encoder_fn=self._encoder_graph_fn,
+            metadata_provider=_Qwen2_5_VisionEncoderMetadataProvider(self),
+            input_specs={
+                "hidden_states":
+                EncoderGraphTensorSpec(
+                    shape=(self.config.hidden_size, ),
+                    dtype=self.model_config.torch_dtype,
+                ),
+                "cos":
+                EncoderGraphTensorSpec(
+                    shape=(rotary_dim, ),
+                    dtype=self.model_config.torch_dtype,
+                ),
+                "sin":
+                EncoderGraphTensorSpec(
+                    shape=(rotary_dim, ),
+                    dtype=self.model_config.torch_dtype,
+                ),
+                "rope_position_ids":
+                EncoderGraphTensorSpec(
+                    shape=(),
+                    dtype=torch.int32,
+                ),
+            },
+            output_specs={"hidden_states": 0},
+            config=config,
+            capture_on_first_use=True,
+        )
+
+    def _encoder_graph_fn(
+        self,
+        inputs: Mapping[str, torch.Tensor],
+        metadata: _Qwen2_5_VisionGraphMetadata,
+    ) -> Dict[str, torch.Tensor]:
+        return {
+            "hidden_states":
+            self._run_encoder_blocks(
+                inputs["hidden_states"],
+                inputs["cos"],
+                inputs["sin"],
+                inputs["rope_position_ids"],
+                metadata.full,
+                metadata.window,
+            )
+        }
+
+    def _run_blocks(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        rope_position_ids: torch.Tensor,
+        seq_lens: Sequence[int],
+        window_seq_lens: Sequence[int],
+    ) -> torch.Tensor:
+        if self._blocks_graph_runner is not None:
+            graph_outputs = self._blocks_graph_runner.maybe_run(
+                seq_lengths=seq_lens,
+                layout=_Qwen2_5_VisionGraphLayout(
+                    full_seq_lens=tuple(seq_lens),
+                    window_seq_lens=tuple(window_seq_lens),
+                ),
+                inputs={
+                    "hidden_states": hidden_states,
+                    "cos": cos,
+                    "sin": sin,
+                    "rope_position_ids": rope_position_ids,
+                },
+            )
+            if graph_outputs is not None:
+                return graph_outputs["hidden_states"]
+
+        assert self.full_attn_metadata is not None
+        assert self.window_attn_metadata is not None
+        return self._run_encoder_blocks(
+            hidden_states,
+            cos,
+            sin,
+            rope_position_ids,
+            self.full_attn_metadata,
+            self.window_attn_metadata,
+        )
+
+    def _run_encoder_blocks(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        rope_position_ids: torch.Tensor,
+        full_attn_metadata: AttentionMetadata,
+        window_attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        position_embeddings = (cos, sin)
+        for layer_num, block in enumerate(self.blocks):
+            attn_metadata = (full_attn_metadata
+                             if layer_num in self.fullatt_block_indexes else
+                             window_attn_metadata)
+            hidden_states = block(
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                position_embeddings=position_embeddings,
+                position_ids=rope_position_ids,
+            )
+        return hidden_states
+
     @torch.inference_mode()
     def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor,
                 **kwargs) -> torch.Tensor:
@@ -2339,8 +2508,6 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         # cat runs on device with no H->D transfer.
         cos = torch.cat(rotary_pos_emb_cos)
         sin = torch.cat(rotary_pos_emb_sin)
-        position_embeddings = (cos, sin)
-
         # window_index is built per tile on CPU (lru_cached). The cat
         # result is a fresh pageable tensor, so route the H->D copy
         # through async_tensor_h2d to land it on a pinned host buffer
@@ -2379,21 +2546,108 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
             self.window_attn_metadata,
             max_seq_len=self._window_attn_max_seq_len)
 
-        for layer_num, block in enumerate(self.blocks):
-            if layer_num in self.fullatt_block_indexes:
-                attn_metadata = self.full_attn_metadata
-            else:
-                attn_metadata = self.window_attn_metadata
-            hidden_states = block(
-                hidden_states=hidden_states,
-                attn_metadata=attn_metadata,
-                position_embeddings=position_embeddings,
-                position_ids=rope_position_ids,
-            )
+        hidden_states = self._run_blocks(
+            hidden_states,
+            cos,
+            sin,
+            rope_position_ids,
+            seq_lens,
+            window_seq_lens,
+        )
         hidden_states = self.merger(hidden_states)
         hidden_states = hidden_states[reverse_indices, :]
 
         return hidden_states
+
+
+class _Qwen2_5_VisionEncoderMetadataProvider(EncoderMetadataProvider):
+    """Own fixed-address full/window attention metadata for graph replay."""
+
+    graph_critical_attrs: Sequence[str] = (
+        "full._seq_lens_cuda",
+        "full.cu_q_seqlens",
+        "full.cu_kv_seqlens",
+        "full.cuda_graph_workspace",
+        "window._seq_lens_cuda",
+        "window.cu_q_seqlens",
+        "window.cu_kv_seqlens",
+        "window.cuda_graph_workspace",
+    )
+
+    def __init__(self, vision: Qwen2_5_VisionModel) -> None:
+        self._vision = vision
+
+    def build(
+        self,
+        key: EncoderGraphKey,
+        layout: Optional[Hashable] = None,
+    ) -> _Qwen2_5_VisionGraphMetadata:
+        vision = self._vision
+        if not isinstance(layout, _Qwen2_5_VisionGraphLayout):
+            raise TypeError(
+                "Qwen2.5-VL encoder CUDA graph layout must contain exact "
+                "full and window attention sequence lengths.")
+        full_seq_lens = layout.full_seq_lens
+        window_seq_lens = layout.window_seq_lens
+        if (len(full_seq_lens) != key.num_contexts
+                or sum(full_seq_lens) != key.total_tokens
+                or sum(window_seq_lens) != key.total_tokens):
+            raise ValueError(
+                "Qwen2.5-VL full/window attention layout does not match "
+                f"graph bucket {key}: got full={full_seq_lens}, "
+                f"window={window_seq_lens}.")
+
+        full_template = vision.full_attn_metadata
+        window_template = vision.window_attn_metadata
+        assert full_template is not None
+        assert window_template is not None
+        if (key.num_contexts > full_template.max_num_requests
+                or key.total_tokens > full_template.max_num_tokens
+                or len(window_seq_lens) > window_template.max_num_requests
+                or key.total_tokens > window_template.max_num_tokens):
+            raise ValueError(
+                f"Qwen2.5-VL encoder CUDA graph bucket {key} exceeds the "
+                "configured full/window attention metadata capacity.")
+
+        full = full_template.create_cuda_graph_metadata(key.num_contexts,
+                                                        encode_only=True)
+        window = window_template.create_cuda_graph_metadata(
+            len(window_seq_lens), encode_only=True)
+        for metadata, num_contexts in ((full, key.num_contexts),
+                                       (window, len(window_seq_lens))):
+            # create_cuda_graph_metadata() shallow-copies its template. Give
+            # each deferred graph an independent attention workspace so a
+            # later, larger live capture cannot resize a buffer already baked
+            # into an earlier graph.
+            metadata.cuda_graph_workspace = torch.empty(0,
+                                                        dtype=torch.int8,
+                                                        device=vision.device)
+            bind_seq_lens = getattr(metadata,
+                                    "bind_encoder_cuda_graph_seq_lens", None)
+            if callable(bind_seq_lens):
+                bind_seq_lens(metadata.seq_lens, num_contexts)
+        return _Qwen2_5_VisionGraphMetadata(full=full, window=window)
+
+    def refresh_in_place(
+        self,
+        metadata: _Qwen2_5_VisionGraphMetadata,
+        padded_seq_lengths: Sequence[int],
+        layout: Optional[Hashable] = None,
+    ) -> None:
+        if not isinstance(layout, _Qwen2_5_VisionGraphLayout):
+            raise TypeError(
+                "Qwen2.5-VL encoder CUDA graph layout must contain exact "
+                "full and window attention sequence lengths.")
+        self._vision.prepare_attn_metadata(
+            list(layout.full_seq_lens),
+            metadata.full,
+            max_seq_len=self._vision._full_attn_max_seq_len,
+        )
+        self._vision.prepare_attn_metadata(
+            list(layout.window_seq_lens),
+            metadata.window,
+            max_seq_len=self._vision._window_attn_max_seq_len,
+        )
 
 
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):

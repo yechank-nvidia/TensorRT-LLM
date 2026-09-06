@@ -6,8 +6,8 @@ import copy
 import dataclasses
 import math
 from collections import namedtuple
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, Mapping,
-                    NamedTuple, Optional, Sequence, Tuple, Type, Union)
+from typing import (TYPE_CHECKING, Dict, Hashable, Iterable, List, Literal,
+                    Mapping, NamedTuple, Optional, Sequence, Tuple, Type, Union)
 
 import torch
 import torch.nn as nn
@@ -964,7 +964,11 @@ class _VisionEncoderMetadataProvider(EncoderMetadataProvider):
                 "_ragged_kv_indptr_buf",
             )
 
-    def build(self, key: EncoderGraphKey) -> AttentionMetadata:
+    def build(
+        self,
+        key: EncoderGraphKey,
+        _layout: Optional[Hashable] = None,
+    ) -> AttentionMetadata:
         vit = self._vit
         metadata_kwargs = dict(
             max_num_requests=max(vit.attn_metadata.max_num_requests,
@@ -979,8 +983,12 @@ class _VisionEncoderMetadataProvider(EncoderMetadataProvider):
         md.is_cuda_graph = True
         return md
 
-    def refresh_in_place(self, metadata: AttentionMetadata,
-                         padded_seq_lengths: Sequence[int]) -> None:
+    def refresh_in_place(
+        self,
+        metadata: AttentionMetadata,
+        padded_seq_lengths: Sequence[int],
+        _layout: Optional[Hashable] = None,
+    ) -> None:
         # Reuse the eager path so both modes go through the same setter logic; the captured graph
         # holds the metadata's tensor addresses.
         self._vit.prepare_attn_metadata(len(padded_seq_lengths),

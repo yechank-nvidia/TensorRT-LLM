@@ -311,6 +311,7 @@ def reorder_multimodal_embeddings_by_modality(
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
     from ..pyexecutor.llm_request import LlmRequest
+    from .multimodal_encoder_graph import MultimodalEncoderGraphRunner
 
 
 _MM_DATA_INPUT_MODALITY_KEYS = frozenset({"audio", "image", "video"})
@@ -590,6 +591,14 @@ class MultimodalModelMixin:
     ) -> list[torch.Tensor]:
         """Delegate item execution to the encoder contract."""
         return MultimodalEncoderMixin.forward_multimodal_encoder_items(self, encoder_inputs)
+
+    def enable_multimodal_encoder_cuda_graph(
+        self,
+    ) -> Optional["MultimodalEncoderGraphRunner"]:
+        """Enable the local encoder's CUDA graph implementation, if present."""
+        encoder = getattr(self, "mm_encoder", None)
+        enable_cuda_graph = getattr(encoder, "enable_cuda_graph", None)
+        return enable_cuda_graph() if callable(enable_cuda_graph) else None
 
     @property
     def multimodal_token_ids(self) -> Optional[Sequence[int] | torch.Tensor]:

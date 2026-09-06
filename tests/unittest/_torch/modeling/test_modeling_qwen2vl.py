@@ -115,6 +115,7 @@ def test_qwen2_5_vision_patch_projection_matches_conv3d(monkeypatch) -> None:
     vision.patch_embed = patch_embed
     vision.spatial_merge_unit = 1
     vision._rope_position_ids_buffer = None
+    vision._blocks_graph_runner = None
     vision.full_attn_metadata = object()
     vision.window_attn_metadata = object()
     vision._full_attn_max_seq_len = 6
@@ -138,6 +139,41 @@ def test_qwen2_5_vision_patch_projection_matches_conv3d(monkeypatch) -> None:
     actual = vision(pixel_values, torch.tensor([[1, 2, 3]]))
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_qwen2_5_vision_passes_complete_layout_to_graph_runner() -> None:
+    expected = torch.randn(6, 8)
+    graph_runner = MagicMock()
+    graph_runner.maybe_run.return_value = {"hidden_states": expected}
+    vision = Qwen2_5_VisionModel.__new__(Qwen2_5_VisionModel)
+    torch.nn.Module.__init__(vision)
+    vision._blocks_graph_runner = graph_runner
+
+    actual = vision._run_blocks(
+        torch.randn(6, 8),
+        torch.randn(6, 4),
+        torch.randn(6, 4),
+        torch.arange(6, dtype=torch.int32),
+        [6],
+        [2, 4],
+    )
+
+    assert actual is expected
+    assert graph_runner.maybe_run.call_args.kwargs["seq_lengths"] == [6]
+    layout = graph_runner.maybe_run.call_args.kwargs["layout"]
+    assert layout.full_seq_lens == (6,)
+    assert layout.window_seq_lens == (2, 4)
+
+
+def test_qwen2vl_enables_local_encoder_cuda_graph() -> None:
+    encoder = MagicMock()
+    model = object.__new__(modeling_qwen2vl.Qwen2VLModelBase)
+    torch.nn.Module.__init__(model)
+    model.mm_encoder = encoder
+
+    model.enable_multimodal_encoder_cuda_graph()
+
+    encoder.enable_cuda_graph.assert_called_once_with()
 
 
 def test_qwen2_5_vision_attention_reuses_fused_qkv(monkeypatch) -> None:

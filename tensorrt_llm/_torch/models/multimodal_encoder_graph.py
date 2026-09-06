@@ -22,11 +22,13 @@ Design highlights:
 
 from __future__ import annotations
 
+from operator import attrgetter
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
     Dict,
+    Hashable,
     List,
     Mapping,
     NamedTuple,
@@ -43,7 +45,6 @@ from ..utils import make_weak_ref, torch_compiling
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import MultimodalEncoderCudaGraphConfig
-    from ..attention_backend import AttentionMetadata
 
 # Single token kept aside for the dummy padding context when `enable_padding=True`.
 # The attention backend rejects zero-length contexts, so the dummy must contain at least one token
@@ -93,7 +94,7 @@ class _CapturedGraph(NamedTuple):
 
     graph: torch.cuda.CUDAGraph
     inputs: Dict[str, torch.Tensor]
-    metadata: AttentionMetadata
+    metadata: Any
     # Each entry is a tensor view aliased to the captured output's memory via `make_weak_ref`; it
     # stays valid as long as the captured graph holds the underlying allocation alive.
     outputs: Dict[str, torch.Tensor]
@@ -102,10 +103,13 @@ class _CapturedGraph(NamedTuple):
     # so a reallocation would silently read stale memory.
     # See `EncoderMetadataProvider.graph_critical_attrs` for more detail.
     metadata_tensor_ptrs: Mapping[str, int]
+    # Complete graph topology for deferred capture. Startup-captured graphs do
+    # not need one because their metadata follows directly from the bucket.
+    layout: Optional[Hashable]
 
 
 class EncoderMetadataProvider(Protocol):
-    """Builds and refreshes the graph-owned `AttentionMetadata`.
+    """Builds and refreshes graph-owned encoder metadata.
 
     The runner takes a single provider object instead of two separate callbacks so the contract
     between `build` and `refresh_in_place` lives in one place:
@@ -124,13 +128,18 @@ class EncoderMetadataProvider(Protocol):
     # this list to anchor and verify `data_ptr()` stability across replays.
     graph_critical_attrs: Sequence[str]
 
-    def build(self, key: "EncoderGraphKey") -> "AttentionMetadata":
+    def build(
+        self,
+        key: "EncoderGraphKey",
+        layout: Optional[Hashable] = None,
+    ) -> Any:
         """Return a fresh metadata instance sized to `key`."""
 
     def refresh_in_place(
         self,
-        metadata: "AttentionMetadata",
+        metadata: Any,
         padded_seq_lengths: Sequence[int],
+        layout: Optional[Hashable] = None,
     ) -> None:
         """Mutate `metadata` in place for the next capture or replay."""
 
@@ -144,8 +153,10 @@ class MultimodalEncoderGraphRunner:
     and the mapping from real-input shapes to captured graph keys.
 
     The runner's existence is itself the enable signal; callers should only construct one when CUDA
-    graph capture is wanted. Captures are taken at startup for every configured bucket, and the
-    captured set is fixed for the runner's lifetime.
+    graph capture is wanted. Most encoders capture every configured bucket at startup. Encoders
+    whose attention layout cannot be derived from the bucket may defer capture until the first real
+    use of each bucket. Deferred capture retains one observed layout per bucket and falls back to
+    eager for a different layout, bounding graph memory by the configured bucket count.
 
     Args:
         encoder_fn: Callable invoked once per warmup step and once during capture. It receives the
@@ -161,24 +172,27 @@ class MultimodalEncoderGraphRunner:
             only the token axis is needed, to slice each output back to the real token extent.
         config: Configuration object containing buckets and padding policy. See
             `MultimodalEncoderCudaGraphConfig`.
+        capture_on_first_use: Defer each bucket's capture until its first matching real input. This
+            is used when the bucket dimensions alone do not describe the encoder's attention
+            layout.
     """
 
     def __init__(
         self,
         *,
-        encoder_fn: Callable[
-            [Mapping[str, torch.Tensor], AttentionMetadata], Mapping[str, torch.Tensor]
-        ],
+        encoder_fn: Callable[[Mapping[str, torch.Tensor], Any], Mapping[str, torch.Tensor]],
         metadata_provider: EncoderMetadataProvider,
         input_specs: Mapping[str, EncoderGraphTensorSpec],
         output_specs: Mapping[str, int],
         config: MultimodalEncoderCudaGraphConfig,
+        capture_on_first_use: bool = False,
     ) -> None:
         self._encoder_fn = encoder_fn
         self._metadata_provider = metadata_provider
         self._input_specs: Dict[str, EncoderGraphTensorSpec] = dict(input_specs)
         self._output_specs: Dict[str, int] = dict(output_specs)
         self._config = config
+        self._capture_on_first_use = capture_on_first_use
         # Adopted from the first captured graph so subsequent bucket captures share the pool.
         self._memory_pool = None
 
@@ -196,14 +210,15 @@ class MultimodalEncoderGraphRunner:
         )
         self._log_cuda_graph_memory_warning()
 
-        # One captured graph per internal key. Populated by `capture_all` and fixed for the runner's
-        # lifetime; `maybe_run` never adds entries.
+        # One captured graph per internal key. Normal runners populate this at startup; deferred
+        # runners populate it on the first matching real input.
         self._captured: Dict[EncoderGraphKey, _CapturedGraph] = {}
         self._warned_no_bucket_match: bool = False
         self._replay_stats_enabled: bool = config.enable_replay_stats
         self._replay_count: int = 0
         self._no_bucket_fallback_count: int = 0
         self._missing_capture_fallback_count: int = 0
+        self._layout_fallback_count: int = 0
         self._useful_token_count: int = 0
         self._padding_token_count: int = 0
         self._fallback_token_count: int = 0
@@ -216,8 +231,12 @@ class MultimodalEncoderGraphRunner:
         """Capture every configured bucket up front.
 
         `enable_padding=True` captures the with-dummy-context variant for each bucket;
-        `enable_padding=False` captures the exact-fit variant.
+        `enable_padding=False` captures the exact-fit variant. Deferred runners intentionally do
+        nothing here because their complete metadata layout is only known from a real request.
         """
+        if self._capture_on_first_use:
+            return
+
         # Capture larger workloads first. Attention backends may share a graph workspace across
         # metadata variants; warming up a later, larger workload can resize that workspace and
         # invalidate pointers captured by an earlier graph. This matches the ordering used by the
@@ -234,6 +253,7 @@ class MultimodalEncoderGraphRunner:
         *,
         seq_lengths: Sequence[int],
         inputs: Mapping[str, torch.Tensor],
+        layout: Optional[Hashable] = None,
     ) -> Optional[Dict[str, torch.Tensor]]:
         """Replay a captured graph for `inputs` if one matches.
 
@@ -264,16 +284,43 @@ class MultimodalEncoderGraphRunner:
         )
         key = self._padded_key_for_bucket(bucket)
 
-        # Every selectable bucket is captured by `capture_all` before the runner is installed, so a
-        # miss here is not expected; fall back to eager rather than crash if it ever happens.
         captured = self._captured.get(key)
+
+        # A deferred runner binds each configured bucket to the first complete
+        # layout it observes. A later request with a different layout uses
+        # eager rather than adding an unbounded graph variant or replaying a
+        # graph whose kernel launch topology is wrong.
+        if self._capture_on_first_use:
+            if layout is None or (captured is not None and captured.layout != layout):
+                if self._replay_stats_enabled:
+                    self._layout_fallback_count += 1
+                    self._fallback_token_count += real_tokens
+                return None
+
+        if captured is None and self._capture_on_first_use:
+            assert layout is not None
+            first_input = next(iter(inputs.values()), None)
+            if first_input is None:
+                raise ValueError("Multimodal encoder CUDA graph inputs cannot be empty.")
+            self._capture_key(
+                key,
+                padded_seq_lengths,
+                first_input.device,
+                initial_inputs=inputs,
+                initial_real_tokens=real_tokens,
+                layout=layout,
+            )
+            captured = self._captured[key]
+
+        # Startup capture should have populated every selectable key. Keep eager fallback for a
+        # missing capture rather than turning an optional optimization into a serving failure.
         if captured is None:
             if self._replay_stats_enabled:
                 self._missing_capture_fallback_count += 1
                 self._fallback_token_count += real_tokens
             return None
-        self._copy_inputs_into_static(captured, inputs, real_tokens=real_tokens)
-        self._metadata_provider.refresh_in_place(captured.metadata, padded_seq_lengths)
+        self._copy_inputs_into_static(captured.inputs, inputs, real_tokens=real_tokens)
+        self._metadata_provider.refresh_in_place(captured.metadata, padded_seq_lengths, layout)
         self._assert_metadata_buffers_stable(captured.metadata, captured.metadata_tensor_ptrs)
         captured.graph.replay()
         if self._replay_stats_enabled:
@@ -290,6 +337,7 @@ class MultimodalEncoderGraphRunner:
             "graphReplays": self._replay_count,
             "graphNoBucketFallbacks": self._no_bucket_fallback_count,
             "graphMissingCaptureFallbacks": self._missing_capture_fallback_count,
+            "graphLayoutFallbacks": self._layout_fallback_count,
             "graphUsefulTokens": self._useful_token_count,
             "graphPaddingTokens": self._padding_token_count,
             "graphFallbackTokens": self._fallback_token_count,
@@ -297,6 +345,7 @@ class MultimodalEncoderGraphRunner:
         self._replay_count = 0
         self._no_bucket_fallback_count = 0
         self._missing_capture_fallback_count = 0
+        self._layout_fallback_count = 0
         self._useful_token_count = 0
         self._padding_token_count = 0
         self._fallback_token_count = 0
@@ -391,6 +440,10 @@ class MultimodalEncoderGraphRunner:
         key: EncoderGraphKey,
         padded_seq_lengths: Sequence[int],
         device: torch.device,
+        *,
+        initial_inputs: Optional[Mapping[str, torch.Tensor]] = None,
+        initial_real_tokens: Optional[int] = None,
+        layout: Optional[Hashable] = None,
     ) -> None:
         padded_seq_lengths = list(padded_seq_lengths)
         logger.info(f"Capturing multimodal encoder CUDA graph for key={key} on device={device}.")
@@ -399,11 +452,21 @@ class MultimodalEncoderGraphRunner:
             name: spec.materialize(key.total_tokens, device)
             for name, spec in self._input_specs.items()
         }
-        metadata = self._metadata_provider.build(key)
-        self._metadata_provider.refresh_in_place(metadata, padded_seq_lengths)
+        if initial_inputs is not None:
+            if initial_real_tokens is None:
+                raise ValueError("initial_real_tokens is required with initial_inputs.")
+            self._copy_inputs_into_static(
+                static_inputs, initial_inputs, real_tokens=initial_real_tokens
+            )
+        metadata = self._metadata_provider.build(key, layout)
+        self._metadata_provider.refresh_in_place(metadata, padded_seq_lengths, layout)
 
         capture_kwargs: Dict[str, Any] = {}
-        if self._memory_pool is not None:
+        # Startup capture uses largest-first ordering and can safely share the
+        # first graph's pool. Deferred capture follows live request order, so
+        # keep its pools independent rather than aliasing allocations across
+        # graphs that may replay in a different order.
+        if not self._capture_on_first_use and self._memory_pool is not None:
             capture_kwargs["pool"] = self._memory_pool
 
         graph = torch.cuda.CUDAGraph()
@@ -430,15 +493,15 @@ class MultimodalEncoderGraphRunner:
             metadata_tensor_ptrs=self._snapshot_metadata_tensor_ptrs(
                 metadata, self._metadata_provider.graph_critical_attrs
             ),
+            layout=layout,
         )
-        # Adopt the pool from the first captured graph so subsequent captures share it and reuse
-        # memory.
-        self._memory_pool = graph.pool()
+        if not self._capture_on_first_use:
+            # Startup captures run largest first, so later captures may reuse
+            # the first graph's pool.
+            self._memory_pool = graph.pool()
 
     @staticmethod
-    def _snapshot_metadata_tensor_ptrs(
-        metadata: AttentionMetadata, attrs: Sequence[str]
-    ) -> Dict[str, int]:
+    def _snapshot_metadata_tensor_ptrs(metadata: Any, attrs: Sequence[str]) -> Dict[str, int]:
         """Record the `data_ptr()` of each named attribute on `metadata`.
 
         Used after capture to anchor the addresses the captured graph reads from. `attrs` comes from
@@ -447,7 +510,7 @@ class MultimodalEncoderGraphRunner:
         """
         snapshot: Dict[str, int] = {}
         for name in attrs:
-            value = getattr(metadata, name)
+            value = attrgetter(name)(metadata)
             if not isinstance(value, torch.Tensor):
                 raise TypeError(
                     f"Encoder graph metadata attribute `{name}` was declared graph-critical but is "
@@ -457,9 +520,7 @@ class MultimodalEncoderGraphRunner:
         return snapshot
 
     @staticmethod
-    def _assert_metadata_buffers_stable(
-        metadata: AttentionMetadata, expected_ptrs: Mapping[str, int]
-    ) -> None:
+    def _assert_metadata_buffers_stable(metadata: Any, expected_ptrs: Mapping[str, int]) -> None:
         """Raise if any captured-time tensor has been rebound or moved.
 
         Catches the realistic failure mode where `refresh_in_place` accidentally reallocates a
@@ -468,7 +529,7 @@ class MultimodalEncoderGraphRunner:
         `copy_`).
         """
         for name, expected_ptr in expected_ptrs.items():
-            value = getattr(metadata, name)
+            value = attrgetter(name)(metadata)
             if not isinstance(value, torch.Tensor):
                 raise RuntimeError(
                     f"Encoder graph metadata attribute `{name}` was a tensor at capture time but "
@@ -486,7 +547,7 @@ class MultimodalEncoderGraphRunner:
 
     def _copy_inputs_into_static(
         self,
-        captured: _CapturedGraph,
+        static_inputs: Mapping[str, torch.Tensor],
         inputs: Mapping[str, torch.Tensor],
         *,
         real_tokens: int,
@@ -495,7 +556,7 @@ class MultimodalEncoderGraphRunner:
             if name not in inputs:
                 raise KeyError(f"Missing graph input '{name}' for multimodal encoder runner.")
             src = inputs[name]
-            dst = captured.inputs[name]
+            dst = static_inputs[name]
             self._copy_token_axis(dst, src, spec.token_dim, real_tokens)
 
     def _collect_outputs(

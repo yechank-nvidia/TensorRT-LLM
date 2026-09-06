@@ -1316,7 +1316,11 @@ class _Qwen3VisionEncoderMetadataProvider(EncoderMetadataProvider):
                 "_ragged_kv_indptr_buf",
             )
 
-    def build(self, key: EncoderGraphKey) -> AttentionMetadata:
+    def build(
+        self,
+        key: EncoderGraphKey,
+        _layout: Optional[Hashable] = None,
+    ) -> AttentionMetadata:
         vision = self._vision
         assert vision.attn_metadata is not None
         if (
@@ -1339,6 +1343,7 @@ class _Qwen3VisionEncoderMetadataProvider(EncoderMetadataProvider):
         self,
         metadata: AttentionMetadata,
         padded_seq_lengths: Sequence[int],
+        _layout: Optional[Hashable] = None,
     ) -> None:
         self._vision.prepare_attn_metadata(list(padded_seq_lengths), metadata)
 
@@ -1715,13 +1720,6 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         self.llm.model = torch.compile(
             self.llm.model, backend=backend, fullgraph=fullgraph, recompile_limit=recompile_limit
         )
-
-    def enable_multimodal_encoder_cuda_graph(
-        self,
-    ) -> Optional[MultimodalEncoderGraphRunner]:
-        if self.mm_encoder is not None:
-            return self.mm_encoder.enable_cuda_graph()
-        return None
 
     def init_mrope_embedding(self, model_config: ModelConfig[PretrainedConfig]):
         config = model_config.pretrained_config.text_config
