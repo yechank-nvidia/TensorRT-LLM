@@ -268,6 +268,41 @@ def test_reservation_limit_and_output_space_are_checked_separately() -> None:
     assert cache.current_bytes == 16
 
 
+def test_reuse_preference_evicts_largest_entry_without_a_hit() -> None:
+    cache = TensorLRUCache[str](max_bytes=12, prefer_reused_entries=True)
+    for key, numel in (("small", 1), ("large", 2)):
+        assert cache.acquire(key, numel * 4) is CacheAcquireResult.NEW_RESERVATION
+        cache.commit(key, torch.ones(numel, dtype=torch.float32))
+        assert cache.release(key) is None
+
+    assert cache.acquire("incoming", 4) is CacheAcquireResult.NEW_RESERVATION
+    assert cache.ensure_capacity(4) == ["large"]
+
+
+def test_reuse_preference_protects_hits_then_falls_back_to_lru() -> None:
+    cache = TensorLRUCache[str](max_bytes=12, prefer_reused_entries=True)
+    for key, numel in (("large", 2), ("small", 1)):
+        assert cache.acquire(key, numel * 4) is CacheAcquireResult.NEW_RESERVATION
+        cache.commit(key, torch.ones(numel, dtype=torch.float32))
+        assert cache.release(key) is None
+
+    assert cache.acquire("large", 8) is CacheAcquireResult.READY_HIT
+    assert cache.release("large") is None
+    assert cache.acquire("incoming", 4) is CacheAcquireResult.NEW_RESERVATION
+    assert cache.ensure_capacity(4) == ["small"]
+
+    cache = TensorLRUCache[str](max_bytes=12, prefer_reused_entries=True)
+    for key, numel in (("first", 1), ("second", 2)):
+        assert cache.acquire(key, numel * 4) is CacheAcquireResult.NEW_RESERVATION
+        cache.commit(key, torch.ones(numel, dtype=torch.float32))
+        assert cache.release(key) is None
+        assert cache.acquire(key, numel * 4) is CacheAcquireResult.READY_HIT
+        assert cache.release(key) is None
+
+    assert cache.acquire("incoming", 4) is CacheAcquireResult.NEW_RESERVATION
+    assert cache.ensure_capacity(4) == ["first"]
+
+
 def test_stream_aware_mode_leaves_cpu_cache_behavior_unchanged() -> None:
     cache = TensorLRUCache[str](max_bytes=16, cuda_stream_aware=True)
     source = torch.arange(4, dtype=torch.float32)

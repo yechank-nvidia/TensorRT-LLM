@@ -56,6 +56,7 @@ class _Entry:
     size_bytes: int
     reference_count: int
     retain_after_release: bool
+    was_reused: bool = False
     value: torch.Tensor | None = None
     # CUDA event recorded on the producing stream right after the clone in `put`. Consumers on a
     # different stream wait on it before reading `value`. `None` for CPU tensors or when the cache
@@ -139,6 +140,8 @@ class TensorLRUCache(Generic[K]):
         cuda_stream_aware: When enabled, synchronize CUDA tensor producers and consumers across
             streams and extend allocation lifetime through every consuming stream. CPU tensors are
             unaffected.
+        prefer_reused_entries: When enabled, `ensure_capacity` evicts entries
+            without a prior READY hit before entries that have been reused.
     """
 
     def __init__(
@@ -147,6 +150,7 @@ class TensorLRUCache(Generic[K]):
         *,
         name: str = "tensor_lru_cache",
         cuda_stream_aware: bool = False,
+        prefer_reused_entries: bool = False,
     ) -> None:
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
@@ -154,6 +158,7 @@ class TensorLRUCache(Generic[K]):
         self._max_bytes = max_bytes
         self._name = name
         self._cuda_stream_aware = cuda_stream_aware
+        self._prefer_reused_entries = prefer_reused_entries
         self._current_bytes = 0
         self._reserved_bytes = 0
         # READY tensor bytes held by live references and therefore not evictable.
@@ -232,6 +237,8 @@ class TensorLRUCache(Generic[K]):
                         return None
                     self._in_use_bytes += entry.size_bytes
                 entry.reference_count += 1
+                if self._prefer_reused_entries:
+                    entry.was_reused = True
                 self._items.move_to_end(key)
                 self._counters.hits += 1
                 return CacheAcquireResult.READY_HIT
@@ -360,10 +367,12 @@ class TensorLRUCache(Generic[K]):
         """Ensure physical space for selected outputs before they are produced.
 
         `incoming_bytes` is the total size of outputs selected for the next
-        producer commits. Only unreferenced READY entries are eligible LRU victims;
-        reservations and referenced tensors are never removed. The returned
-        keys let an authority replay the exact removals on peer caches. A
-        failure leaves the cache unchanged.
+        producer commits. Only unreferenced READY entries are eligible victims;
+        reservations and referenced tensors are never removed. With reuse
+        preference enabled, entries without a prior READY hit are considered
+        first, largest first; reused entries retain LRU order. The returned keys
+        let an authority replay the exact removals on peer caches. A failure
+        leaves the cache unchanged.
         """
         if incoming_bytes < 0:
             raise ValueError("incoming_bytes must be non-negative")
@@ -375,11 +384,22 @@ class TensorLRUCache(Generic[K]):
             if required_bytes == 0:
                 return []
 
+            eviction_candidates = [
+                (cache_key, entry)
+                for cache_key, entry in self._items.items()
+                if entry.state is _CacheEntryState.READY and entry.reference_count == 0
+            ]
+            if self._prefer_reused_entries:
+                eviction_candidates.sort(
+                    key=lambda item: (
+                        item[1].was_reused,
+                        0 if item[1].was_reused else -item[1].size_bytes,
+                    )
+                )
+
             entries_to_evict: list[tuple[K, _Entry]] = []
             freed_bytes = 0
-            for cache_key, entry in list(self._items.items()):
-                if entry.state is not _CacheEntryState.READY or entry.reference_count != 0:
-                    continue
+            for cache_key, entry in eviction_candidates:
                 entries_to_evict.append((cache_key, entry))
                 freed_bytes += entry.size_bytes
                 if freed_bytes >= required_bytes:

@@ -1247,6 +1247,7 @@ class MultimodalModelMixin:
             max_bytes,
             name=_MM_ENCODER_CACHE_LOG_NAME,
             cuda_stream_aware=multimodal_config.encoder_side_stream_max_ahead > 0,
+            prefer_reused_entries=True,
         )
         try:
             embedding_dim = self.embedding_dim
