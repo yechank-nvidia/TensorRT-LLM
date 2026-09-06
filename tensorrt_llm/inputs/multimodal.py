@@ -343,9 +343,9 @@ class MultimodalInput:
 class DisaggPrefillMultimodalInputs:
     """Typed multimodal metadata carried from encoder to prefill.
 
-    ``encoder_token_lengths`` is the producer-known cost of encoding each
-    item. Prefill uses it only when the handoff follows item scheduling; older
-    whole-request handoffs may omit it.
+    ``encoder_token_lengths`` is the producer-known upper bound on the
+    unpadded encoder tokens for each item. Prefill uses it only when the
+    handoff follows item scheduling; older whole-request handoffs may omit it.
     """
 
     prompt_token_ids: List[int]

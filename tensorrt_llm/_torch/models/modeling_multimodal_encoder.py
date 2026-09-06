@@ -73,6 +73,43 @@ class MultimodalEncoderMixin:
         """Run model-specific encoder work and return request-ordered rows."""
         raise NotImplementedError
 
+    def _get_mm_encoder_token_lengths(
+        self,
+        multimodal_param: MultimodalParams,
+        modality: str,
+    ) -> list[int]:
+        """Return the encoder-side token count for each prepared item.
+
+        Packed image/video encoders use one ``grid_thw`` row per item. Models
+        with another physical layout override this method rather than teaching
+        the scheduler about model-specific geometry.
+        """
+        modality_data = multimodal_param.multimodal_data.get(modality)
+        if not isinstance(modality_data, dict):
+            raise MultimodalEncoderContractError(
+                f"MM encoder {modality} data must be a dictionary")
+        grid_key = f"{modality}_grid_thw"
+        grids = modality_data.get(grid_key)
+        if (not isinstance(grids, torch.Tensor) or grids.ndim != 2
+                or grids.shape[1] != 3):
+            raise MultimodalEncoderContractError(
+                f"{type(self).__name__} must report MM encoder token "
+                f"lengths for {modality} inputs without {grid_key}")
+        token_lengths = [
+            int(length) for length in torch.prod(grids, dim=1).tolist()
+        ]
+        pixel_key = ("pixel_values"
+                     if modality == "image" else "pixel_values_videos")
+        pixel_values = modality_data.get(pixel_key)
+        if (not isinstance(pixel_values, torch.Tensor)
+                or pixel_values.shape[0] != sum(token_lengths)):
+            actual_rows = (pixel_values.shape[0] if isinstance(
+                pixel_values, torch.Tensor) else None)
+            raise MultimodalEncoderContractError(
+                f"MM encoder {modality} grids require "
+                f"{sum(token_lengths)} packed pixel rows, got {actual_rows}")
+        return token_lengths
+
     def prepare_multimodal_encoder_inputs(
         self,
         selected_items: Sequence[tuple[MultimodalParams, int]],
@@ -98,12 +135,35 @@ class MultimodalEncoderMixin:
                 )
                 self._apply_metadata_slice(residual, multimodal_param,
                                            run_indices)
+                actual_token_lengths = self._get_mm_encoder_token_lengths(
+                    residual, modality)
             except MultimodalEncoderContractError:
                 raise
             except (KeyError, IndexError, TypeError, ValueError) as error:
                 raise MultimodalEncoderContractError(
                     f"Invalid multimodal encoder item input: {error}"
                 ) from error
+            declared_token_lengths = [
+                int(item_metadata.encoder_token_lengths[i]) for i in run_indices
+            ]
+            if len(actual_token_lengths) != len(declared_token_lengths):
+                raise MultimodalEncoderContractError(
+                    f"MM encoder prepared {len(actual_token_lengths)} "
+                    f"{modality} item(s), but item metadata declares "
+                    f"{len(declared_token_lengths)}")
+            for item_idx, actual, declared in zip(run_indices,
+                                                  actual_token_lengths,
+                                                  declared_token_lengths,
+                                                  strict=True):
+                if actual <= 0:
+                    raise MultimodalEncoderContractError(
+                        f"MM encoder item {item_idx} has non-positive token "
+                        f"length {actual}")
+                if actual > declared:
+                    raise MultimodalEncoderContractError(
+                        f"MM encoder item {item_idx} requires {actual} tokens, "
+                        f"but item metadata declares an upper bound of "
+                        f"{declared}")
             encoder_inputs.append((
                 residual,
                 [

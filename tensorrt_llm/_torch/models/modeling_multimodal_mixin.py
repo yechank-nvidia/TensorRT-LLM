@@ -585,6 +585,16 @@ class MultimodalModelMixin:
         """Delegate selected-item preparation to the encoder contract."""
         return MultimodalEncoderMixin.prepare_multimodal_encoder_inputs(self, selected_items)
 
+    def _get_mm_encoder_token_lengths(
+        self,
+        multimodal_param: MultimodalParams,
+        modality: str,
+    ) -> list[int]:
+        """Delegate model-side encoder cost observation to the encoder contract."""
+        return MultimodalEncoderMixin._get_mm_encoder_token_lengths(
+            self, multimodal_param, modality
+        )
+
     def forward_multimodal_encoder_items(
         self,
         encoder_inputs: Sequence[tuple[MultimodalParams, list[int], str]],

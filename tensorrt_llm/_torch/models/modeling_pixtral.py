@@ -10,11 +10,15 @@ from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.attention_backend import interface as attention_interface
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
-from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import (
+    MultimodalEncoderContractError,
+    MultimodalEncoderMixin,
+)
 from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import gated_mlp as trtllm_gated_mlp
 from tensorrt_llm._torch.modules import rms_norm as trtllm_rmsnorm
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 
 class PixtralAttention(trtllm_attention.Attention):
@@ -215,6 +219,32 @@ class PixtralVisionModel(torch.nn.Module, MultimodalEncoderMixin):
         token bound into :meth:`setup_attn_metadata`.
         """
         return {"attention": max(1, max_num_tokens)}
+
+    def _get_mm_encoder_token_lengths(
+        self,
+        multimodal_param: MultimodalParams,
+        modality: str,
+    ) -> list[int]:
+        """Return the patch rows Pixtral attention will process per image."""
+        if modality != "image":
+            return super()._get_mm_encoder_token_lengths(multimodal_param, modality)
+        modality_data = multimodal_param.multimodal_data.get(modality)
+        if not isinstance(modality_data, dict):
+            raise MultimodalEncoderContractError("MM encoder image data must be a dictionary")
+        image_sizes = modality_data.get("image_sizes")
+        if image_sizes is None:
+            raise MultimodalEncoderContractError("Pixtral MM encoder input requires image_sizes")
+        pixel_values = modality_data.get("pixel_values")
+        if not isinstance(pixel_values, torch.Tensor) or pixel_values.shape[0] != len(image_sizes):
+            actual_items = pixel_values.shape[0] if isinstance(pixel_values, torch.Tensor) else None
+            raise MultimodalEncoderContractError(
+                f"Pixtral MM encoder received {actual_items} image tensors "
+                f"for {len(image_sizes)} image sizes"
+            )
+        return [
+            (int(size[0]) // self._patch_size) * (int(size[1]) // self._patch_size)
+            for size in image_sizes
+        ]
 
     @torch.inference_mode()
     def forward(

@@ -948,6 +948,18 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         mm_embeds = self._vision_forward(list(multimodal_params))
         return mm_embeds[0]
 
+    def _get_mm_encoder_token_lengths(
+        self,
+        multimodal_param: MultimodalParams,
+        modality: str,
+    ) -> list[int]:
+        """Use the loaded Pixtral encoder geometry for item-cost validation."""
+        if self._vision_tower is None:
+            raise ValueError(
+                "Raw multimodal inputs require a local multimodal encoder.")
+        return self._vision_tower._get_mm_encoder_token_lengths(
+            multimodal_param, modality)
+
     def get_language_model_extra_forward_kwargs(
         self,
         *,

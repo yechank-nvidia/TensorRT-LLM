@@ -77,11 +77,14 @@ class MultimodalEncoderItemMetadata(NamedTuple):
     """
 
     encoder_token_lengths: List[int]
-    """Physical encoder attention-token cost of each item.
+    """Upper bound on unpadded encoder attention tokens for each item.
 
-    This is what one encoder forward actually attends over (for example,
-    pre-merger patch tokens for Qwen ViTs) and is the unit the scheduler
-    charges against ``encoder_max_num_tokens``.
+    For example, this counts pre-merger patch tokens for Qwen ViTs. The
+    scheduler charges this value against ``encoder_max_num_tokens``; the
+    selected-item execution path rejects a model-side token count above the
+    declaration before launching the encoder. Backend padding for CUDA graph
+    buckets is accounted by the graph runner rather than attributed to an
+    individual item.
     """
 
     output_embedding_lengths: List[int]

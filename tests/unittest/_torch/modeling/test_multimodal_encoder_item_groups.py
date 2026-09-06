@@ -229,6 +229,37 @@ def test_partial_selection_only_encodes_selected_items():
     assert model.encoder_calls == [ITEM_ROWS["image"][1]]
 
 
+def test_item_preparation_rejects_underdeclared_encoder_tokens():
+    model = _GroupedEncoderModel()
+    request = _make_request(["image"])
+    metadata = request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata._replace(
+        encoder_token_lengths=[metadata.encoder_token_lengths[0] - 1]
+    )
+
+    with pytest.raises(
+        MultimodalEncoderContractError,
+        match="requires 2 tokens, but item metadata declares an upper bound of 1",
+    ):
+        model.prepare_multimodal_encoder_inputs([(request, 0)])
+
+    assert model.encoder_calls == []
+
+
+def test_item_preparation_accepts_conservative_encoder_token_bound():
+    model = _GroupedEncoderModel()
+    request = _make_request(["image"])
+    metadata = request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata._replace(
+        encoder_token_lengths=[metadata.encoder_token_lengths[0] + 1]
+    )
+
+    encoder_inputs = model.prepare_multimodal_encoder_inputs([(request, 0)])
+
+    assert len(encoder_inputs) == 1
+    assert model.encoder_calls == []
+
+
 def test_model_engine_uses_standalone_encoder_provider(monkeypatch):
     """Encoder-only models resolve a capable provider without model dispatch."""
     provider = _GroupedEncoderProvider()

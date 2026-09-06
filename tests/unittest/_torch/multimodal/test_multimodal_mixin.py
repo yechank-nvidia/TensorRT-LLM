@@ -34,7 +34,10 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
     MultimodalRuntimeData,
 )
-from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
+from tensorrt_llm.inputs.registry import (
+    MultimodalEncoderItemMetadata,
+    get_multimodal_encoder_item_metadata,
+)
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderSchedulingPolicy
 from tensorrt_llm.mapping import Mapping
 
@@ -154,6 +157,14 @@ class DataParallelEncoderMultimodalModel(DummyMultimodalModel):
         )
         self.peer_output = None
         self.encoded_item_ids = []
+
+    def _get_mm_encoder_token_lengths(self, multimodal_param, modality):
+        # This synthetic encoder has no patch geometry; its test contract
+        # defines the metadata values as the work performed by each item.
+        del modality
+        metadata = get_multimodal_encoder_item_metadata(multimodal_param.multimodal_data)
+        assert metadata is not None
+        return metadata.encoder_token_lengths
 
     def encode_multimodal_inputs(self, multimodal_params, **encoder_kwargs) -> torch.Tensor:
         rows = []

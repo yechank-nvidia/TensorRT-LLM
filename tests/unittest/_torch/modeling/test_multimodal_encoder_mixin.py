@@ -12,6 +12,7 @@ avoid pulling in any real attention backend (and any GPU/CUDA dependency).
 
 from types import SimpleNamespace
 
+import torch
 import torch.nn as nn
 
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import (
@@ -20,6 +21,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_encoder import (
 )
 from tensorrt_llm._torch.models.modeling_pixtral import PixtralVisionModel
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VisionModel
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 
 class _StubMetadata:
@@ -117,6 +119,22 @@ def test_pixtral_conservatively_allows_one_context_per_token():
 
     encoder.setup_attn_metadata(max_num_tokens=3)
     assert encoder.attn_metadata.kwargs["max_num_requests"] == 3
+
+
+def test_pixtral_reports_encoder_tokens_from_loaded_patch_geometry():
+    encoder = SimpleNamespace(_patch_size=16)
+    multimodal_param = MultimodalParams(
+        multimodal_data={
+            "image": {
+                "image_sizes": [[32, 48], [16, 64]],
+                "pixel_values": torch.empty(2, 3, 32, 64),
+            }
+        }
+    )
+
+    lengths = PixtralVisionModel._get_mm_encoder_token_lengths(encoder, multimodal_param, "image")
+
+    assert lengths == [6, 4]
 
 
 def test_qwen3_maps_token_budget_to_temporal_attention_contexts():

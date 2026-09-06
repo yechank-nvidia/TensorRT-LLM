@@ -110,10 +110,12 @@ class MultimodalEncoderRequestState:
     """Expected encoder-output rows for each item, in prompt order."""
 
     encoder_token_lengths: List[int]
-    """Validated encoder token cost for each item.
+    """Declared encoder token upper bound for each item.
 
     Admission copies these values from the request metadata so scheduling
-    never has to re-validate user input inside the scheduler loop.
+    never has to re-validate user input inside the scheduler loop. Selected
+    item execution validates the declaration against model-side geometry
+    before launching the encoder.
     """
 
     item_cache_keys: List[Optional[Hashable]] = field(default_factory=list)
@@ -1362,7 +1364,7 @@ def get_mm_items_for_chunk(request: LlmRequest, chunk_start: int,
 
 def get_multimodal_encoder_token_lengths(
         request: LlmRequest) -> Optional[List[int]]:
-    """Return per-item physical encoder attention-token costs.
+    """Return per-item unpadded encoder attention-token upper bounds.
 
     Local encoder requests carry the costs in item metadata. E/P prefill
     requests carry only the flat cost list because they do not need the
