@@ -19,6 +19,12 @@ from tensorrt_llm._torch.models.modeling_qwen2vl import (
 )
 
 
+def test_concrete_qwen_vl_models_support_encoder_cache() -> None:
+    assert not modeling_qwen2vl.Qwen2VLModelBase.supports_encoder_cache
+    assert modeling_qwen2vl.Qwen2VLModel.supports_encoder_cache
+    assert modeling_qwen2vl.Qwen2_5_VLModel.supports_encoder_cache
+
+
 @pytest.mark.parametrize(
     ("modality", "processor_name", "output_name"),
     [

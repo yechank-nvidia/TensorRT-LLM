@@ -2711,6 +2711,7 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         content_format=ContentFormat.STRING,
     ))
 class Qwen2VLModel(Qwen2VLModelBase):
+    supports_encoder_cache = True
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
@@ -2839,6 +2840,7 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
         content_format=ContentFormat.STRING,
     ))
 class Qwen2_5_VLModel(Qwen2VLModelBase):
+    supports_encoder_cache = True
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
