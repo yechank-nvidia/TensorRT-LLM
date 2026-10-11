@@ -1661,10 +1661,20 @@ class Qwen2_5_VLVisionAttention(Attention):
         q, k, v = self.split_qkv(q, k, v)
 
         q, k, v = self.apply_rope(q, k, v, position_ids, position_embeddings)
+        reuse_qkv = False
         if self.support_fused_qkv:
-            # RoPE updates Q/K in their views of the fused projection. Reuse
-            # that buffer instead of copying Q/K/V back together every layer.
+            # Only reuse the projection when RoPE preserves every original
+            # view's storage, offset, shape, stride, and dtype.
+            projected_qkv = qkv.split([self.q_size, self.kv_size, self.kv_size],
+                                      dim=-1)
+            reuse_qkv = all(
+                rotated.dtype == projected.dtype
+                and rotated.is_set_to(projected)
+                for rotated, projected in zip((q, k, v), projected_qkv))
+        if reuse_qkv:
             q, k, v = qkv, None, None
+        else:
+            q, k, v = self.convert_qkv(q, k, v)
 
         output = self.forward_impl(
             q=q,
