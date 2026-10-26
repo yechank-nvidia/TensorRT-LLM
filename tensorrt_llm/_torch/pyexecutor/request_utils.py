@@ -17,6 +17,7 @@ from tensorrt_llm.mapping import CpType
 from ..distributed import Distributed
 from .hang_detector import HangDetector
 from .llm_request import ExecutorRequest, LlmRequest, executor_request_to_llm_request
+from .tp_bcast_handles import TpBroadcastHandles
 
 # Type alias for request queue items (to avoid circular import)
 # The actual RequestQueueItem class is defined in executor_request_queue.py
@@ -373,17 +374,22 @@ def merge_requests(
 class RequestBroadcaster:
     """Broadcasts requests across distributed ranks (TP, PP, CP)."""
 
+    # Python objects from ``_collect_py_objects`` whose tensors local TP peers
+    # may map from shared storage.
+    _SHARED_TENSOR_ATTRIBUTES = ("py_multimodal_data",)
+
     def __init__(self, dist: Distributed, hang_detector: HangDetector):
         self.dist = dist
         self.hang_detector = hang_detector
         self.send_requests_handler = None
+        # Local TP peers map shared tensors instead of receiving their bytes.
         self.tp_handles = None
-        from ..distributed.communicator import MPIDist
-
-        if isinstance(dist, MPIDist) and not dist.has_pp and dist.tp_size == dist.world_size > 1:
-            from .tp_bcast_handles import TpBroadcastHandles
-
-            self.tp_handles = TpBroadcastHandles(dist)
+        if (
+            getattr(dist, "supports_local_tensor_handles", False)
+            and not dist.has_pp
+            and dist.tp_size == dist.world_size > 1
+        ):
+            self.tp_handles = TpBroadcastHandles(dist, self._SHARED_TENSOR_ATTRIBUTES)
 
     def broadcast(
         self, new_requests: List, prefer_cpu: bool = False

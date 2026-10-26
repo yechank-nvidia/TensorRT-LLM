@@ -1,24 +1,46 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Shared-storage transport for eligible local tensor-parallel requests."""
+"""Request broadcast that shares tensors with local tensor-parallel ranks.
+
+Rank 0 exports each eligible tensor once per receiving rank through
+``SharedTensorContainer`` (CPU shared memory or CUDA IPC) and broadcasts the
+small handles instead of the tensor bytes. Peers map the handles to local views.
+
+Lifetime: every export takes one reference. A peer that maps a handle releases
+that reference when its view is freed, through the normal request teardown.
+One acknowledgement allgather per broadcast that carries handles tells rank 0
+which handles were not mapped, and rank 0 releases those references itself.
+
+Failure handling: an export or mapping error does not fail the request. The
+batch is sent again as bytes, and the helper stays on the byte path for the
+rest of the run. A payload that cannot be pickled still raises, as it does
+on the byte path.
+
+Shared tensors are views of the same memory on every rank, so consumers must
+not modify them in place.
+"""
 
 import socket
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 import torch
 from torch.utils._pytree import tree_map
 
 from tensorrt_llm.logger import logger
 
-from ..distributed.communicator import MPIDist
+from ..distributed.communicator import Distributed, SerializationError
 from ..shared_tensor import SharedTensorContainer
 from ..shared_tensor.shared_tensor import DTYPE_MAPPING
+
+_SHAREABLE_DTYPES = frozenset(DTYPE_MAPPING.values())
 
 
 @dataclass
 class _TensorHandles:
-    handles: tuple
+    """Exported handles of one tensor, one per receiving rank (rank 1 first)."""
+
+    handles: Tuple[Dict[str, Any], ...]
 
 
 def _map_tensors(value: Any, operation: Callable[[Any], Any]) -> Any:
@@ -27,50 +49,110 @@ def _map_tensors(value: Any, operation: Callable[[Any], Any]) -> Any:
     )
 
 
-def _retire(container: SharedTensorContainer) -> None:
-    """Retire one exported reference that no receiver reconstructed."""
-    handle = container.tensor_handle
-    if container.method_key == 2:
-        handle[1]._shared_decref()
-    else:
-        torch.UntypedStorage._release_ipc_counter(handle[11], handle[12], device=handle[6])
+def _can_share(tensor: torch.Tensor) -> bool:
+    """Whether a tensor can be sent as a handle; other tensors are pickled as bytes."""
+    return (
+        tensor.layout == torch.strided
+        and tensor.device.type in ("cpu", "cuda")
+        and tensor.dtype in _SHAREABLE_DTYPES
+        and tensor.numel() > 0
+        and not tensor.requires_grad
+        and not tensor.is_neg()
+    )
 
 
 class TpBroadcastHandles:
-    def __init__(self, dist: MPIDist) -> None:
-        self.dist = dist
-        self.same_host: bool | None = None
+    """Broadcast requests to local TP ranks with shared tensor storage.
 
-    def broadcast(self, requests: list, py_objects: tuple | None) -> tuple:
+    It is a drop-in replacement for ``dist.broadcast((requests, py_objects),
+    root=0)`` when all ranks are tensor-parallel peers of one host. Only the
+    tensors inside the named request attributes are shared. All other values,
+    and tensors that cannot be shared, are pickled as before.
+
+    Collectives: one hostname allgather on first use. Then, per call, the
+    payload broadcast, plus one acknowledgement allgather when the payload
+    carries handles. Iterations without shareable tensors add no collective.
+    """
+
+    def __init__(self, dist: Distributed, tensor_attributes: Iterable[str]) -> None:
+        """Create the helper.
+
+        Args:
+            dist: Transport whose ranks are all TP peers.
+            tensor_attributes: Names of the request attributes in
+                ``py_objects`` whose tensors are shared.
+        """
+        self.dist = dist
+        self.tensor_attributes: FrozenSet[str] = frozenset(tensor_attributes)
+        # None until the first call checks that all ranks share one host.
+        self.enabled: Optional[bool] = None
+
+    def _disable(self, reason: str) -> None:
+        self.enabled = False
+        if self.dist.rank == 0:
+            logger.warning(f"TP shared-tensor broadcast disabled, using byte transport: {reason}")
+
+    def _transform(
+        self, py_objects: Tuple[Tuple[str, Any], ...], operation: Callable[[Any], Any]
+    ) -> Tuple[Tuple[str, Any], ...]:
+        return tuple(
+            (name, _map_tensors(value, operation) if name in self.tensor_attributes else value)
+            for name, value in py_objects
+        )
+
+    def broadcast(
+        self, requests: List, py_objects: Optional[Tuple[Tuple[str, Any], ...]]
+    ) -> Tuple[List, Optional[Tuple]]:
+        """Broadcast requests and their Python objects from rank 0.
+
+        This is a collective call. Every rank must call it.
+
+        Args:
+            requests: Requests on rank 0. Ignored on other ranks.
+            py_objects: ``(attribute_name, {request_id: value})`` pairs on
+                rank 0. Ignored on other ranks.
+
+        Returns:
+            Rank 0 gets its own ``(requests, py_objects)`` back. Other ranks
+            get the received requests and Python objects, with shared tensors
+            mapped to local views.
+
+        Raises:
+            SerializationError: On rank 0, if the payload cannot be pickled.
+            RuntimeError: On other ranks, in the same case.
+        """
         dist = self.dist
-        if self.same_host is None:
-            self.same_host = len(set(dist.allgather(socket.gethostname()))) == 1
+        if self.enabled is None:
+            self.enabled = len(set(dist.allgather(socket.gethostname()))) == 1
             if dist.rank == 0:
                 logger.info(
-                    f"Multimodal TP handle broadcast: same_host={self.same_host}, "
-                    f"ranks={dist.world_size}"
+                    f"TP shared-tensor broadcast: enabled={self.enabled}, ranks={dist.world_size}"
                 )
-        if not self.same_host:
+        if not self.enabled:
             return dist.broadcast((requests, py_objects), root=0)
 
-        pending, owners = [], []
-        wire, error = py_objects, None
+        peers = dist.world_size - 1
+        pending: List[SharedTensorContainer] = []
+        # Rank 0 keeps local copies alive until the peers have mapped them.
+        owners: List[torch.Tensor] = []
+        wire, export_error = py_objects, None
 
         def export(value: Any) -> Any:
-            if not isinstance(value, torch.Tensor):
+            if not isinstance(value, torch.Tensor) or not _can_share(value):
                 return value
-            # An imported device allocation cannot itself be re-exported.
-            owner = (
-                torch.empty_strided(
-                    value.size(), value.stride(), dtype=value.dtype, device=value.device
-                ).copy_(value)
-                if value.is_cuda
-                else value
-            )
-            owners.append(owner)
-            handles = []
-            for _ in range(1, dist.world_size):
-                container = SharedTensorContainer.from_tensor(owner)
+            owner, handles = value, []
+            for _ in range(peers):
+                try:
+                    container = SharedTensorContainer.from_tensor(owner)
+                except RuntimeError:
+                    if owner is not value or not value.is_cuda:
+                        raise
+                    # A CUDA allocation imported from another process cannot
+                    # be exported again, so export a local copy instead.
+                    owner = value.clone()
+                    owners.append(owner)
+                    container = SharedTensorContainer.from_tensor(owner)
+                # CUDA takes its export reference in from_tensor, CPU in dump_to_dict.
                 if owner.is_cuda:
                     pending.append(container)
                 handle = container.dump_to_dict()
@@ -81,57 +163,29 @@ class TpBroadcastHandles:
 
         if dist.rank == 0:
             try:
-                supported = True
-
-                def check(value: Any) -> Any:
-                    nonlocal supported
-                    if isinstance(value, torch.Tensor):
-                        supported &= (
-                            value.layout == torch.strided
-                            and value.device.type in ("cpu", "cuda")
-                            and value.dtype in DTYPE_MAPPING.values()
-                            and value.numel() > 0
-                            and not value.requires_grad
-                            and not value.is_neg()
-                            and (not value.is_cuda or torch._debug_has_internal_overlap(value) != 1)
-                        )
-                    return value
-
-                for name, value in py_objects:
-                    if name == "py_multimodal_data":
-                        _map_tensors(value, check)
-                if supported:
-                    wire = tuple(
-                        (
-                            name,
-                            _map_tensors(value, export) if name == "py_multimodal_data" else value,
-                        )
-                        for name, value in py_objects
-                    )
+                wire = self._transform(py_objects, export)
             except Exception as exc:
-                # Every rank must receive export errors before attempting to map.
-                error = repr(exc)
                 for container in pending:
-                    _retire(container)
+                    container.release_unconsumed()
                 pending.clear()
-                wire = None
+                wire, export_error = py_objects, repr(exc)
 
         try:
-            result, wire, has_handles, error = dist.broadcast(
-                (requests, wire, bool(pending), error), root=0
+            result, wire, has_handles, export_error = dist.broadcast(
+                (requests, wire, bool(pending), export_error), root=0
             )
-        except RuntimeError as exc:
-            # A serialization-failure header precedes all payload bytes and mappings.
-            if dist.rank == 0 and str(exc).startswith("Serialization failed:"):
-                for container in pending:
-                    _retire(container)
+        except SerializationError:
+            # Rank 0 fails before any handle leaves the rank.
+            for container in pending:
+                container.release_unconsumed()
             raise
-        if error:
-            raise RuntimeError("Multimodal handle export failed: " + error)
+        if export_error:
+            self._disable("export failed: " + export_error)
         if not has_handles:
-            return result, wire
+            return (requests, py_objects) if dist.rank == 0 else (result, wire)
 
-        consumed, errors = [], []
+        consumed: List[bool] = []
+        errors: List[str] = []
 
         def restore(value: Any) -> Any:
             if not isinstance(value, _TensorHandles):
@@ -139,32 +193,28 @@ class TpBroadcastHandles:
             consumed.append(False)
             try:
                 container = SharedTensorContainer.from_dict(value.handles[dist.rank - 1])
-                # CPU from_dict opens storage and consumes its exported reference.
-                # CUDA consumes its reference later, when get_local_view opens IPC.
-                consumed[-1] = container.method_key == 2
+                consumed[-1] = container.consumes_reference_on_from_dict
                 tensor = container.get_local_view()
                 consumed[-1] = True
                 return tensor
             except Exception as exc:
-                # Visit every handle, even when an earlier mapping failed.
+                # Visit every handle, even after an earlier mapping failed.
                 errors.append(repr(exc))
                 return None
 
         if dist.rank != 0:
-            wire = tuple(
-                (name, _map_tensors(value, restore) if name == "py_multimodal_data" else value)
-                for name, value in wire
-            )
+            wire = self._transform(wire, restore)
         acknowledgements = dist.allgather((consumed, errors))
         if dist.rank == 0:
             for index, container in enumerate(pending):
-                peer = index % (dist.world_size - 1) + 1
-                slot = index // (dist.world_size - 1)
+                peer, slot = index % peers + 1, index // peers
                 if not acknowledgements[peer][0][slot]:
-                    _retire(container)
+                    container.release_unconsumed()
         failures = [message for _, messages in acknowledgements for message in messages]
         if failures:
-            raise RuntimeError("Multimodal handle mapping failed: " + repr(failures))
-        # Storage references now belong to each request. Existing completion,
-        # cancellation and error teardown drop them after the final use.
+            # Every rank sees the same failures, so all ranks take this branch.
+            self._disable("mapping failed: " + repr(failures))
+            wire = dist.broadcast(py_objects if dist.rank == 0 else None, root=0)
+        # Mapped storage now belongs to each request. Completion, cancellation
+        # and error teardown drop it after the final use.
         return (requests, py_objects) if dist.rank == 0 else (result, wire)

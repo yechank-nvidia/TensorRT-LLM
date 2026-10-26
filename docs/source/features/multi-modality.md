@@ -70,18 +70,7 @@ Evaluate offline inference performance with multimodal inputs using the `trtllm-
 
 ## Tensor-parallel tensor transport
 
-Multimodal tensor storage is shared automatically from rank 0 to its local tensor-parallel peers.
-No environment variable or model-specific flag is required.
-This applies to models using `py_multimodal_data` with a single-host MPI tensor-parallel group.
-Pipeline parallelism, context parallelism, non-MPI distribution, and groups spanning multiple hosts keep the existing transport.
-
-The transport reuses `SharedTensorContainer` for CPU shared memory and CUDA IPC, with one reduction reference per receiving rank.
-CPU tensors reuse shared storage or move to shared storage once.
-CUDA tensors use one locally owned copy because imported CUDA allocations cannot be exported again.
-Only multimodal data is transformed; nested metadata types and unrelated request attributes are preserved.
-Empty tensors, negative views, unsupported dtypes or layouts, tensors requiring gradients, and overlapping CUDA views keep byte transport.
-
-A collective acknowledgement retires handles that peers could not map.
-Mapped storage stays alive through the final consumer and is released by the existing completion, cancellation, and error cleanup.
-Graceful export, mapping, and serialization failures propagate to all ranks.
-Abrupt MPI rank loss is not qualified.
+With single-host MPI tensor parallelism, rank 0 shares multimodal tensors with the other ranks through shared memory or CUDA IPC instead of copying their bytes.
+It is automatic and has no setting.
+Pipeline parallelism, context parallelism, non-MPI launches and multi-host groups use the existing transport.
+Tensors that cannot be shared, and batches that hit a sharing error, are sent with the existing transport.

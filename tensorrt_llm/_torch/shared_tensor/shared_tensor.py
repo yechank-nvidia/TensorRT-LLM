@@ -156,6 +156,12 @@ class SharedTensorContainer:
 
     """
 
+    # Positions in the handle tuples returned by ``reduce_tensor``.
+    _CPU_STORAGE = 1
+    _CUDA_STORAGE_DEVICE = 6
+    _CUDA_REF_COUNTER_HANDLE = 11
+    _CUDA_REF_COUNTER_OFFSET = 12
+
     def __init__(self, method_key: int, tensor_handle: Dict[str, Any]):
         """Initialize the SharedTensorContainer.
 
@@ -432,6 +438,38 @@ class SharedTensorContainer:
         rebuild_method = _SharedTensorRebuildMethodRegistry.get_method(
             self.method_key)
         return rebuild_method(*self.tensor_handle)
+
+    @property
+    def consumes_reference_on_from_dict(self) -> bool:
+        """Whether ``from_dict`` already releases the export reference (Consumer side).
+
+        CPU handles open the shared storage, and release the producer's export
+        reference, inside ``from_dict``. CUDA handles release it later, when
+        ``get_local_view`` opens the IPC allocation.
+        """
+        return self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CPU
+
+    def release_unconsumed(self) -> None:
+        """Release one export reference that no consumer opened (Producer side).
+
+        Each CUDA export takes one reference in ``from_tensor``, and each CPU
+        export takes one in ``dump_to_dict``. A consumer that rebuilds the
+        tensor releases it. Call this once for each exported handle that will
+        never be rebuilt, so the producer can free the memory.
+
+        Raises:
+            ValueError: If the container is not a CPU or CUDA export.
+        """
+        if self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CPU:
+            self.tensor_handle[self._CPU_STORAGE]._shared_decref()
+        elif self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CUDA:
+            torch.UntypedStorage._release_ipc_counter(
+                self.tensor_handle[self._CUDA_REF_COUNTER_HANDLE],
+                self.tensor_handle[self._CUDA_REF_COUNTER_OFFSET],
+                device=self.tensor_handle[self._CUDA_STORAGE_DEVICE])
+        else:
+            raise ValueError(
+                f"Unsupported shared tensor method key: {self.method_key}")
 
     def dump_to_dict(self) -> Dict[str, Any]:
         """Convert this container to a dictionary for direct IPC (Producer side).

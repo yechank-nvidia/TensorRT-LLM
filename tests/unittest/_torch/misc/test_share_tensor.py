@@ -268,6 +268,49 @@ class TestShareTensor(unittest.TestCase):
             producer.join()
             parent_conn.close()
 
+    def test_release_unconsumed_cpu_export(self):
+        """The producer can release a CPU export that no consumer opened."""
+        import base64
+        import gc
+        import time
+        from pathlib import Path
+
+        tensor = torch.arange(1024)
+        container = SharedTensorContainer.from_tensor(tensor)
+        handle = container.dump_to_dict()
+        name = base64.b64decode(handle["storage_handle"]).decode().lstrip("/")
+        path = Path("/dev/shm") / name
+        self.assertTrue(path.exists())
+        consumer = SharedTensorContainer.from_dict(handle)
+        self.assertTrue(consumer.consumes_reference_on_from_dict)
+        del consumer
+        # The consumer above released its reference; release the second export.
+        container.dump_to_dict()
+        container.release_unconsumed()
+        del tensor, container
+        deadline = time.monotonic() + 15
+        while path.exists() and time.monotonic() < deadline:
+            gc.collect()
+            time.sleep(0.05)
+        self.assertFalse(path.exists())
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+    def test_release_unconsumed_cuda_export(self):
+        """The producer can release a CUDA export that no consumer opened."""
+        import gc
+
+        torch.cuda.synchronize()
+        torch.cuda.ipc_collect()
+        before = torch.cuda.memory_allocated()
+        tensor = torch.empty(1 << 20, device="cuda")
+        container = SharedTensorContainer.from_tensor(tensor)
+        self.assertFalse(container.consumes_reference_on_from_dict)
+        container.release_unconsumed()
+        del tensor, container
+        gc.collect()
+        torch.cuda.ipc_collect()
+        self.assertEqual(torch.cuda.memory_allocated(), before)
+
 
 if __name__ == '__main__':
     mp.set_start_method('spawn', force=True)
