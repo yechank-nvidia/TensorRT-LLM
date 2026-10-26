@@ -743,6 +743,7 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
     """
 
     supports_encoder_cache = True
+    supports_device_pixel_normalization = True
 
     @classmethod
     def get_model_defaults(cls, llm_args):

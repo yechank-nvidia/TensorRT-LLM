@@ -442,6 +442,11 @@ class MultimodalModelMixin:
     `BaseMultimodalInputProcessor.get_mm_encoder_item_metadata`. This is the executor-layer gate for
     item scheduling."""
 
+    supports_device_pixel_normalization: ClassVar[bool] = False
+    """Whether the model's encoder accepts raw `uint8` channel-major patch rows and applies the
+    processor's rescale and normalize itself (see `tensorrt_llm.inputs.pixel_normalization`).
+    When set, the input processor defers that step to the encoder for eligible requests."""
+
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
 
