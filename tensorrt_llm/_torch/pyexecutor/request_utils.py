@@ -17,7 +17,7 @@ from tensorrt_llm.mapping import CpType
 from ..distributed import Distributed
 from .hang_detector import HangDetector
 from .llm_request import ExecutorRequest, LlmRequest, executor_request_to_llm_request
-from .tp_bcast_handles import TpBroadcastHandles
+from .same_host_tensors import SameHostTensorSharing
 
 # Type alias for request queue items (to avoid circular import)
 # The actual RequestQueueItem class is defined in executor_request_queue.py
@@ -374,22 +374,15 @@ def merge_requests(
 class RequestBroadcaster:
     """Broadcasts requests across distributed ranks (TP, PP, CP)."""
 
-    # Python objects from ``_collect_py_objects`` whose tensors local TP peers
-    # may map from shared storage.
-    _SHARED_TENSOR_ATTRIBUTES = ("py_multimodal_data",)
-
     def __init__(self, dist: Distributed, hang_detector: HangDetector):
         self.dist = dist
         self.hang_detector = hang_detector
         self.send_requests_handler = None
-        # Local TP peers map shared tensors instead of receiving their bytes.
-        self.tp_handles = None
-        if (
-            getattr(dist, "supports_local_tensor_handles", False)
-            and not dist.has_pp
-            and dist.tp_size == dist.world_size > 1
-        ):
-            self.tp_handles = TpBroadcastHandles(dist, self._SHARED_TENSOR_ATTRIBUTES)
+        # Receivers on the sender's host map large tensors instead of
+        # receiving their bytes.
+        self.same_host_tensors = None
+        if getattr(dist, "supports_local_tensor_handles", False) and dist.world_size > 1:
+            self.same_host_tensors = SameHostTensorSharing(dist)
 
     def broadcast(
         self, new_requests: List, prefer_cpu: bool = False
@@ -540,41 +533,58 @@ class RequestBroadcaster:
         if self.dist.world_size == 1:
             return payloads
 
+        sharing = self.same_host_tensors
         if not self.dist.has_pp:
-            if self.tp_handles is not None:
-                return self.tp_handles.broadcast(new_requests, py_request_objects)
+            if sharing is not None:
+                return sharing.broadcast("world", payloads)
             return self.dist.broadcast(payloads, root=0)
 
         # Broadcast within first PP stage before send/recv chain to other PP stages.
         # This needs to cover both TP and CP ranks within the first PP stage.
         if self.dist.is_first_pp_rank:
             with nvtx_range("tp_broadcast_requests"):
-                payloads = self.dist.tp_cp_broadcast(payloads, root=0)
+                if sharing is None:
+                    payloads = self.dist.tp_cp_broadcast(payloads, root=0)
+                else:
+                    # Same order as tp_cp_broadcast: the CP root forwards.
+                    if self.dist.tp_size > 1:
+                        payloads = sharing.broadcast("tp", payloads)
+                    if self.dist.cp_size > 1:
+                        payloads = sharing.broadcast("cp", payloads)
 
         # Tag for communication
         tag = self.dist.pp_size  # Use pp_size as tag to avoid conflicts
+        # Receivers reply on this tag when the hop maps shared tensors.
+        reply_tag = self.dist.pp_size + 2
+        send_async = os.environ.get("TRTLLM_PP_REQ_SEND_ASYNC", "0") == "1"
+        # An acknowledgement would wait for the receiver, so asynchronous
+        # sends keep the byte transport.
+        if send_async:
+            sharing = None
 
         # Send payloads
         if not self.dist.is_first_pp_rank:
             with nvtx_range("recv_requests_from_prev_pp"):
-                payloads = self.dist.recv_object(self.dist.prev_pp_rank, tag)
+                if sharing is None:
+                    payloads = self.dist.recv_object(self.dist.prev_pp_rank, tag)
+                else:
+                    payloads = sharing.recv(self.dist.prev_pp_rank, tag, reply_tag)
 
         # isend new requests may cause deadlock, when CUDA_LAUNCH_BLOCKING=1
         # or PP microbatches can't overlap, the deadlock will happen:
         # 1. rank1 will wait on nccl.send(rank2), without invoking mpi.wait(isend-handle)
         # 2. rank2 will wait on mpi.recv(rank1) but never receive the new requests.
         # 3. rank1 will hang on nccl.send because rank2 will never reach nccl.recv(rank1).
-        pp_send_func = (
-            self.dist.isend_object
-            if os.environ.get("TRTLLM_PP_REQ_SEND_ASYNC", "0") == "1"
-            else self.dist.send_object
-        )
+        pp_send_func = self.dist.isend_object if send_async else self.dist.send_object
 
         if not self.dist.is_last_pp_rank:
             if self.send_requests_handler is not None:
                 with nvtx_range("wait_prev_send_requests_handler"):
                     self.send_requests_handler.wait()
             with nvtx_range("send_requests_to_next_pp"):
-                self.send_requests_handler = pp_send_func(payloads, self.dist.next_pp_rank, tag)
+                if sharing is None:
+                    self.send_requests_handler = pp_send_func(payloads, self.dist.next_pp_rank, tag)
+                else:
+                    sharing.send(payloads, self.dist.next_pp_rank, tag, reply_tag)
 
         return payloads

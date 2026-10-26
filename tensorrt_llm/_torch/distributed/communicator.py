@@ -221,8 +221,9 @@ class Distributed(ABC):
     supports_single_round_broadcast = False
 
     # Transports whose ranks are separate host processes and whose object
-    # broadcast can carry shared-memory and CUDA IPC handles set this, so
-    # local ranks can map tensors instead of receiving copies (MPIDist).
+    # collectives and point-to-point sends can carry shared-memory and CUDA
+    # IPC handles set this, so ranks on the sender's host can map request
+    # tensors instead of receiving copies (MPIDist).
     supports_local_tensor_handles = False
 
     def broadcast_or_none(self, obj, root=0):
