@@ -497,6 +497,10 @@ class PyTorchModelEngine(ModelEngine):
                                 f"{num_mnnvl_allreduces} modules to cover "
                                 f"max_num_tokens={self.max_num_tokens} before "
                                 "torch.compile.")
+                # Dynamo config overrides are thread-local and forward runs on
+                # the executor thread, so bind the limit to each compiled callable.
+                torch_compile_recompile_limit = max(
+                    torch._dynamo.config.recompile_limit, 16)
                 use_ub = not use_ub_for_nccl and (
                     torch_compile_enable_userbuffers
                     and self._init_userbuffers(self.model.config.hidden_size))
@@ -519,9 +523,10 @@ class PyTorchModelEngine(ModelEngine):
                         "compile_only_piecewise_graphs=True is "
                         "only supported for DecoderModelForCausalLM models.")
 
-                self._apply_torch_compile(self._torch_compile_backend,
-                                          torch_compile_fullgraph)
-                torch._dynamo.config.cache_size_limit = 16
+                self._apply_torch_compile(
+                    self._torch_compile_backend,
+                    torch_compile_fullgraph,
+                    recompile_limit=torch_compile_recompile_limit)
             else:
                 set_torch_compiling(False)
                 self._nccl_window_tensor_scope_hooks = (
@@ -1244,15 +1249,22 @@ class PyTorchModelEngine(ModelEngine):
             scope = scope.eager_model
         return getattr(scope, "_orig_mod", scope)
 
-    def _apply_torch_compile(self, backend: Backend, fullgraph: bool) -> None:
-        """Compile the eager model scope."""
+    def _apply_torch_compile(self,
+                             backend: Backend,
+                             fullgraph: bool,
+                             *,
+                             recompile_limit: Optional[int] = None) -> None:
+        """Compile the eager model scope with a callable-local recompile budget."""
+        if recompile_limit is None:
+            recompile_limit = max(torch._dynamo.config.recompile_limit, 16)
         apply_llm_torch_compile = getattr(self.model, "apply_llm_torch_compile",
                                           None)
         if isinstance(self.model, DecoderModelForCausalLM):
             eager_model = self._eager_decoder_scope()
             compiled_model = torch.compile(eager_model,
                                            backend=backend,
-                                           fullgraph=fullgraph)
+                                           fullgraph=fullgraph,
+                                           recompile_limit=recompile_limit)
             self._torch_compile_prefill_only = (
                 self.llm_args.prefill_cuda_graph_backend
                 == PrefillCudaGraphBackend.PIECEWISE
@@ -1270,12 +1282,15 @@ class PyTorchModelEngine(ModelEngine):
                 llm.model = compiled_model._orig_mod
             # TODO: Move this contract to MultimodalModelMixin once
             # multimodal models consistently expose their LLM compile scope.
-            apply_llm_torch_compile(backend=backend, fullgraph=fullgraph)
+            apply_llm_torch_compile(backend=backend,
+                                    fullgraph=fullgraph,
+                                    recompile_limit=recompile_limit)
         else:
             eager_model = getattr(self.model, "_orig_mod", self.model)
             self.model = torch.compile(eager_model,
                                        backend=backend,
-                                       fullgraph=fullgraph)
+                                       fullgraph=fullgraph,
+                                       recompile_limit=recompile_limit)
 
     def _remove_torch_compile(self) -> None:
         """Restore the eager model scope."""
