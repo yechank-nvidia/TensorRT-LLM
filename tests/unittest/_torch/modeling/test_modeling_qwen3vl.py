@@ -141,6 +141,45 @@ def test_qwen3vl_moe_nvfp4_per_expert_weights(allow_partial_loading: bool) -> No
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("preload", [False, True])
+@pytest.mark.parametrize(
+    ("projection", "suffix"),
+    [
+        ("up_proj", "weight"),
+        ("down_proj", "weight"),
+        ("gate_proj", "weight_scale"),
+        ("up_proj", "weight_scale_2"),
+        ("down_proj", "input_scale"),
+    ],
+)
+def test_qwen3vl_moe_nvfp4_sparse_expert_weights(
+    preload: bool, projection: str, suffix: str
+) -> None:
+    module = Mock(spec=MoE)
+    module.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    module.weight_loading_mode = MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
+    mapper = Qwen3VLMoeHfWeightMapper()
+    if preload:
+        mapper.handle_special_instance_module(
+            module, "experts", {"0.gate_proj.weight": torch.zeros(1, dtype=torch.uint8)}
+        )
+        module.load_weights.reset_mock()
+    weight = torch.ones(1)
+
+    mapper.handle_special_instance_module(
+        module, "experts", {f"0.{projection}.{suffix}": weight}, allow_partial_loading=True
+    )
+
+    assert module.weight_loading_mode is MoEWeightLoadingMode.VANILLA
+    module.load_weights.assert_called_once()
+    loaded = module.load_weights.call_args.kwargs
+    assert loaded["allow_partial_loading"] is True
+    target = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}[projection]
+    assert list(loaded["weights"][0]) == [f"0.{target}.{suffix}"]
+    assert loaded["weights"][0][f"0.{target}.{suffix}"] is weight
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.FP8])
 def test_qwen3vl_moe_fused_weights_keep_loading_mode(quant_algo: QuantAlgo) -> None:
     module = Mock(spec=MoE)

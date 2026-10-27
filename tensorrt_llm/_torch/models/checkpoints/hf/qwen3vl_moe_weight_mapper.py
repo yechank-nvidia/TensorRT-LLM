@@ -21,7 +21,9 @@ class Qwen3VLMoeHfWeightMapper(Qwen3MoeHfWeightMapper):
     ) -> None:
         if is_moe_weight_owner(module):
             if module.quant_config.quant_mode.has_nvfp4() and any(
-                name.endswith(".gate_proj.weight") for name in module_weights
+                expert.isdecimal()
+                and weight_name.startswith(("gate_proj.", "up_proj.", "down_proj."))
+                for expert, _, weight_name in (name.partition(".") for name in module_weights)
             ):
                 # ModelOpt NVFP4 checkpoints keep each expert and its scales separate.
                 module.weight_loading_mode = MoEWeightLoadingMode.VANILLA
