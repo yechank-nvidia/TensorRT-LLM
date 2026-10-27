@@ -7261,6 +7261,14 @@
       "description": "ModelExpress (MX) P2P checkpoint loading config.",
       "status": "prototype"
     },
+    "num_input_processor_workers": {
+      "default": 8,
+      "description": "Number of input-processing threads per serving frontend for chat and completion requests, including text-only models. 0 runs inline on the request event loop. Offline LLM calls remain synchronous.",
+      "minimum": 0,
+      "status": "prototype",
+      "title": "Num Input Processor Workers",
+      "type": "integer"
+    },
     "num_postprocess_workers": {
       "default": 0,
       "description": "The number of processes used for postprocessing the generated tokens, including detokenization.",

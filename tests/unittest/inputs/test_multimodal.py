@@ -2,6 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Tests for MultimodalRuntimeData cumsum math and the flat-mask producer."""
 
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import get_args
 from unittest.mock import patch
@@ -10,6 +11,7 @@ import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.inputs.media_io import MEDIA_IO_REGISTRY, MediaModality
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -1224,3 +1226,17 @@ def test_params_do_not_infer_item_layout_from_raw_buckets():
     params = MultimodalParams(multimodal_data={"audio": {}, "image": {}})
     assert params.item_metadata is None
     assert params.get_item_layout() == ((), ())
+
+
+def test_concurrent_cpu_handle_exports_restore_values_and_strategy():
+    strategy = torch.multiprocessing.get_sharing_strategy()
+
+    def roundtrip(value):
+        tensor = torch.full((3, 8), value, dtype=torch.int32)
+        payload = SharedTensorContainer.from_tensor(tensor).dump_to_dict()
+        restored = SharedTensorContainer.from_dict(payload).get_local_view()
+        assert torch.equal(restored, tensor)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(roundtrip, range(40)))
+    assert torch.multiprocessing.get_sharing_strategy() == strategy

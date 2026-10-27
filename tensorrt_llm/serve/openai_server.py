@@ -34,7 +34,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, JSONResponse, Response,
                                StreamingResponse)
 from fastapi.routing import APIRoute
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 from starlette.routing import Mount
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from transformers import AutoProcessor
@@ -63,6 +63,7 @@ from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import LLM, RequestOutput
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
@@ -729,7 +730,7 @@ class OpenAIServer(_VideoRoutesMixin):
             allow_request_chat_template: bool = False,
             embedding_max_queue_delay: float = 0.005,
             embedding_max_queue_size: int = 2048,
-            input_processor_workers: int = 8,
+            input_processor_workers: Optional[int] = None,
             media_load_workers: int = 8,
             internal_disagg_auth_key: Optional[str] = None,
             enable_rl_control_endpoints: bool = False,
@@ -823,12 +824,24 @@ class OpenAIServer(_VideoRoutesMixin):
         # multimodal preprocessing and decode work off the asyncio default
         # executor avoids contention with unrelated `to_thread` callers and
         # lets the two stages be sized independently.
+        args = getattr(self.generator, "args", None)
+        worker_field = TorchLlmArgs.model_fields["num_input_processor_workers"]
+        workers = getattr(args, "num_input_processor_workers",
+                          worker_field.default)
+        if input_processor_workers is not None:
+            workers = TypeAdapter(
+                worker_field.rebuild_annotation()).validate_python(
+                    input_processor_workers)
+            if args is not None:
+                args.num_input_processor_workers = workers
+        if isinstance(ip, BaseMultimodalInputProcessor):
+            ip.configure_preprocessing(workers)
         self._input_proc_executor = ThreadPoolExecutor(
-            max_workers=input_processor_workers,
+            max_workers=workers,
             thread_name_prefix="trtllm_inputproc",
             initializer=_multimodal_processor_torch_initializer(
                 self.generator, ip),
-        )
+        ) if workers else None
         self._media_load_executor = ThreadPoolExecutor(
             max_workers=media_load_workers,
             thread_name_prefix="trtllm_media_load",
@@ -997,6 +1010,9 @@ class OpenAIServer(_VideoRoutesMixin):
             if self.resource_governor is not None:
                 self.resource_governor.close()
             self.generator.shutdown()
+            if self._input_proc_executor is not None:
+                self._input_proc_executor.shutdown(wait=False,
+                                                   cancel_futures=True)
             # A stats read still in flight fails fast now that the executor is
             # down; the /metrics handler already treats that as no stats.
             self._metrics_stats_executor.shutdown(wait=False,
@@ -2232,6 +2248,8 @@ class OpenAIServer(_VideoRoutesMixin):
         loop = asyncio.get_running_loop()
         queued = _start_input_processing()
         if queued is None:
+            if self._input_proc_executor is None:
+                return process()
             return await loop.run_in_executor(self._input_proc_executor,
                                               process)
 
@@ -2240,6 +2258,8 @@ class OpenAIServer(_VideoRoutesMixin):
             with _time_input_processing("processor"):
                 return process()
 
+        if self._input_proc_executor is None:
+            return run()
         return await loop.run_in_executor(self._input_proc_executor,
                                           copy_context().run, run)
 
@@ -2639,8 +2659,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     parser.build_required_structural_tag,
                     request.tools,
                     thinking=thinking)
-                required_format = await asyncio.get_running_loop(
-                ).run_in_executor(self._input_proc_executor, build_required)
+                required_format = await self._run_input_processor(build_required
+                                                                  )
                 if required_format is None:
                     raise ValueError(
                         "The configured tool parser does not support required tools."
