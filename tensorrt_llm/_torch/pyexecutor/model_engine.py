@@ -38,6 +38,7 @@ from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
 from ..distributed.ops import MNNVLAllReduce
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
+from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from ..models.multimodal import is_multimodal_model
 from ..moe.expert_statistic import ExpertStatistic
@@ -987,13 +988,30 @@ class PyTorchModelEngine(ModelEngine):
         decoder_model = getattr(self.model, "llm", None)
         if (self.llm_args.disable_mm_encoder
                 and isinstance(decoder_model, DecoderModelForCausalLM)
-                and getattr(self.model, "mm_encoder", None) is None):
+                and getattr(self.model, "mm_encoder", None) is None
+                and (not isinstance(self.model, MultimodalModelMixin)
+                     or decoder_model.supports_multimodal_breakable_cuda_graph)):
+            return
+        if isinstance(self.model, MultimodalModelMixin):
+            if not isinstance(self.model.language_model,
+                              DecoderModelForCausalLM):
+                raise ValueError(
+                    "Multimodal breakable prefill CUDA graph requires a "
+                    "DecoderModelForCausalLM language_model")
+            if self.mapping.pp_size > 1:
+                raise ValueError(
+                    "Multimodal breakable prefill CUDA graph does not support "
+                    "pipeline parallelism: prepared embedding inputs require "
+                    "a single pipeline stage")
+            if not self.model.language_model.supports_multimodal_breakable_cuda_graph:
+                raise ValueError(
+                    "Multimodal breakable prefill CUDA graph is not supported "
+                    "by this language_model; use eager prefill")
             return
         if (is_multimodal_model(self.model) or isinstance(
                 self.input_processor, BaseMultimodalInputProcessor)):
-            raise ValueError(
-                "breakable prefill CUDA graph does not support multimodal models"
-            )
+            raise ValueError("Multimodal breakable prefill CUDA graph requires "
+                             "MultimodalModelMixin to prepare decoder inputs")
 
     def forward_multimodal_encoder_items(
         self,
