@@ -25,7 +25,7 @@ import dataclasses
 import math
 from collections.abc import Mapping
 from itertools import accumulate, groupby
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 import torch

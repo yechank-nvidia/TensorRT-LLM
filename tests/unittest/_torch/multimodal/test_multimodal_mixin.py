@@ -432,6 +432,37 @@ def test_item_scheduled_encoder_uses_data_parallel_execution():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("encoder_dp_active", [False, True])
+def test_encoder_metrics_wrap_physical_calls_with_parallelism(encoder_dp_active: bool) -> None:
+    model = DataParallelEncoderMultimodalModel(
+        rank=0, enable_attention_dp=not encoder_dp_active
+    )
+    model.peer_output = torch.tensor([10.0] * 4 + [30.0] * 3).unsqueeze(1).repeat(1, 2)
+    model._encoder_forward_context = MagicMock()
+    encode = model.encode_multimodal_inputs
+    option = object()
+
+    def encode_with_context(
+        params: Sequence[MultimodalParams], **kwargs: object
+    ) -> torch.Tensor:
+        model._encoder_forward_context.return_value.__enter__.assert_called_once_with()
+        model._encoder_forward_context.return_value.__exit__.assert_not_called()
+        assert kwargs == {"encoder_option": option}
+        return encode(params, **kwargs)
+
+    with patch.object(model, "encode_multimodal_inputs", side_effect=encode_with_context):
+        output = model._run_multimodal_encoder(
+            [make_encoder_dp_param_with_input_costs()], encoder_option=option
+        )
+
+    model._encoder_forward_context.assert_called_once_with()
+    model._encoder_forward_context.return_value.__exit__.assert_called_once()
+    assert model.encoded_item_ids == ([20] if encoder_dp_active else [10, 20, 30])
+    expected = torch.tensor([10.0] * 4 + [20.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
+    torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.cpu_only
 def test_encoder_dp_uses_the_model_item_slicer() -> None:
     param = make_encoder_dp_param_with_input_costs()
     param.multimodal_data["image"]["custom_tiles"] = param.multimodal_data["image"].pop(

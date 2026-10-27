@@ -203,6 +203,55 @@ def test_config_validation(
     assert (not errors) == valid, [error.message for error in errors]
 
 
+@pytest.mark.parametrize(
+    ("filename", "section"),
+    [
+        (generator.SERVE_SCHEMA, None),
+        (generator.DISAGG_SCHEMA, None),
+        (generator.DISAGG_SCHEMA, "context_servers"),
+        (generator.DISAGG_SCHEMA, "generation_servers"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("value", "valid"),
+    [
+        ("TRTLLM", True),
+        ("trtllm", True),
+        ("FLASHINFER", True),
+        ("fLaShInFeR", True),
+        ("flash_attention_2", True),
+        ("sDpA", True),
+        ("vanilla", True),
+        (" flashinfer", False),
+        ("flashinfer ", False),
+        ("flashinfer\n", False),
+        ("flashinfer\r\n", False),
+        ("FLASHINFER_extra", False),
+        ("", False),
+        (1, False),
+        (None, False),
+        (False, False),
+    ],
+)
+def test_encoder_backend_schema_matches_runtime_normalization(
+    schemas: dict[str, dict], filename: str, section: str | None, value: object, valid: bool
+) -> None:
+    from tensorrt_llm.llmapi.llm_args import MultimodalConfig
+
+    backends = {"vision": value}
+    if valid:
+        runtime = MultimodalConfig(encoder_attention_backend=backends)
+        assert runtime.encoder_attention_backend == {"vision": value.upper()}
+    else:
+        with pytest.raises(ValueError):
+            MultimodalConfig(encoder_attention_backend=backends)
+    config = {"multimodal_config": {"encoder_attention_backend": backends}}
+    if section is not None:
+        config = {section: config}
+    validator = Draft202012Validator(schemas[filename])
+    assert validator.is_valid(config) == valid
+
+
 @pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
 @pytest.mark.parametrize("section", ["block_reuse_config", "mamba_state_config"])
 @pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("invalid", False)])

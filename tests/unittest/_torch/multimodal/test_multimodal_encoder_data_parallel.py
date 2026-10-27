@@ -14,14 +14,25 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import pytest
 import torch
 
 from tensorrt_llm._torch.models.multimodal_encoder_data_parallel import (
     EncoderDpItem,
     execute_encoder_dp_items,
+    iter_encoder_rank_inputs,
     plan_encoder_dp_items,
 )
+
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalParams,
+)
+from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
@@ -212,3 +223,37 @@ def test_execute_encoder_dp_items_stops_before_output_collective_on_peer_failure
         )
 
     assert collective_dtypes == []
+
+
+def test_iter_encoder_rank_inputs_preserves_common_item_metadata():
+    metadata = MultimodalItemMetadata(
+        item_refs=[("image", 0)], encoder_token_lengths=[2], output_embedding_lengths=[1]
+    )
+    param = MultimodalParams(
+        multimodal_data={
+            "image": {"pixel_values": torch.tensor([[3.0]])},
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
+        }
+    )
+    distributed = SimpleNamespace(tp_allgather=lambda value: [value])
+    with patch(
+        "tensorrt_llm._torch.models.multimodal_encoder_data_parallel.Distributed.get",
+        return_value=distributed,
+    ):
+        batches = list(
+            iter_encoder_rank_inputs(
+                [(param, [1], "image")],
+                mapping=Mapping(),
+                any_rank_failed=lambda failed: failed,
+            )
+        )
+
+    [(owner, [(shared_param, lengths, modality)])] = batches
+    assert owner == 0
+    assert shared_param.item_metadata is metadata
+    assert lengths == [1]
+    assert modality == "image"
+    torch.testing.assert_close(
+        shared_param.multimodal_data["image"]["pixel_values"],
+        param.multimodal_data["image"]["pixel_values"],
+    )

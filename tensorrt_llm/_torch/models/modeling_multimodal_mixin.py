@@ -17,7 +17,7 @@
 import contextlib
 import copy
 import itertools
-from collections.abc import Mapping
+from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from functools import partial
@@ -133,8 +133,8 @@ class EncoderInputField:
 
 
 def batch_encoder_inputs(
-    inputs: Sequence[Mapping[str, Any]],
-    fields: Mapping[str, EncoderInputField],
+    inputs: Sequence[MappingABC[str, Any]],
+    fields: MappingABC[str, EncoderInputField],
 ) -> dict[str, torch.Tensor]:
     """Gather, explicitly pad and concatenate encoder kwargs without reordering.
 
@@ -818,15 +818,16 @@ class MultimodalModelMixin:
         """
         return None
 
-    def _run_multimodal_encoder(
+    def _encode_multimodal_inputs_with_metrics(
         self,
         multimodal_params: Sequence[MultimodalParams],
+        **encoder_kwargs: Any,
     ) -> torch.Tensor:
         """Run encoder work with optional runtime instrumentation after H2D."""
         if self._encoder_forward_context is None:
-            return self.encode_multimodal_inputs(multimodal_params)
+            return self.encode_multimodal_inputs(multimodal_params, **encoder_kwargs)
         with self._encoder_forward_context():
-            return self.encode_multimodal_inputs(multimodal_params)
+            return self.encode_multimodal_inputs(multimodal_params, **encoder_kwargs)
 
     def prepare_multimodal_encoder_inputs(
         self,
@@ -1133,11 +1134,11 @@ class MultimodalModelMixin:
         params = list(multimodal_params)
         model_config = getattr(self, "model_config", None)
         if model_config is None:
-            return self.encode_multimodal_inputs(params, **encoder_kwargs)
+            return self._encode_multimodal_inputs_with_metrics(params, **encoder_kwargs)
         mapping = model_config.mapping
 
         if not self.encoder_data_parallel_active:
-            return self.encode_multimodal_inputs(params, **encoder_kwargs)
+            return self._encode_multimodal_inputs_with_metrics(params, **encoder_kwargs)
 
         encoder_dp_inputs = self._build_encoder_dp_items(params)
         if encoder_dp_inputs is not None:
@@ -1153,7 +1154,7 @@ class MultimodalModelMixin:
                 )
 
             def encode_local_inputs(local_params: list[MultimodalParams]) -> torch.Tensor:
-                return self.encode_multimodal_inputs(local_params, **encoder_kwargs)
+                return self._encode_multimodal_inputs_with_metrics(local_params, **encoder_kwargs)
 
             embedding_weight = self.text_embedding_layer.weight
             return execute_encoder_dp_items(
@@ -1174,7 +1175,7 @@ class MultimodalModelMixin:
         # status collective so a rank-local profiling failure is not observed as
         # success by peer ranks.
         with encoder_dp_error_guard(self._any_encoder_dp_rank_failed):
-            local_output = self.encode_multimodal_inputs(params, **encoder_kwargs)
+            local_output = self._encode_multimodal_inputs_with_metrics(params, **encoder_kwargs)
         return local_output
 
     @property

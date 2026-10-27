@@ -167,19 +167,22 @@ def test_context_captures_cache_identity_before_submission(llm, monkeypatch):
 def test_embedding_handoff_captures_cache_identity(llm, monkeypatch):
     from dataclasses import asdict
 
-    from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs
+    from tensorrt_llm.inputs.multimodal import MultimodalItemMetadata, MultimodalParams
 
-    layout = DisaggPrefillMultimodalInputs(
-        prompt_token_ids=[1, 91, 2, 91],
-        multimodal_lengths=[2],
-        multimodal_positions=[1],
-        multimodal_embedding_lengths=[2],
-        multimodal_item_run_cu_offsets=[0, 2],
-        multimodal_run_positions=[1, 3],
-        multimodal_run_lengths=[1, 1],
-    )
+    def build_disagg_prefill(inputs, mm_handles, *, mm_hashes=None):
+        return [1, 91, 2, 91], MultimodalParams.from_embeddings(
+            mm_handles,
+            MultimodalItemMetadata([("image", 0)], output_embedding_lengths=[2]),
+            multimodal_lengths=[2],
+            multimodal_positions=[1],
+            multimodal_hashes=mm_hashes,
+            multimodal_item_run_cu_offsets=[0, 2],
+            multimodal_run_positions=[1, 3],
+            multimodal_run_lengths=[1, 1],
+        )
+
     llm.input_processor.support_mm_disagg = True
-    llm.input_processor.build_disagg_prefill_multimodal_inputs = lambda *args: layout
+    llm.input_processor.build_disagg_prefill_multimodal_inputs = build_disagg_prefill
     monkeypatch.setattr("tensorrt_llm.llmapi.llm.maybe_compute_mm_embed_cumsum", lambda *args: None)
     disagg = DisaggregatedParams(
         request_type="context_only",

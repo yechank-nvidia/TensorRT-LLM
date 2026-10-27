@@ -27,10 +27,10 @@ from mpi4py import MPI
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
-from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.inputs.registry import (
+from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
-    MultimodalEncoderItemMetadata,
+    MultimodalItemMetadata,
+    MultimodalParams,
 )
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig
 from tensorrt_llm.mapping import Mapping
@@ -88,7 +88,7 @@ class _EncoderDpModel(torch.nn.Module, MultimodalModelMixin):
         rows = []
         for param in multimodal_params:
             item_ids = param.multimodal_data["image"]["pixel_values"][:, 0, 0, 0]
-            lengths = param.multimodal_data["multimodal_embedding_lengths"]
+            lengths = param.get_item_layout()[1]
             self.encoded_item_ids.extend(int(item_id) for item_id in item_ids)
             for item_id, length in zip(item_ids, lengths, strict=True):
                 rows.append(
@@ -109,8 +109,7 @@ def _make_param(item_ids: list[int], lengths: list[int]) -> MultimodalParams:
                 "pixel_values": torch.tensor(item_ids, dtype=torch.float32).reshape(-1, 1, 1, 1),
                 "image_sizes": [[1, 1] for _ in item_ids],
             },
-            "multimodal_embedding_lengths": lengths,
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                 item_refs=[("image", i) for i in range(len(item_ids))],
                 encoder_token_lengths=lengths,
                 output_embedding_lengths=lengths,
@@ -267,8 +266,7 @@ def _make_qwen_vision_param(rank):
                 ).cuda(),
                 "image_grid_thw": torch.tensor(grids),
             },
-            "multimodal_embedding_lengths": lengths,
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                 item_refs=[("image", i) for i in range(len(grids))],
                 encoder_token_lengths=[length * 4 for length in lengths],
                 output_embedding_lengths=lengths,
@@ -315,7 +313,7 @@ def _run_qwen_vision_parallel_rank(config):
     # ranks instead receive the same requests. Then test an empty/cache-hit
     # owner and an iteration where every owner has no encoder work.
     param = _make_qwen_vision_param(rank if attention_dp else 0)
-    lengths = param.multimodal_data["multimodal_embedding_lengths"]
+    lengths = param.get_item_layout()[1]
     expected = reference.encode_multimodal_inputs([param])
     prepared = model.prepare_multimodal_encoder_inputs([(param, i) for i in range(len(lengths))])
     actual = torch.cat(model.forward_multimodal_encoder_items(prepared), dim=0)

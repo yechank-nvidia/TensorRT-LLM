@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import re
 import runpy
 from functools import cache
 from pathlib import Path
@@ -80,6 +81,20 @@ class _ServeSchemaGeneratorMixin:
                 if names and names[0] in properties:
                     for name in names[1:]:
                         properties[name] = copy.deepcopy(properties[names[0]])
+        if "encoder_attention_backend" in properties:
+            # The runtime before-validator uppercases names before Literal validation.
+            for branch in properties["encoder_attention_backend"]["anyOf"]:
+                if branch.get("type") == "object":
+                    backend = branch["additionalProperties"]
+                    names = backend.pop("enum")
+                    alternatives = "|".join(
+                        "".join(
+                            f"[{char.lower()}{char.upper()}]" if char.isalpha() else re.escape(char)
+                            for char in name
+                        )
+                        for name in names
+                    )
+                    backend["pattern"] = f"^(?:{alternatives})(?![\\s\\S])"
         return result
 
     def dataclass_schema(self, schema: core_schema.DataclassSchema) -> JsonSchemaValue:

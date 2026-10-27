@@ -249,7 +249,7 @@ def iter_encoder_rank_inputs(
     with encoder_dp_error_guard(any_rank_failed):
         leaves, spec = tree_flatten(
             [
-                (param.multimodal_data, param.mm_item_order, lengths, modality)
+                (param.multimodal_data, lengths, modality)
                 for param, lengths, modality in encoder_inputs
             ]
         )
@@ -293,7 +293,7 @@ def iter_encoder_rank_inputs(
         yield (
             owner,
             [
-                (MultimodalParams(multimodal_data=data, mm_item_order=order), lengths, modality)
-                for data, order, lengths, modality in tree_unflatten(shared_leaves, owner_spec)
+                (MultimodalParams(multimodal_data=data), lengths, modality)
+                for data, lengths, modality in tree_unflatten(shared_leaves, owner_spec)
             ],
         )

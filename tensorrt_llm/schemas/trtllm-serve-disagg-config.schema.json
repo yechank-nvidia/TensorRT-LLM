@@ -5802,6 +5802,27 @@
       "additionalProperties": false,
       "description": "Multimodal model configuration.",
       "properties": {
+        "encoder_attention_backend": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "pattern": "^(?:[tT][rR][tT][lL][lL][mM]|[fF][lL][aA][sS][hH][iI][nN][fF][eE][rR]|[vV][aA][nN][iI][lL][lL][aA]|[sS][dD][pP][aA]|[fF][lL][aA][sS][hH]_[aA][tT][tT][eE][nN][tT][iI][oO][nN]_2)(?![\\s\\S])",
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Attention backend for each logical multimodal encoder, for example {'vision': 'FLASHINFER', 'audio': 'SDPA'}. Image and video share the vision encoder. Omitted encoders retain their model-specific defaults. Explicit selections do not change the language model's attn_backend. Supported backends depend on the encoder; unsupported explicit selections raise an error.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Encoder Attention Backend"
+        },
         "encoder_cache_max_bytes": {
           "default": 134217728,
           "description": "Target capacity in bytes for reusable multimodal encoder embeddings; 0 disables cross-request reuse. The capacity applies per rank; ranks do not share a cache. With item scheduling, encoder outputs still use the model-owned cache and its capacity is at least one legal encoder iteration; this value can make that cache larger. String values such as '512MB' and '1GiB' use binary units. Both inline encoding and item scheduling cache individual items; inline caching supports only single-modality parameters. Compatible with side-stream prefetch.",

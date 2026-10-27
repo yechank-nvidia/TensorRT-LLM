@@ -2024,3 +2024,56 @@ def test_preprocessing_thread_local_processor_and_tokenizer(workers, modality):
     assert processor._processor.tokenizer["values"] == []
     assert processor._processor.video_processor["values"] == []
     assert processor._tokenizer["values"] == []
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("include_image", [True, False])
+def test_qwen3vl_raw_batching_preserves_bucket_constants_and_aliases(include_image: bool) -> None:
+    from tensorrt_llm.inputs import pixel_normalization as pn
+
+    image_pixels = torch.tensor([[11, 12, 21, 22, 31, 32]], dtype=torch.uint8)
+    video_pixels = torch.tensor([[71, 72, 81, 82, 91, 92]], dtype=torch.uint8)
+    preferred_pixels = torch.tensor([[41, 42, 51, 52, 61, 62]], dtype=torch.uint8)
+    image_grid = torch.tensor([[1, 2, 3]])
+    video_grid = torch.tensor([[2, 3, 4]])
+    preferred_grid = torch.tensor([[3, 4, 5]])
+    image_norm = ((1.0, 2.0, 3.0), (2.0, 4.0, 8.0))
+    video_norm = ((10.0, 20.0, 30.0), (5.0, 10.0, 20.0))
+    video = {
+        "pixel_values_videos": video_pixels,
+        "video_grid_thw": video_grid,
+        "pixel_values": preferred_pixels,
+        "image_grid_thw": preferred_grid,
+        pn.PIXEL_NORMALIZATION_KEY: video_norm,
+    }
+    data = {"video": video}
+    if include_image:
+        data["image"] = {
+            "pixel_values": image_pixels,
+            "image_grid_thw": image_grid,
+            pn.PIXEL_NORMALIZATION_KEY: image_norm,
+        }
+    originals = [image_pixels, video_pixels, preferred_pixels, image_grid, video_grid, preferred_grid]
+    snapshots = [tensor.clone() for tensor in originals]
+
+    packed = modeling_qwen3vl._qwen3vl_build_batched_input(
+        [MultimodalParams(multimodal_data=data)], dtype=torch.bfloat16
+    )
+
+    selected = (
+        [(image_pixels, image_norm), (preferred_pixels, video_norm)]
+        if include_image
+        else [(video_pixels, video_norm)]
+    )
+    expected = torch.cat(
+        [pn.normalize_pixel_patches(pixels, norm, torch.bfloat16) for pixels, norm in selected]
+    )
+    expected_grid = torch.cat([image_grid, preferred_grid] if include_image else [video_grid])
+    assert torch.equal(packed["pixel_values"], expected)
+    assert torch.equal(packed["grid_thw"], expected_grid)
+    assert data["video"] is video
+    assert video[pn.PIXEL_NORMALIZATION_KEY] == video_norm
+    for original, snapshot in zip(originals, snapshots, strict=True):
+        assert torch.equal(original, snapshot)
+        for result in packed.values():
+            assert result.untyped_storage().data_ptr() != original.untyped_storage().data_ptr()
