@@ -287,7 +287,7 @@ async def async_load_video(video: str,
     are read fully into memory during decoding. Local-file I/O failures raise
     ValueError, with the original OSError as their cause.
     """
-    assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
+    assert format in ("pt", "np", "pil"), "format must be one of 'pt', 'np', 'pil'"
 
     # See `load_video`: share the serving decode path so hashes agree.
     video_io = VideoMediaIO(num_frames=num_frames,

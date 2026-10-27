@@ -51,6 +51,30 @@ from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCuda
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+
+@pytest.mark.cpu_only
+def test_qwen3vl_async_video_loader_keeps_raw_numpy(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    import numpy as np
+
+    from tensorrt_llm.inputs.media_io import VideoMediaIO
+    from tensorrt_llm.inputs.multimodal_data import VideoData
+    from tensorrt_llm.inputs.utils import async_load_video
+
+    frames = np.arange(36, dtype=np.uint8).reshape(1, 3, 4, 3)
+
+    def decode(video_io: VideoMediaIO, content: bytes) -> VideoData:
+        assert video_io._format == "np"
+        assert content == b"video"
+        return VideoData(frames=frames, metadata={"total_num_frames": 1})
+
+    monkeypatch.setattr(VideoMediaIO, "load_bytes", decode)
+    video = asyncio.run(async_load_video("data:video/mp4;base64,dmlkZW8=", format="np"))
+    assert video.frames is frames
+    assert video.frames.dtype == np.uint8
+
+
 QWEN3_VL_8B_CONFIG = {
     "architectures": ["Qwen3VLForConditionalGeneration"],
     "image_token_id": 151655,
