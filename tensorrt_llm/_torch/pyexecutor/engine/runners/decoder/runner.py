@@ -18,6 +18,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
@@ -454,14 +455,20 @@ class DecoderRunner(ScheduledModelRunner):
         ):
             return None
 
-        decoder_model = (
-            self._model
-            if isinstance(self._model, DecoderModelForCausalLM)
-            else getattr(self._model, "llm", None)
-        )
+        prepare_inputs = None
+        if isinstance(self._model, MultimodalModelMixin):
+            decoder_model = self._model.language_model
+            if self._mapping.pp_size == 1:
+                prepare_inputs = self._model.prepare_breakable_cuda_graph_inputs
+        else:
+            decoder_model = (
+                self._model
+                if isinstance(self._model, DecoderModelForCausalLM)
+                else getattr(self._model, "llm", None)
+            )
         if not isinstance(decoder_model, DecoderModelForCausalLM):
             raise ValueError("breakable prefill CUDA graph requires a decoder model body")
-        return BreakableCUDAGraphRunner(decoder_model.model)
+        return BreakableCUDAGraphRunner(decoder_model.model, prepare_inputs=prepare_inputs)
 
     @property
     def _use_beam_search(self) -> bool:
@@ -723,6 +730,22 @@ class DecoderRunner(ScheduledModelRunner):
 
     def _model_forward(self, *, is_dummy: bool, **kwargs: Any) -> Any:
         assert self._model_caller is not None
+        if (
+            self._config.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE
+            and isinstance(self._model, MultimodalModelMixin)
+            and self._mapping.pp_size > 1
+            and (
+                kwargs.get("inputs_embeds") is not None
+                or any(
+                    param.multimodal_data.get("multimodal_embedding") is not None
+                    for param in (kwargs.get("multimodal_params") or [])
+                )
+            )
+        ):
+            raise ValueError(
+                "Multimodal breakable prefill CUDA graph embedding inputs require "
+                "a single pipeline stage"
+            )
         reclaimer = self._eager_workspace_reclaimer
         metadata = kwargs["attn_metadata"]
         reclaim_scope = (

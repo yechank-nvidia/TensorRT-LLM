@@ -355,6 +355,107 @@ class TestQwen3VL(TestModelingMultimodal):
             )
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_levels", [0, 2])
+def test_qwen3vl_breakable_inputs_text_clears_stale_visual_features(num_levels):
+    model = Qwen3VLModel.__new__(Qwen3VLModel)
+    torch.nn.Module.__init__(model)
+    embedding = torch.nn.Embedding(16, 4)
+    model.llm = SimpleNamespace(model=SimpleNamespace(embed_tokens=embedding))
+    model.deepstack_num_level = num_levels
+    if num_levels:
+        model.deepstack_input_embeds = torch.full((num_levels, 8, 4), 7.0)
+    input_ids = torch.tensor([1, 2, 3])
+    inputs = {"input_ids": input_ids, "inputs_embeds": None, "deepstack_embeds": []}
+
+    prepared = model.prepare_breakable_cuda_graph_inputs(inputs)
+
+    assert prepared is not inputs
+    assert inputs["input_ids"] is input_ids
+    assert inputs["inputs_embeds"] is None
+    assert inputs["deepstack_embeds"] == []
+    assert prepared["input_ids"] is None
+    torch.testing.assert_close(prepared["inputs_embeds"], embedding(input_ids), atol=0, rtol=0)
+    assert len(prepared["deepstack_embeds"]) == num_levels
+    for feature in prepared["deepstack_embeds"]:
+        torch.testing.assert_close(feature, torch.zeros(3, 4), atol=0, rtol=0)
+        assert (
+            feature.untyped_storage().data_ptr()
+            == model.deepstack_input_embeds.untyped_storage().data_ptr()
+        )
+
+
+@pytest.mark.cpu_only
+def test_qwen3vl_breakable_inputs_preserve_fused_visual_features():
+    model = Qwen3VLModel.__new__(Qwen3VLModel)
+    torch.nn.Module.__init__(model)
+    embedding = torch.nn.Embedding(16, 4)
+    embedding.register_forward_pre_hook(
+        lambda module, args: pytest.fail("fused embeddings must not run token lookup")
+    )
+    model.llm = SimpleNamespace(model=SimpleNamespace(embed_tokens=embedding))
+    model.deepstack_num_level = 2
+    model.deepstack_input_embeds = torch.arange(64, dtype=torch.float32).view(2, 8, 4)
+    inputs_embeds = torch.arange(12, dtype=torch.float32).view(3, 4)
+    deepstack_embeds = list(model.deepstack_input_embeds[:, :3, :].unbind(0))
+    expected_features = [feature.clone() for feature in deepstack_embeds]
+    inputs = {
+        "input_ids": None,
+        "inputs_embeds": inputs_embeds,
+        "deepstack_embeds": deepstack_embeds,
+    }
+
+    prepared = model.prepare_breakable_cuda_graph_inputs(inputs)
+
+    assert prepared["inputs_embeds"] is inputs_embeds
+    assert prepared["deepstack_embeds"] is deepstack_embeds
+    for actual, expected in zip(prepared["deepstack_embeds"], expected_features):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_generations", [0, 1, 3])
+def test_qwen3vl_breakable_inputs_pad_generation_deltas_without_context_offset(num_generations):
+    model = Qwen3VLModel.__new__(Qwen3VLModel)
+    torch.nn.Module.__init__(model)
+    model.deepstack_num_level = 0
+    num_tokens = 5
+    mrope_config = {"mrope_rotary_cos_sin": torch.randn(1, 20)}
+    deltas = torch.tensor([-3, 0, 7], dtype=torch.int32)[:num_generations].view(-1, 1)
+    if num_generations:
+        mrope_config["mrope_position_deltas"] = deltas
+    inputs = {"inputs_embeds": torch.randn(num_tokens, 4), "mrope_config": mrope_config}
+
+    prepared = model.prepare_breakable_cuda_graph_inputs(inputs)
+
+    padded = prepared["mrope_config"]["mrope_position_deltas"]
+    assert padded.shape == (num_tokens, 1)
+    assert padded.dtype == torch.int32
+    torch.testing.assert_close(padded[:num_generations], deltas, atol=0, rtol=0)
+    torch.testing.assert_close(
+        padded[num_generations:], torch.zeros(num_tokens - num_generations, 1, dtype=torch.int32)
+    )
+    assert prepared["mrope_config"] is not mrope_config
+    assert prepared["mrope_config"]["mrope_rotary_cos_sin"] is mrope_config["mrope_rotary_cos_sin"]
+    if num_generations:
+        assert mrope_config["mrope_position_deltas"] is deltas
+    else:
+        assert "mrope_position_deltas" not in mrope_config
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mrope_config", [None, {}])
+def test_qwen3vl_breakable_inputs_leave_unfused_mrope_unchanged(mrope_config):
+    model = Qwen3VLModel.__new__(Qwen3VLModel)
+    torch.nn.Module.__init__(model)
+    model.deepstack_num_level = 0
+    inputs = {"inputs_embeds": torch.randn(3, 4), "mrope_config": mrope_config}
+
+    prepared = model.prepare_breakable_cuda_graph_inputs(inputs)
+
+    assert prepared["mrope_config"] is mrope_config
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen3vl_deepstack_fusion_reuses_registered_buffer():
     hidden_size = 4
