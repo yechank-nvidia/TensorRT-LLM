@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List, Optional
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -21,6 +21,9 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_qwen2vl, modeling_qwen3vl
+from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_moe_weight_mapper import (
+    Qwen3VLMoeHfWeightMapper,
+)
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     EncoderGroup,
@@ -33,6 +36,7 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VLModel,
     _triton_pos_embed_interpolate,
 )
+from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoEWeightLoadingMode
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import get_sm_version
@@ -103,6 +107,63 @@ QWEN3_VL_8B_CONFIG = {
     "_attn_implementation": "flash_attention_2",
     "_name_or_path": str(os.path.join(llm_models_root(), "Qwen3", "Qwen3-VL-8B-Instruct")),
 }
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("allow_partial_loading", [False, True])
+def test_qwen3vl_moe_nvfp4_per_expert_weights(allow_partial_loading: bool) -> None:
+    module = Mock(spec=MoE)
+    module.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    module.weight_loading_mode = MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
+    weights = {
+        f"{expert}.{projection}.{suffix}": torch.tensor(
+            [expert], dtype=torch.uint8 if suffix == "weight" else torch.float32
+        )
+        for expert in range(2)
+        for projection in ("gate_proj", "up_proj", "down_proj")
+        for suffix in ("weight", "weight_scale", "weight_scale_2", "input_scale")
+    }
+
+    Qwen3VLMoeHfWeightMapper().handle_special_instance_module(
+        module, "experts", weights, allow_partial_loading
+    )
+
+    assert module.weight_loading_mode is MoEWeightLoadingMode.VANILLA
+    module.load_weights.assert_called_once()
+    loaded = module.load_weights.call_args.kwargs
+    assert loaded["allow_partial_loading"] is allow_partial_loading
+    actual = loaded["weights"][0]
+    assert len(actual) == len(weights)
+    for name, weight in weights.items():
+        expert, projection, suffix = name.split(".")
+        target = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}[projection]
+        assert actual[f"{expert}.{target}.{suffix}"] is weight
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.FP8])
+def test_qwen3vl_moe_fused_weights_keep_loading_mode(quant_algo: QuantAlgo) -> None:
+    module = Mock(spec=MoE)
+    module.quant_config = QuantConfig(quant_algo=quant_algo)
+    module.weight_loading_mode = MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
+    module.intermediate_size, module.hidden_size = 3, 4
+    gate_up = torch.arange(48).reshape(2, 6, 4)
+    down = torch.arange(24).reshape(2, 4, 3)
+    scales = torch.ones(2, 1, 1)
+
+    Qwen3VLMoeHfWeightMapper().handle_special_instance_module(
+        module,
+        "experts",
+        {"gate_up_proj": gate_up, "down_proj": down, "gate_up_proj_scale_inv": scales},
+    )
+
+    assert module.weight_loading_mode is MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
+    loaded = module.load_weights.call_args.kwargs
+    assert loaded["allow_partial_loading"] is False
+    actual = loaded["weights"][0]
+    assert torch.equal(actual["gate_up_proj"], gate_up.transpose(-1, -2))
+    assert torch.equal(actual["down_proj"], down.transpose(-1, -2))
+    assert actual["gate_up_proj_weight_scale"] is scales
 
 
 @dataclass(repr=False)

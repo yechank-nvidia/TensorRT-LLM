@@ -6,6 +6,7 @@ from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
 
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_moe_weight_mapper import Qwen3MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
 
 
@@ -19,6 +20,14 @@ class Qwen3VLMoeHfWeightMapper(Qwen3MoeHfWeightMapper):
         allow_partial_loading: bool = False,
     ) -> None:
         if is_moe_weight_owner(module):
+            if module.quant_config.quant_mode.has_nvfp4() and any(
+                name.endswith(".gate_proj.weight") for name in module_weights
+            ):
+                # ModelOpt NVFP4 checkpoints keep each expert and its scales separate.
+                module.weight_loading_mode = MoEWeightLoadingMode.VANILLA
+                return super().handle_special_instance_module(
+                    module, module_name, module_weights, allow_partial_loading
+                )
             # Qwen3VL MoE uses MoEWeightLoadingMode.FUSED_GATE_UP_PROJ, whose
             # loader expects gate_up_proj in [E, H, 2*I] and down_proj in
             # [E, I, H] format, but HF stores them transposed:
