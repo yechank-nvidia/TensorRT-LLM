@@ -182,3 +182,7 @@ The histogram sum and count provide total measured time and mean; percentile val
 ### Run with [`trtllm-bench`](../../source/commands/trtllm-bench.rst)
 
 Evaluate offline inference performance with multimodal inputs using the `trtllm-bench` tool. For detailed instructions, see the [benchmarking guide](../developer-guide/perf-benchmarking.md).
+
+## Request tensor transport between ranks
+
+With MPI multi-rank runs (tensor, context, attention data or pipeline parallelism), a rank that passes requests to ranks on its own host shares large request tensors, such as images, video, audio features, embeddings and prompt tables, through shared memory or CUDA IPC instead of copying their bytes. It is automatic and has no setting. Ranks on other hosts, non-MPI launches, asynchronous pipeline request sends (`TRTLLM_PP_REQ_SEND_ASYNC=1`), tensors smaller than 256 KiB, tensors that cannot be shared, and hops that hit a sharing error use the existing transport. Request tensors are shared read-only, so code that consumes them must not modify them in place.
