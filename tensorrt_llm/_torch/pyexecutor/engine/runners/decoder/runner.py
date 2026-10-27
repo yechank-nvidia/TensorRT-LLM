@@ -458,6 +458,11 @@ class DecoderRunner(ScheduledModelRunner):
         prepare_inputs = None
         if isinstance(self._model, MultimodalModelMixin):
             decoder_model = self._model.language_model
+            if (
+                isinstance(decoder_model, DecoderModelForCausalLM)
+                and not decoder_model.supports_multimodal_breakable_cuda_graph
+            ):
+                return None
             if self._mapping.pp_size == 1:
                 prepare_inputs = self._model.prepare_breakable_cuda_graph_inputs
         else:

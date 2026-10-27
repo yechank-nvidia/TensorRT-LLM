@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import (
     BreakableCUDAGraphRunnerState,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledInputs
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -641,8 +642,14 @@ class _MultimodalOwner(MultimodalModelMixin):
         return self._decoder
 
 
-def _decoder_stub():
-    decoder = object.__new__(DecoderModelForCausalLM)
+class _SupportedMultimodalDecoder(DecoderModelForCausalLM):
+    supports_multimodal_breakable_cuda_graph = True
+
+
+def _decoder_stub(supported=True):
+    decoder = object.__new__(
+        _SupportedMultimodalDecoder if supported else DecoderModelForCausalLM
+    )
     nn.Module.__init__(decoder)
     decoder.model = _Body()
     return decoder
@@ -650,7 +657,7 @@ def _decoder_stub():
 
 @pytest.mark.parametrize("owner_kind", ["property", "text", "handoff", "llm_only"])
 def test_decoder_runner_resolves_breakable_graph_body(owner_kind):
-    decoder = _decoder_stub()
+    decoder = _decoder_stub(supported=owner_kind != "text")
     owner = (
         decoder
         if owner_kind == "text"
@@ -700,6 +707,215 @@ def test_multimodal_breakable_graph_guard_explains_unsupported_case(decoder_body
 
     with pytest.raises(ValueError, match=error):
         engine._validate_breakable_cuda_graph_compatibility()
+
+
+def _multimodal_prefill(owner, run_model=None):
+    decoder_runner = object.__new__(DecoderRunner)
+    decoder_runner._model = owner
+    decoder_runner._mapping = SimpleNamespace(pp_size=1)
+    decoder_runner._config = SimpleNamespace(
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+        disable_mm_encoder=False,
+    )
+    graphs = object.__new__(DecoderCudaGraphs)
+    graphs.breakable_cuda_graph_runner = decoder_runner._initialize_breakable_cuda_graph_runner(
+        object()
+    )
+
+    def forward(inputs):
+        return graphs._run(
+            None,
+            inputs,
+            run_model or (lambda current: owner.language_model.model(**current)),
+            lambda _current: None,
+            attn_metadata=inputs.get("attn_metadata"),
+            draft_kv_cache_manager=None,
+            moe_load_balancer=None,
+            enable_spec_decode=False,
+            gather_context_logits=False,
+            position_id_offsets=None,
+        )
+
+    return graphs.breakable_cuda_graph_runner, forward
+
+
+@pytest.mark.parametrize("disable_mm_encoder", [False, True])
+def test_glm_multimodal_changed_host_schedule_stays_eager(disable_mm_encoder):
+    from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import Glm5NextMamba2Metadata
+    from tensorrt_llm._torch.models.modeling_glm5_next import Glm5NextForCausalLM, Glm5NextModel
+
+    class ObserveContext(nn.Module):
+        def forward(self, *, hidden_states, runtime_ctx, **_kwargs):
+            scalar = 100 * runtime_ctx.num_contexts + runtime_ctx.num_ctx_tokens
+            return hidden_states + scalar + runtime_ctx.cached_lens[0]
+
+    metadata = object.__new__(AttentionMetadata)
+    metadata.kv_cache_manager = object()
+    metadata._seq_lens = torch.tensor([4], dtype=torch.int32)
+    metadata._num_contexts = 1
+    metadata._num_ctx_tokens = metadata._num_tokens = 4
+    metadata.kv_lens_cuda = torch.tensor([4, 0], dtype=torch.int32, device="cuda")
+    mamba = object.__new__(Glm5NextMamba2Metadata)
+    mamba.glm_block_tables = torch.zeros((2, 1), dtype=torch.long, device="cuda")
+    mamba.glm_ctx_cu_seqlens = [0, 4]
+    mamba.glm_cached_lens_host = [0]
+    metadata.mamba_metadata = mamba
+    body = object.__new__(Glm5NextModel)
+    nn.Module.__init__(body)
+    body.schedule = SimpleNamespace(num_layers=1)
+    body.layers = nn.ModuleList([ObserveContext()])
+    body._fused_hc_ok = lambda: False
+    body.expand_streams = body.collapse_streams = lambda value: value
+    decoder = object.__new__(Glm5NextForCausalLM)
+    nn.Module.__init__(decoder)
+    decoder.model = body
+    owner = _MultimodalOwner(decoder, disable_mm_encoder=disable_mm_encoder)
+    owner.llm = decoder
+    runner, forward = _multimodal_prefill(
+        owner,
+        lambda current: body(
+            attn_metadata=current["attn_metadata"], inputs_embeds=current["inputs_embeds"]
+        ),
+    )
+    inputs = {
+        "input_ids": torch.zeros(4, dtype=torch.long, device="cuda"),
+        "attn_metadata": metadata,
+        "inputs_embeds": torch.ones((4, 4), device="cuda"),
+    }
+
+    assert runner is None
+    torch.testing.assert_close(forward(inputs), torch.full_like(inputs["inputs_embeds"], 105))
+    mamba.glm_cached_lens_host = [7]
+    metadata.kv_lens_cuda.copy_(torch.tensor([11, 0], dtype=torch.int32, device="cuda"))
+    torch.testing.assert_close(forward(inputs), torch.full_like(inputs["inputs_embeds"], 112))
+    metadata._seq_lens = torch.tensor([3, 1], dtype=torch.int32)
+    metadata._num_ctx_tokens = 3
+    metadata.kv_lens_cuda.copy_(torch.tensor([10, 1], dtype=torch.int32, device="cuda"))
+    mamba.glm_ctx_cu_seqlens = [0, 3]
+    mamba.glm_cached_lens_host = [7, 0]
+
+    torch.testing.assert_close(forward(inputs), torch.full_like(inputs["inputs_embeds"], 111))
+    assert inputs["attn_metadata"] is metadata
+    assert inputs["input_ids"].numel() == 4
+
+
+@pytest.mark.parametrize("disable_mm_encoder", [False, True])
+def test_deepseek_multimodal_changed_ids_and_image_mask_stay_eager(disable_mm_encoder):
+    from _torch.modules.test_engram_replay import provider
+
+    from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41ForCausalLM
+
+    hash_provider = provider()
+    reference_provider = provider()
+
+    class EngramBody(nn.Module):
+        def forward(self, input_ids, image_mask):
+            return hash_provider.compute_hashes(input_ids, token_mask=~image_mask)[0].float()
+
+    decoder = object.__new__(DeepseekV41ForCausalLM)
+    nn.Module.__init__(decoder)
+    decoder.model = EngramBody()
+    owner = _MultimodalOwner(decoder, disable_mm_encoder=disable_mm_encoder)
+    owner.llm = decoder
+    runner, forward = _multimodal_prefill(owner)
+    inputs = {
+        "input_ids": torch.zeros(4, dtype=torch.long, device="cuda"),
+        "image_mask": torch.zeros(4, dtype=torch.bool, device="cuda"),
+    }
+
+    assert runner is None
+    original = forward(inputs).clone()
+    inputs["input_ids"].copy_(torch.tensor([1, 2, 4, 5], device="cuda"))
+    inputs["image_mask"].copy_(torch.tensor([False, True, False, False], device="cuda"))
+    expected = reference_provider.compute_hashes(
+        inputs["input_ids"], token_mask=~inputs["image_mask"]
+    )[0].float()
+    actual = forward(inputs).clone()
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert not torch.equal(actual, original)
+    assert torch.count_nonzero(actual[1]).item() == 0
+    inputs["image_mask"].zero_()
+    unmasked = forward(inputs)
+    expected = reference_provider.compute_hashes(inputs["input_ids"])[0].float()
+    torch.testing.assert_close(unmasked, expected, rtol=0, atol=0)
+    assert not torch.equal(unmasked, actual)
+
+
+@pytest.mark.parametrize("disable_mm_encoder", [False, True])
+def test_multimodal_unverified_decoder_requires_explicit_support(disable_mm_encoder):
+    decoder = object.__new__(DecoderModelForCausalLM)
+    nn.Module.__init__(decoder)
+    decoder.model = _Body()
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = _MultimodalOwner(decoder, disable_mm_encoder=disable_mm_encoder)
+    engine.model.llm = decoder
+    engine.mapping = SimpleNamespace(pp_size=1)
+    engine.llm_args = SimpleNamespace(
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED,
+        disable_mm_encoder=disable_mm_encoder,
+    )
+    engine._validate_breakable_cuda_graph_compatibility()
+    runner, _forward = _multimodal_prefill(engine.model)
+    assert runner is None
+    engine.llm_args.prefill_cuda_graph_backend = PrefillCudaGraphBackend.BREAKABLE
+
+    with pytest.raises(ValueError, match="support"):
+        engine._validate_breakable_cuda_graph_compatibility()
+
+
+@torch.inference_mode()
+def test_gemma4_opted_in_decoder_captures_and_refreshes_ple_ids():
+    from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4ForCausalLM
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+
+    class Body(nn.Module):
+        hidden_size_per_layer_input = 1
+
+        def __init__(self):
+            super().__init__()
+            self.forward_calls = 0
+
+        def forward(self, input_ids=None, inputs_embeds=None, ple_input_ids=None):
+            self.forward_calls += 1
+            return inputs_embeds + ple_input_ids[:, None]
+
+    decoder = object.__new__(Gemma4ForCausalLM)
+    nn.Module.__init__(decoder)
+    body = decoder.model = Body()
+    owner = object.__new__(Gemma4ForConditionalGeneration)
+    nn.Module.__init__(owner)
+    owner.llm = decoder
+    owner.model_config = SimpleNamespace(disable_mm_encoder=False)
+    runner, _forward = _multimodal_prefill(owner)
+    assert runner is not None
+    inputs = {
+        "input_ids": torch.zeros(4, dtype=torch.long, device="cuda"),
+        "inputs_embeds": torch.zeros((4, 4), device="cuda"),
+    }
+
+    def outer():
+        return body(**inputs)
+
+    def engine():
+        return runner.capture_model_body(outer) if runner.is_capturing else outer()
+
+    try:
+        runner.capture(4, engine)
+        assert runner.has_graph(4)
+        calls_after_capture = body.forward_calls
+        inputs["input_ids"] = torch.arange(4, device="cuda")
+        inputs["inputs_embeds"] = torch.full((4, 4), 3.0, device="cuda")
+        actual = runner.execute(4, engine)
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(
+            actual, inputs["inputs_embeds"] + inputs["input_ids"][:, None], rtol=0, atol=0
+        )
+        assert body.forward_calls == calls_after_capture
+    finally:
+        runner.clear()
 
 
 @pytest.mark.parametrize("input_kind", ["inputs_embeds", "embedding_handle"])
