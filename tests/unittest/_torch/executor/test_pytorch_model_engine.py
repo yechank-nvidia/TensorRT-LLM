@@ -2167,16 +2167,18 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         engine._metadata.setup_attention.assert_not_called()
 
-    def test_breakable_rejects_multimodal_models(self) -> None:
+    def test_breakable_rejects_multimodal_non_decoder_body(self) -> None:
         engine = object.__new__(PyTorchModelEngine)
         engine.model = DummyLegacyMultimodalIndexModel()
+        engine.model.llm = torch.nn.Identity()
         engine.input_processor = None
         engine.llm_args = SimpleNamespace(
             prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
             disable_mm_encoder=False)
 
         self.assertTrue(is_multimodal(engine.model, engine.input_processor))
-        with self.assertRaisesRegex(ValueError, "multimodal models"):
+        with self.assertRaisesRegex(ValueError,
+                                    "DecoderModelForCausalLM language_model"):
             engine._validate_breakable_cuda_graph_compatibility()
 
     def test_breakable_allows_text_decoder_with_multimodal_processor(
