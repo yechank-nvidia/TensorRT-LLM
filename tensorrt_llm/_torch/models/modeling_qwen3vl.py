@@ -1328,7 +1328,19 @@ class Qwen3VisionModelBase(nn.Module):
         model_class: Union[type[PreTrainedModel], type[torch.nn.Module]],
     ):
         super().__init__()
+        encoder_backends = model_config.get_multimodal_encoder_attention_backends(
+            defaults={"vision": model_config.attn_backend},
+            supported_backends=Qwen3VLModelBase.get_supported_encoder_attention_backends(
+                model_config
+            ),
+        )
         self.model_config = model_config
+        if encoder_backends["vision"] != model_config.attn_backend:
+            self.model_config = dataclasses.replace(
+                model_config, attn_backend=encoder_backends["vision"]
+            )
+            self.model_config.extra_attrs = model_config.extra_attrs
+            self.model_config._frozen = model_config._frozen
         self.model_dtype = self.model_config.pretrained_config.text_config.dtype
 
         # NOTE: Re-setting QuantConfig to exclude vision encoder from quantization,
@@ -1441,6 +1453,17 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         cls, model_config: ModelConfig
     ) -> dict[str, frozenset[EncoderParallelMode]]:
         return {"vision": frozenset({"tp", "dp"})}
+
+    supports_encoder_attention_backend = True
+
+    @classmethod
+    def get_supported_encoder_attention_backends(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[str]]:
+        """Return supported attention backends for enabled logical encoders."""
+        if getattr(model_config.pretrained_config, "vision_config", None) is None:
+            return {}
+        return {"vision": frozenset({"TRTLLM", "FLASHINFER", "VANILLA"})}
 
     def encode_multimodal_inputs(
         self, multimodal_params: List[MultimodalParams], **encoder_kwargs: Any
@@ -1564,9 +1587,18 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
                     kwargs.get("vision_model_class", None),
                 ).eval()
             else:
-                self.mm_encoder = vision_encoder_class(
-                    make_multimodal_encoder_model_config(model_config)
-                ).eval()
+                encoder_config = make_multimodal_encoder_model_config(model_config)
+                encoder_backends = encoder_config.get_multimodal_encoder_attention_backends(
+                    defaults={"vision": encoder_config.attn_backend},
+                    supported_backends=self.get_supported_encoder_attention_backends(encoder_config),
+                )
+                if encoder_backends["vision"] != encoder_config.attn_backend:
+                    encoder_config = dataclasses.replace(
+                        encoder_config, attn_backend=encoder_backends["vision"]
+                    )
+                    encoder_config.extra_attrs = model_config.extra_attrs
+                    encoder_config._frozen = model_config._frozen
+                self.mm_encoder = vision_encoder_class(encoder_config).eval()
             # Reuse the encoder's own group definition so the aggregated and
             # mm-encoder-only paths share a single source of truth.
             self.mm_encoder_groups = self.mm_encoder.mm_encoder_groups

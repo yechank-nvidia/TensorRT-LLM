@@ -827,6 +827,21 @@ class MultimodalConfig(StrictBaseModel):
         status="prototype",
     )
 
+    encoder_attention_backend: dict[str, Literal[
+        "TRTLLM", "FLASHINFER", "VANILLA", "SDPA",
+        "FLASH_ATTENTION_2"]] | None = Field(
+            default=None,
+            description=
+            ("Attention backend for each logical multimodal encoder, for example "
+             "{'vision': 'FLASHINFER', 'audio': 'SDPA'}. Image and video share the "
+             "vision encoder. Omitted encoders retain their model-specific defaults. "
+             "Explicit selections do not change the language model's attn_backend. Supported backends "
+             "depend on the encoder; unsupported explicit selections raise an error."
+             ),
+            status="prototype",
+            telemetry=False,
+        )
+
     encoder_cuda_graph: dict[str, MultimodalEncoderCudaGraphConfig] | None = Field(
         default=None,
         description=
@@ -894,6 +909,16 @@ class MultimodalConfig(StrictBaseModel):
     @classmethod
     def parse_encoder_cache_max_bytes(cls, value):
         return _parse_binary_byte_string(value)
+
+    @field_validator('encoder_attention_backend', mode='before')
+    @classmethod
+    def normalize_encoder_attention_backend(cls, value: object) -> object:
+        if isinstance(value, dict):
+            return {
+                name: backend.upper() if isinstance(backend, str) else backend
+                for name, backend in value.items()
+            }
+        return value
 
     @model_validator(mode='after')
     def validate_encoder_optimization_compatibility(self) -> 'MultimodalConfig':

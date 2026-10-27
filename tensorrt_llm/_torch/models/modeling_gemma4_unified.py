@@ -262,7 +262,22 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4MultimodalModelBase):
             for name in super().get_multimodal_encoder_parallel_modes(model_config)
         }
 
+    supports_encoder_attention_backend = False
+
+    @classmethod
+    def get_supported_encoder_attention_backends(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[str]]:
+        """Return supported attention backends for enabled logical encoders."""
+        return {}
+
     def __init__(self, model_config: ModelConfig):
+        model_config.get_multimodal_encoder_attention_backends(
+            defaults={},
+            supported_backends=Gemma4UnifiedForConditionalGeneration.get_supported_encoder_attention_backends(
+                model_config
+            ),
+        )
         config = model_config.pretrained_config
         if config.image_token_id is None:
             raise ValueError(

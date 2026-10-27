@@ -528,6 +528,28 @@ class MultimodalModelMixin:
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
 
+    # TODO: Move capability declarations into the planned single
+    # SupportsMultimodal Protocol; keep shared execution in this mixin
+    # and encoder attention-metadata setup in MultimodalEncoderMixin.
+    supports_encoder_attention_backend: ClassVar[bool] = False
+    """Whether the model honors per-encoder attention backend configuration."""
+
+    @classmethod
+    def get_supported_encoder_attention_backends(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[str]]:
+        """Return supported attention backends for enabled logical encoders.
+
+        Args:
+            model_config: Checkpoint configuration used to identify its encoders.
+
+        Returns:
+            Logical encoder names (for example, vision or audio) mapped to
+            supported backends. A model implementing this contract can return
+            an empty mapping when the checkpoint has no encoders enabled.
+        """
+        return {}
+
     @classmethod
     def get_multimodal_encoder_parallel_modes(
         cls, model_config: ModelConfig

@@ -808,6 +808,17 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     ) -> dict[str, frozenset[EncoderParallelMode]]:
         return {"vision": frozenset({"tp", "dp"})}
 
+    supports_encoder_attention_backend = True
+
+    @classmethod
+    def get_supported_encoder_attention_backends(
+            cls, model_config: ModelConfig) -> dict[str, frozenset[str]]:
+        """Return supported attention backends for enabled logical encoders."""
+        if getattr(model_config.pretrained_config, "vision_config",
+                   None) is None:
+            return {}
+        return {"vision": frozenset({"TRTLLM", "FLASHINFER", "VANILLA"})}
+
     def __init__(
         self,
         model_config: ModelConfig[Mistral3Config],
@@ -860,10 +871,15 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
                 model_config_cp)
             # NOTE: current `modelopt` does not support quantizing the vision portion.
             # NOTE: attn_backend: Pixtral head size not always divisible by 128
+            encoder_backends = model_config.get_multimodal_encoder_attention_backends(
+                defaults={"vision": "TRTLLM"},
+                supported_backends=Mistral3VLM.
+                get_supported_encoder_attention_backends(model_config),
+            )
             vision_model_config = self._get_sub_model_config(
                 encoder_model_config,
                 "vision_config",
-                attn_backend="TRTLLM",
+                attn_backend=encoder_backends["vision"],
                 quant_config=None)
 
             self._vision_tower = modeling_pixtral.PixtralVisionModel(
