@@ -234,8 +234,6 @@ class HostLists:
     multimodal_params_list: list[MultimodalParams] = field(default_factory=list)
     # (start_idx, end_idx, (3,1,L) mrope_pos_ids) per multimodal request
     mrope_position_ids: list[tuple[int, int, torch.Tensor]] = field(default_factory=list)
-    # (token row, base position, scalar delta) for batched generation writes.
-    generation_mrope_positions: list[tuple[int, int, torch.Tensor]] = field(default_factory=list)
     mrope_delta_write_seq_slots: list[int] = field(default_factory=list)
     mrope_delta_read_seq_slots: list[int] = field(default_factory=list)
     # will contain previous batch indices of generation requests
@@ -835,7 +833,15 @@ class DecoderInputPreparer:
             spec_config,
             enable_spec_decode=enable_spec_decode,
         )
-        self._pack_generation_requests(host, promoted_context_request_ids, new_tokens_device)
+        batched_mrope_generation_updates: list[tuple[int, int, torch.Tensor]] | None = (
+            [] if host.use_mrope else None
+        )
+        self._pack_generation_requests(
+            host,
+            promoted_context_request_ids,
+            new_tokens_device,
+            batched_mrope_generation_updates=batched_mrope_generation_updates,
+        )
 
         self._copy_token_ids_to_device(
             host,
@@ -847,7 +853,9 @@ class DecoderInputPreparer:
             attn_metadata=attn_metadata,
             enable_spec_decode=enable_spec_decode,
         )
-        self._copy_position_ids_to_device(host)
+        self._copy_position_ids_to_device(
+            host, batched_mrope_generation_updates=batched_mrope_generation_updates
+        )
 
         if enable_spec_decode:
             self._gather_ids_buffer.update(torch.tensor(host.lists.gather_ids, dtype=torch.int))
@@ -1511,8 +1519,10 @@ class DecoderInputPreparer:
         host: HostInputs,
         promoted_context_request_ids: frozenset[int],
         new_tokens_device: torch.Tensor | None,
+        *,
+        batched_mrope_generation_updates: list[tuple[int, int, torch.Tensor]] | None = None,
     ) -> None:
-        """Pack one token per beam for every plain generation request."""
+        """Pack generation tokens, collecting (row, base, delta) updates when supplied."""
         generation_requests = host.lists.generation_requests
         draft_lens = host.lists.draft_lens
         sequence_lengths = host.lists.sequence_lengths
@@ -1681,7 +1691,8 @@ class DecoderInputPreparer:
                         # Batch deltas that need no device or dtype conversion.
                         mrope_position_buffer = self._buffers.mrope_position_ids_cuda
                         can_batch_mrope = (
-                            mrope_position_delta.numel() == 1
+                            batched_mrope_generation_updates is not None
+                            and mrope_position_delta.numel() == 1
                             and mrope_position_delta.device == mrope_position_buffer.device
                             and mrope_position_delta.dtype == mrope_position_buffer.dtype
                         )
@@ -1712,8 +1723,8 @@ class DecoderInputPreparer:
                         for beam in range(beam_width):
                             # Locate this beam's single token in the flat array.
                             token_start = len(position_ids) - beam_width + beam
-                            if can_batch_mrope:
-                                host.lists.generation_mrope_positions.append(
+                            if can_batch_mrope and batched_mrope_generation_updates is not None:
+                                batched_mrope_generation_updates.append(
                                     (token_start, past_seen_token_num, mrope_position_delta)
                                 )
                             else:
@@ -1962,7 +1973,12 @@ class DecoderInputPreparer:
         host.total_num_tokens = total_num_tokens
         host.previous_batch_len = previous_batch_len
 
-    def _copy_position_ids_to_device(self, host: HostInputs) -> None:
+    def _copy_position_ids_to_device(
+        self,
+        host: HostInputs,
+        *,
+        batched_mrope_generation_updates: Sequence[tuple[int, int, torch.Tensor]] | None = None,
+    ) -> None:
         total_num_tokens = host.total_num_tokens
         position_ids = apply_position_id_offset(host.lists.position_ids, model=self.model)
         host_position_ids = torch.tensor(position_ids, dtype=torch.int, pin_memory=prefer_pinned())
@@ -2004,14 +2020,13 @@ class DecoderInputPreparer:
                 self._buffers.mrope_position_ids_cuda[:, :, start_idx:end_idx].copy_(
                     segment[:, :, : end_idx - start_idx], non_blocking=True
                 )
-            if host.lists.generation_mrope_positions:
-                rows, positions, deltas = zip(*host.lists.generation_mrope_positions)
+            if batched_mrope_generation_updates:
+                rows, positions, deltas = zip(*batched_mrope_generation_updates)
                 indices_and_positions = torch.tensor(
                     (rows, positions), dtype=torch.long, pin_memory=prefer_pinned()
                 ).to(device=self._buffers.mrope_position_ids_cuda.device, non_blocking=True)
-                generation_positions = torch.cat(
-                    [delta.reshape(1) for delta in deltas]
-                ) + indices_and_positions[1].to(dtype=torch.int32)
+                generation_positions = torch.cat([delta.reshape(1) for delta in deltas])
+                generation_positions.add_(indices_and_positions[1])
                 self._buffers.mrope_position_ids_cuda.index_copy_(
                     2,
                     indices_and_positions[0],
@@ -2360,7 +2375,6 @@ class DecoderInputPreparer:
             and self.guided_decoder is None
             and not self._config.enable_attention_dp
             and not host.lists.mrope_position_ids
-            and not host.lists.generation_mrope_positions
             and not host.lists.mrope_delta_write_seq_slots
             and not host.lists.mrope_delta_read_seq_slots
             and not self.use_beam_search
