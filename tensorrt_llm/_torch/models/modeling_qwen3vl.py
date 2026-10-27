@@ -1466,7 +1466,7 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         return {"vision": frozenset({"TRTLLM", "FLASHINFER", "VANILLA"})}
 
     def encode_multimodal_inputs(
-        self, multimodal_params: List[MultimodalParams], **encoder_kwargs: Any
+        self, multimodal_params: Sequence[MultimodalParams], **encoder_kwargs: Any
     ) -> torch.Tensor:
         """Uniform encoder entry (``MultimodalModelMixin`` contract).
 

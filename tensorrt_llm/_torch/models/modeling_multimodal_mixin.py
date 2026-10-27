@@ -60,6 +60,7 @@ from .modeling_multimodal_utils import (
     fuse_input_embeds,
     get_multimodal_embeddings,
 )
+from .multimodal import EncoderParallelMode
 from .multimodal_encoder_data_parallel import (
     EncoderDpItem,
     encoder_dp_error_guard,
@@ -70,9 +71,6 @@ from .multimodal_encoder_data_parallel import (
 
 class MultimodalEncoderContractError(ValueError):
     """A request-local MM encoder input or output contract violation."""
-
-
-EncoderParallelMode = Literal["tp", "dp"]
 
 
 def _assemble_multimodal_encoder_embeddings(
@@ -499,8 +497,8 @@ class EncoderCachePartition:
 class MultimodalModelMixin:
     """Template-method mixin for PyTorch multimodal causal LM models.
 
-    Concrete model forwards can call `prepare_multimodal_inputs` while keeping their explicit
-    language-model delegation.
+    Implements ``SupportsMultimodal``. Concrete model forwards can call
+    `prepare_multimodal_inputs` while keeping their explicit language-model delegation.
 
     Models provide encoder computation and layout-specific input slicing. They declare optional
     encoder TP/DP support through `get_multimodal_encoder_parallel_modes`; the shared execution
@@ -516,6 +514,9 @@ class MultimodalModelMixin:
       `get_multimodal_item_partitions`. Undeclared models retain legacy stacked/packed inference.
     """
 
+    supports_multimodal: ClassVar[Literal[True]] = True
+    """Opt in to the shared model contract without requiring mixin inheritance."""
+
     supports_encoder_cache: ClassVar[bool] = False
     """Whether the model's production forward path uses the persistent encoder cache."""
 
@@ -525,14 +526,14 @@ class MultimodalModelMixin:
     `BaseMultimodalInputProcessor.get_mm_item_metadata`. This is the executor-layer gate for
     item scheduling."""
 
-    model_config: ModelConfig
-    _multimodal_encoder_cache: Optional[TensorLRUCache] = None
-
-    # TODO: Move capability declarations into the planned single
-    # SupportsMultimodal Protocol; keep shared execution in this mixin
-    # and encoder attention-metadata setup in MultimodalEncoderMixin.
     supports_encoder_attention_backend: ClassVar[bool] = False
     """Whether the model honors per-encoder attention backend configuration."""
+
+    support_mm_disagg: ClassVar[bool] = False
+    """Set by ``supports_multimodal_disagg`` after validating the processor hook."""
+
+    model_config: ModelConfig
+    _multimodal_encoder_cache: Optional[TensorLRUCache] = None
 
     @classmethod
     def get_supported_encoder_attention_backends(
@@ -637,6 +638,15 @@ class MultimodalModelMixin:
             and not cls.supports_mm_encoder_item_scheduling
         ):
             raise ValueError("Encoder TP with attention DP requires MM encoder item scheduling.")
+
+    @property
+    def multimodal_encoder_cache(self) -> Optional[TensorLRUCache]:
+        """Expose the existing model-owned encoder cache without transferring ownership."""
+        return self._multimodal_encoder_cache
+
+    def initialize_multimodal_encoder_cache(self, max_bytes: int) -> Optional[TensorLRUCache]:
+        """Initialize the encoder output cache through the existing implementation hook."""
+        return self._initialize_multimodal_encoder_cache(max_bytes)
 
     @classmethod
     def _cast_multimodal_encoder_dtype(
