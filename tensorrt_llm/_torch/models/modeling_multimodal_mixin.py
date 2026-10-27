@@ -655,6 +655,7 @@ class MultimodalModelMixin:
 
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
+    _encoder_forward_context: Callable[[], contextlib.AbstractContextManager[None]] | None = None
 
     @classmethod
     def get_supported_encoder_attention_backends(
@@ -816,6 +817,16 @@ class MultimodalModelMixin:
         the bad one. Default: accept everything.
         """
         return None
+
+    def _run_multimodal_encoder(
+        self,
+        multimodal_params: Sequence[MultimodalParams],
+    ) -> torch.Tensor:
+        """Run encoder work with optional runtime instrumentation after H2D."""
+        if self._encoder_forward_context is None:
+            return self.encode_multimodal_inputs(multimodal_params)
+        with self._encoder_forward_context():
+            return self.encode_multimodal_inputs(multimodal_params)
 
     def prepare_multimodal_encoder_inputs(
         self,
@@ -2260,7 +2271,7 @@ def _dispatch_cross_iter_prefetch(
                 if partial_hits and encoder_cache is not None:
                     model._encode_with_partial_cache(partial_hits, encoder_cache)
                 if cache_misses:
-                    encoder_output = model.encode_multimodal_inputs(cache_misses).clone()
+                    encoder_output = model._run_multimodal_encoder(cache_misses).clone()
                     _store_chunked_prefill_embeddings(cache_misses, [encoder_output])
                     if encoder_cache is not None:
                         for param in cache_misses:

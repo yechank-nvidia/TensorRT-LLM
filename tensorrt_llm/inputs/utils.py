@@ -39,6 +39,7 @@ from tensorrt_llm.inputs.multimodal_data import VideoData as VideoData
 from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
                                           MultimodalPlaceholderPlacement)
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
+from tensorrt_llm.metrics.perf_utils import _time_input_processing
 from tensorrt_llm.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
 from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
@@ -520,14 +521,16 @@ class MultimodalDataTracker:
                 out[modality].append(result)
             return dict(out)
 
-        max_bytes = self._multimodal_server_config.max_cpu_bytes_per_request
-        if max_bytes is not None:
-            return await self._retrieve_with_byte_limit(max_bytes)
+        if not self._data and not self._embeddings:
+            return None, None
+        with _time_input_processing("media_load"):
+            max_bytes = self._multimodal_server_config.max_cpu_bytes_per_request
+            if max_bytes is not None:
+                return await self._retrieve_with_byte_limit(max_bytes)
 
-        # _data and _embeddings also gathered concurrently. Preserve this
-        # zero-overhead path when frontend byte admission is not configured.
-        data_result, embed_result = await asyncio.gather(
-            _retrieve(self._data), _retrieve(self._embeddings))
+            # Preserve concurrent retrieval when byte admission is not configured.
+            data_result, embed_result = await asyncio.gather(
+                _retrieve(self._data), _retrieve(self._embeddings))
         return data_result, embed_result
 
     async def discard_all_async(
@@ -1013,21 +1016,22 @@ async def async_apply_chat_template(
     injected_chat_template_kwargs: Optional[Collection[str]] = None,
 ) -> (str | List[str]):
     """Apply chat template without blocking the event loop."""
-    return await asyncio.to_thread(
-        apply_chat_template,
-        model_type=model_type,
-        tokenizer=tokenizer,
-        processor=processor,
-        conversation=conversation,
-        add_generation_prompt=add_generation_prompt,
-        mm_placeholder_counts=mm_placeholder_counts,
-        tools=tools,
-        documents=documents,
-        chat_template=chat_template,
-        chat_template_kwargs=chat_template_kwargs,
-        enable_tokenize=enable_tokenize,
-        injected_chat_template_kwargs=injected_chat_template_kwargs,
-    )
+    with _time_input_processing("chat_template"):
+        return await asyncio.to_thread(
+            apply_chat_template,
+            model_type=model_type,
+            tokenizer=tokenizer,
+            processor=processor,
+            conversation=conversation,
+            add_generation_prompt=add_generation_prompt,
+            mm_placeholder_counts=mm_placeholder_counts,
+            tools=tools,
+            documents=documents,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+            enable_tokenize=enable_tokenize,
+            injected_chat_template_kwargs=injected_chat_template_kwargs,
+        )
 
 
 def apply_mm_placeholders(
