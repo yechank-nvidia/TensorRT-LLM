@@ -660,6 +660,7 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
         return_value=SimpleNamespace(
             name="config",
             mapping=SimpleNamespace(),
+            multimodal_config=None,
             pretrained_config=SimpleNamespace(
                 architectures=["TinyForCausalLM"],
                 model_type="tiny",

@@ -191,7 +191,7 @@ async def test_total_includes_inline_preprocessing_but_not_generation(route, fai
         ),
         patch(
             "tensorrt_llm.serve.openai_server.responses_api_create_response",
-            new=AsyncMock(return_value=SimpleNamespace(model_dump=lambda: {})),
+            new=AsyncMock(return_value=SimpleNamespace(model_dump=lambda **_kwargs: {})),
         ),
     ):
         await middleware(raw_request.scope, raw_request.receive, send)

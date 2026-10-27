@@ -228,6 +228,10 @@ def test_disagg_preprocess_keeps_processor_params_and_mrope(monkeypatch, deepsta
 
 def test_disagg_decode_rebuilds_only_mrope_params():
     llm = object.__new__(BaseLLM)
+    llm.input_processor = object.__new__(Qwen3VLInputProcessorBase)
+    llm.input_processor._config = SimpleNamespace(
+        image_token_id=_IMAGE_TOKEN_ID, video_token_id=_VIDEO_TOKEN_ID
+    )
     llm._hf_model_config = SimpleNamespace(is_encoder_decoder=False)
     mrope_ids, mrope_deltas = {"position_ids": "handle"}, {"position_deltas": "handle"}
     disagg = DisaggregatedParams(

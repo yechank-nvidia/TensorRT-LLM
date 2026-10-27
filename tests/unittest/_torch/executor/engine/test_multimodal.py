@@ -420,7 +420,7 @@ def test_item_scheduler_accepts_model_contract_without_mixin_inheritance() -> No
         {
             "audio": {"input_features": torch.empty(1, 4)},
             "multimodal_embedding_lengths": [1],
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                 item_refs=[("audio", 0)],
                 encoder_token_lengths=[4],
                 output_embedding_lengths=[1],

@@ -259,7 +259,11 @@ def test_profiling_dummy_has_encoder_item_metadata(num_images: int) -> None:
         merge_size=2,
     )
     processor._processor = SimpleNamespace(image_processor=image_processor)
-    model = Mock(spec=MultimodalModelMixin, dtype=torch.float16)
+
+    class _MultimodalModel(MultimodalModelMixin):
+        dtype = torch.float16
+
+    model = _MultimodalModel()
     profiler = object.__new__(KvCacheCreator)
     profiler._llm_args = SimpleNamespace(disable_mm_encoder=False)
     profiler._profiling_stage_data = {"enable_mm_reqs": True}

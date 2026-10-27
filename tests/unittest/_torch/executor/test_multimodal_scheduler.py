@@ -510,13 +510,18 @@ def test_multimodal_scheduler_forwards_async_transfer_manager(scheduler_cls):
     v2_scheduler._async_transfer_manager = None
     transfer_manager = Mock()
 
-    scheduler_cls(v2_scheduler, max_batch_size=1, max_num_tokens=1).set_async_transfer_manager(
-        transfer_manager
-    )
+    _scheduler(
+        base_scheduler=v2_scheduler,
+        scheduler_cls=scheduler_cls,
+        max_batch_size=1,
+        max_num_tokens=1,
+    ).set_async_transfer_manager(transfer_manager)
     # A wrapped scheduler without the hook is left untouched.
-    scheduler_cls(_BaseScheduler(), max_batch_size=1, max_num_tokens=1).set_async_transfer_manager(
-        transfer_manager
-    )
+    _scheduler(
+        scheduler_cls=scheduler_cls,
+        max_batch_size=1,
+        max_num_tokens=1,
+    ).set_async_transfer_manager(transfer_manager)
 
     assert v2_scheduler._async_transfer_manager is transfer_manager
 

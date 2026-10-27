@@ -1710,14 +1710,17 @@ class Qwen2_5_VLVisionAttention(Attention):
         q, k, v = qkv, None, None
         q, k, v = self.split_qkv(q, k, v)
 
-        packed_qk = (qkv[..., :self.q_size +
-                         self.kv_size] if q.shape == k.shape else None)
-        q, k, v = self.apply_rope(q,
-                                  k,
-                                  v,
-                                  position_ids,
-                                  position_embeddings,
-                                  packed_qk=packed_qk)
+        if position_embeddings is not None and q.shape == k.shape:
+            q, k, v = self.apply_rope(q,
+                                      k,
+                                      v,
+                                      position_ids,
+                                      position_embeddings,
+                                      packed_qk=qkv[..., :self.q_size +
+                                                    self.kv_size])
+        else:
+            q, k, v = self.apply_rope(q, k, v, position_ids,
+                                      position_embeddings)
         reuse_qkv = False
         if self.support_fused_qkv:
             # Only reuse the projection when RoPE preserves every original
