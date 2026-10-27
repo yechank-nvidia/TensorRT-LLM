@@ -1411,6 +1411,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 breakable_runner.is_warming_up = False
                 breakable_runner.has_graph.return_value = True
                 breakable_runner.execute.return_value = outputs
+                breakable_runner.run_eager.side_effect = lambda forward: forward()
                 engine._runner._graphs.breakable_cuda_graph_runner = breakable_runner
                 prepared = engine._runner._inputs.prepare_inputs.return_value
 
@@ -1440,9 +1441,11 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 })
                 self.assertIsNot(actual_outputs, outputs)
                 if return_context_logits:
+                    breakable_runner.run_eager.assert_called_once()
                     breakable_runner.execute.assert_not_called()
                     engine._runner._forward_step.assert_called_once()
                 else:
+                    breakable_runner.run_eager.assert_not_called()
                     breakable_runner.execute.assert_called_once()
                     engine._runner._forward_step.assert_not_called()
 
