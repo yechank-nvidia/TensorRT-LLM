@@ -191,6 +191,7 @@ class BaseMultimodalInputProcessor(ABC):
                  config,
                  tokenizer,
                  trust_remote_code: bool = True,
+                 device_pixel_normalization: bool = False,
                  **kwargs) -> None:
         super().__init__(**kwargs)
         self._config = config
@@ -198,6 +199,9 @@ class BaseMultimodalInputProcessor(ABC):
         self._tokenizer = tokenizer
         self._use_fast: bool = kwargs.get('use_fast', True)
         self._trust_remote_code = trust_remote_code
+        # Set by `create_input_processor` when the model's encoder normalizes
+        # raw uint8 patch rows itself (`supports_device_pixel_normalization`).
+        self._device_pixel_normalization = device_pixel_normalization
         self._multimodal_hashing_supported: Optional[bool] = None
 
     def _init_tokenization_cache(self, enable_tokenization_cache: bool,
@@ -1130,6 +1134,10 @@ def create_input_processor(
             if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
                     and input_processor_cls.supports_tokenization_cache):
                 kwargs["enable_tokenization_cache"] = enable_tokenization_cache
+            if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
+                    and getattr(model_cls,
+                                "supports_device_pixel_normalization", False)):
+                kwargs["device_pixel_normalization"] = True
             # Input processors build an AutoTokenizer/AutoProcessor with
             # trust_remote_code; doing so copies the checkpoint's .py files
             # into the shared HF module cache non-atomically, and a rank that

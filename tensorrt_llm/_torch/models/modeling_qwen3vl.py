@@ -5,7 +5,7 @@ import copy
 import dataclasses
 import math
 import re
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 from typing import Mapping as TypingMapping
 
@@ -39,6 +39,7 @@ from ...inputs import (
     support_multimodal_disaggregated,
 )
 from ...inputs.multimodal import MultimodalItemMetadata, MultimodalItemPartition, MultimodalParams
+from ...inputs.pixel_normalization import PIXEL_NORMALIZATION_KEY, concat_pixel_patches
 from ...logger import logger
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
@@ -370,6 +371,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         text: Dict[str, Any],
         mm_data: Dict[str, Any],
         mm_processor_kwargs: Dict[str, Any],
+        defer_pixel_normalization: bool = False,
     ):
         images = mm_data.get("image")
         video_datas = mm_data.get("video")
@@ -417,6 +419,10 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                 # `num_frames` for short clips. Null `fps` so `num_frames` is
                 # respected verbatim.
                 proc_kwargs["fps"] = None
+        if defer_pixel_normalization:
+            # The encoder applies rescale and normalize to the uint8 patches.
+            do_rescale = False
+            proc_kwargs["do_normalize"] = False
 
         # Forward per-video metadata with `total_num_frames` rewritten to the
         # actual decoded frame count. HF's `sample_frames` computes indices
@@ -1316,16 +1322,25 @@ _QWEN3VL_SINGLE_MODALITY_FIELDS = tuple(
 
 def _qwen3vl_build_batched_input(
     multimodal_params: list[MultimodalParams],
+    dtype: Optional[torch.dtype] = None,
 ) -> dict[str, Any]:
     """Cat image items then video items across requests (matching the
-    ``EncoderGroup.modalities`` order) into one ViT input."""
-    pixels, grids = [], []
+    ``EncoderGroup.modalities`` order) into one ViT input.
+
+    Deferred uint8 rows use their bucket's normalization constants and ``dtype``.
+    """
+    pixels, grids, normalizations = [], [], []
+    has_raw_pixels = False
     try:
         for param in multimodal_params:
             bucket = param.multimodal_data.get("image")
             if bucket is not None:
                 pixels.append(bucket["pixel_values"])
                 grids.append(bucket["image_grid_thw"])
+                normalizations.append(bucket.get(PIXEL_NORMALIZATION_KEY))
+                has_raw_pixels |= (
+                    isinstance(pixels[-1], torch.Tensor) and pixels[-1].dtype == torch.uint8
+                )
         has_images = bool(pixels)
         for param in multimodal_params:
             bucket = param.multimodal_data.get("video")
@@ -1339,10 +1354,18 @@ def _qwen3vl_build_batched_input(
                     break
                 pixels.append(bucket["pixel_values_videos"])
                 grids.append(bucket["video_grid_thw"])
+                normalizations.append(bucket.get(PIXEL_NORMALIZATION_KEY))
+                has_raw_pixels |= (
+                    isinstance(pixels[-1], torch.Tensor) and pixels[-1].dtype == torch.uint8
+                )
         else:
             if pixels:
                 return {
-                    "pixel_values": _QWEN3VL_ENCODER_INPUT_FIELDS["pixel_values"].batch(pixels),
+                    "pixel_values": (
+                        concat_pixel_patches(list(zip(pixels, normalizations)), dtype)
+                        if has_raw_pixels
+                        else _QWEN3VL_ENCODER_INPUT_FIELDS["pixel_values"].batch(pixels)
+                    ),
                     "grid_thw": _QWEN3VL_ENCODER_INPUT_FIELDS["grid_thw"].batch(grids),
                 }
     except (KeyError, TypeError, ValueError):
@@ -1359,9 +1382,25 @@ def _qwen3vl_build_batched_input(
     ]
     images, videos = inputs_by_modality
     if images and videos:
-        return batch_encoder_inputs(images + videos, _QWEN3VL_ENCODER_INPUT_FIELDS)
-    index = 0 if images else 1
-    return batch_encoder_inputs(inputs_by_modality[index], _QWEN3VL_SINGLE_MODALITY_FIELDS[index])
+        inputs, fields = images + videos, _QWEN3VL_ENCODER_INPUT_FIELDS
+    else:
+        index = 0 if images else 1
+        inputs, fields = inputs_by_modality[index], _QWEN3VL_SINGLE_MODALITY_FIELDS[index]
+    normalized_inputs = []
+    for bucket in inputs:
+        for name in fields["pixel_values"].source_names:
+            value = bucket.get(name)
+            if value is not None:
+                if isinstance(value, torch.Tensor) and value.dtype == torch.uint8:
+                    bucket = {
+                        **bucket,
+                        name: concat_pixel_patches(
+                            [(value, bucket.get(PIXEL_NORMALIZATION_KEY))], dtype
+                        ),
+                    }
+                break
+        normalized_inputs.append(bucket)
+    return batch_encoder_inputs(normalized_inputs, fields)
 
 
 class Qwen3VisionModelBase(nn.Module):
@@ -1464,7 +1503,7 @@ class Qwen3VisionModelBase(nn.Module):
             EncoderGroup(
                 modalities=("image", "video"),
                 encoder_fn=self.encode_batched,
-                build_batched_input=_qwen3vl_build_batched_input,
+                build_batched_input=partial(_qwen3vl_build_batched_input, dtype=self.model_dtype),
             ),
         )
 
@@ -1966,6 +2005,7 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
 )
 class Qwen3VLModel(Qwen3VLModelBase):
     supports_encoder_cache = True
+    supports_device_pixel_normalization = True
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         # NOTE: HF implementation.

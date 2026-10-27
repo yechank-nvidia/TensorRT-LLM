@@ -34,6 +34,9 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
     MultimodalItemPartition, MultimodalParams)
+from tensorrt_llm.inputs.pixel_normalization import (
+    PIXEL_NORMALIZATION_KEY, concat_pixel_patches, pack_pixel_patches,
+    plan_deferred_pixel_normalization)
 
 from ..._utils import async_tensor_h2d, nvtx_range
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -1118,8 +1121,11 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                              device=input_device).unsqueeze(1)
         return position_ids, mrope_position_deltas
 
-    def _preprocess(self, text: Dict[str, any], mm_data: Dict[str, any],
-                    mm_processor_kwargs: Dict[str, Any]):
+    def _preprocess(self,
+                    text: Dict[str, any],
+                    mm_data: Dict[str, any],
+                    mm_processor_kwargs: Dict[str, Any],
+                    defer_pixel_normalization: bool = False):
         images = mm_data.get("image")
         video_datas = mm_data.get("video")
         if video_datas is not None:
@@ -1131,6 +1137,10 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             do_rescale = False
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
+        if defer_pixel_normalization:
+            # The encoder applies rescale and normalize to the uint8 patches.
+            do_rescale = False
+            mm_processor_kwargs = {**mm_processor_kwargs, "do_normalize": False}
         # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
         # validates per-modality kwargs against the processor's TypedDict.
         # Processor *output* keys (``video_grid_thw``, ``pixel_values``, ...)
@@ -1292,22 +1302,39 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                        return_tensors="pt").input_ids
             return input_ids[0].to(torch.int32).tolist(), None
 
+        # Leave rescale and normalize to the encoder when every item allows it.
+        deferred_normalization = {}
+        if self._device_pixel_normalization:
+            video_datas = mm_data.get("video")
+            deferred_normalization = plan_deferred_pixel_normalization(
+                self.processor, mm_data.get("image"),
+                [video_data.frames
+                 for video_data in video_datas] if video_datas else None,
+                mm_processor_kwargs) or {}
+        preprocess_kwargs = ({
+            "defer_pixel_normalization": True
+        } if deferred_normalization else {})
         processed_inputs = self._preprocess(text_prompt, mm_data,
-                                            mm_processor_kwargs)
+                                            mm_processor_kwargs,
+                                            **preprocess_kwargs)
 
         multimodal_data = {}
         pixel_values = processed_inputs.get('pixel_values', None)
         if pixel_values is not None:
             multimodal_data["image"] = {
-                "pixel_values": pixel_values.to(self.dtype),
-                "image_grid_thw": processed_inputs.get('image_grid_thw')
+                **pack_pixel_patches("pixel_values", pixel_values,
+                                     deferred_normalization.get("image"), self.dtype),
+                "image_grid_thw":
+                processed_inputs.get('image_grid_thw'),
             }
 
         pixel_values_videos = processed_inputs.get('pixel_values_videos', None)
         if pixel_values_videos is not None:
             multimodal_data["video"] = {
-                "pixel_values_videos": pixel_values_videos.to(self.dtype),
-                "video_grid_thw": processed_inputs.get('video_grid_thw')
+                **pack_pixel_patches("pixel_values_videos", pixel_values_videos,
+                                     deferred_normalization.get("video"), self.dtype),
+                "video_grid_thw":
+                processed_inputs.get('video_grid_thw'),
             }
 
         # Computed from the fused ids so the vision spans get their per-axis
@@ -1467,31 +1494,28 @@ class Qwen2VisionModelBase(nn.Module):
 
         for multimodal_param in multimodal_params:
             # Process images if present
-            if multimodal_param.multimodal_data.get("image") is not None:
+            image = multimodal_param.multimodal_data.get("image")
+            if image is not None:
                 pixel_values_list.append(
-                    multimodal_param.multimodal_data["image"]["pixel_values"])
-                image_grid_thw_list.append(
-                    multimodal_param.multimodal_data["image"]["image_grid_thw"])
+                    (image["pixel_values"], image.get(PIXEL_NORMALIZATION_KEY)))
+                image_grid_thw_list.append(image["image_grid_thw"])
 
             # Process videos if present
-            if multimodal_param.multimodal_data.get("video") is not None:
+            video = multimodal_param.multimodal_data.get("video")
+            if video is not None:
                 pixel_values_videos_list.append(
-                    multimodal_param.multimodal_data["video"]
-                    ["pixel_values_videos"])
-                video_grid_thw_list.append(
-                    multimodal_param.multimodal_data["video"]["video_grid_thw"])
+                    (video["pixel_values_videos"],
+                     video.get(PIXEL_NORMALIZATION_KEY)))
+                video_grid_thw_list.append(video["video_grid_thw"])
 
-        # Concatenate tensors
+        # Concatenate tensors, normalizing raw uint8 patches on their device.
         mm_content_dict = {}
         if pixel_values_list:
-            mm_content_dict["pixel_values"] = torch.cat(
-                pixel_values_list,
-                dim=0) if len(pixel_values_list) > 1 else pixel_values_list[0]
+            mm_content_dict["pixel_values"] = concat_pixel_patches(
+                pixel_values_list, self.model_dtype)
         if pixel_values_videos_list:
-            mm_content_dict["pixel_values_videos"] = torch.cat(
-                pixel_values_videos_list,
-                dim=0) if len(pixel_values_videos_list
-                              ) > 1 else pixel_values_videos_list[0]
+            mm_content_dict["pixel_values_videos"] = concat_pixel_patches(
+                pixel_values_videos_list, self.model_dtype)
 
         # Prepare extra data
         mm_extra_data = {}
@@ -2553,6 +2577,7 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         content_format=ContentFormat.STRING,
     ))
 class Qwen2VLModel(Qwen2VLModelBase):
+    supports_device_pixel_normalization = True
 
     @classmethod
     def get_supported_encoder_attention_backends(
@@ -2698,6 +2723,7 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
         content_format=ContentFormat.STRING,
     ))
 class Qwen2_5_VLModel(Qwen2VLModelBase):
+    supports_device_pixel_normalization = True
 
     @classmethod
     def get_multimodal_encoder_parallel_modes(

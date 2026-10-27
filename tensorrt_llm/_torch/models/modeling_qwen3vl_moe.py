@@ -46,6 +46,7 @@ from .modeling_utils import ModelConfig, register_auto_model, register_vision_en
 )
 class Qwen3MoeVLModel(Qwen3VLModelBase):
     supports_encoder_cache = True
+    supports_device_pixel_normalization = True
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         # NOTE: HF implementation.
